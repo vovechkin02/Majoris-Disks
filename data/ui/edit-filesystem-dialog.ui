@@ -1,0 +1,16 @@
+<interface>
+  <template class="MajorisDisksLabelDialog" parent="AdwAlertDialog">
+    <property name="heading">Edit Filesystem Label</property>
+    <property name="extra-child">
+      <object class="AdwEntryRow" id="entry">
+        <property name="title">Volume label</property>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="apply" appearance="suggested">Apply</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

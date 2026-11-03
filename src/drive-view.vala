@@ -16,6 +16,12 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button initialize_disk;
         [GtkChild] private unowned Gtk.Button delete_partition;
         [GtkChild] private unowned Gtk.Button format_volume;
+        [GtkChild] private unowned Gtk.Button edit_label;
+        [GtkChild] private unowned Gtk.Button take_ownership;
+        [GtkChild] private unowned Gtk.Button edit_partition;
+        public signal void metadata_requested (StorageBlock block);
+        public signal void ownership_requested (StorageBlock block);
+        public signal void label_requested (StorageBlock block);
         public signal void format_requested (StorageBlock block);
         public signal void partitioning_requested (StorageBlock block, bool deleting);
         private StorageBlock? selected_block;
@@ -60,6 +66,15 @@ namespace MajorisDisks {
             initialize_disk.clicked.connect (() => {
                 var disk = current?.medium;
                 if (disk != null) partitioning_requested (disk, false);
+            });
+            edit_partition.clicked.connect (() => {
+                if (selected_block != null) metadata_requested (selected_block);
+            });
+            take_ownership.clicked.connect (() => {
+                if (selected_block != null) ownership_requested (selected_block);
+            });
+            edit_label.clicked.connect (() => {
+                if (selected_block != null) label_requested (selected_block);
             });
             format_volume.clicked.connect (() => {
                 if (selected_block != null) format_requested (selected_block);
@@ -146,6 +161,9 @@ namespace MajorisDisks {
             repair_filesystem.visible = false;
             delete_partition.visible = false;
             format_volume.visible = false;
+            edit_label.visible = false;
+            take_ownership.visible = false;
+            edit_partition.visible = false;
             selected_block = null;
             usage.label = "";
             foreach (var field in metadata) properties.remove (field);
@@ -164,10 +182,16 @@ namespace MajorisDisks {
                 return;
             }
             selected_block = block;
+            take_ownership.visible = UDisksService.supports_ownership (block);
+            edit_label.visible = block.available && !block.read_only && !block.system_hint &&
+                block.type_id == "ext4" && block.filesystem != null && !block.filesystem.mounted;
             format_volume.visible = block.table == null && block.partition?.container != true &&
                 block.available && !block.read_only && !block.system_hint && block.filesystem?.mounted != true;
             delete_partition.visible = block.partition != null && !block.partition.container &&
                 block.available && !block.read_only && !block.system_hint;
+            var scheme = current?.medium?.table?.scheme;
+            edit_partition.visible = delete_partition.visible && block.filesystem?.mounted != true &&
+                (scheme == "gpt" || (scheme == "dos" && block.partition?.logical != true));
             add_volume_field ("Device", block.preferred, true);
             var part = block.partition;
             if (part != null) {

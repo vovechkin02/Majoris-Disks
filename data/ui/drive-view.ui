@@ -18,7 +18,10 @@
 <child><object class="GtkButton" id="operation"><property name="label">Mount</property></object></child>
 <child><object class="GtkButton" id="check_filesystem"><property name="label">Check Filesystem</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="repair_filesystem"><property name="label">Repair Filesystem</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="take_ownership"><property name="label">Take Ownership</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="edit_label"><property name="label">Edit Label</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="format_volume"><property name="label">Format Volume</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="edit_partition"><property name="label">Edit Partition</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="delete_partition"><property name="label">Delete Partition</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="open_files"><property name="label">Open in Files</property></object></child>
 </object></child></object></child>

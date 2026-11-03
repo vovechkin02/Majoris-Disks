@@ -1,0 +1,18 @@
+<interface>
+  <template class="MajorisDisksPartitionMetadataDialog" parent="AdwAlertDialog">
+    <property name="heading">Edit Partition</property>
+    <property name="extra-child">
+      <object class="GtkBox">
+        <property name="orientation">vertical</property>
+        <child><object class="AdwEntryRow" id="name_entry"><property name="title">GPT partition name</property></object></child>
+        <child><object class="GtkCheckButton" id="bootable"><property name="label">Bootable</property></object></child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="apply" appearance="suggested">Apply</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

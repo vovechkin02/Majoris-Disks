@@ -55,6 +55,9 @@ namespace MajorisDisks {
                 });
             });
             drive_view.partitioning_requested.connect ((block, deleting) => confirm_partitioning (block, deleting));
+            drive_view.metadata_requested.connect (edit_partition_metadata);
+            drive_view.ownership_requested.connect (confirm_ownership);
+            drive_view.label_requested.connect (edit_filesystem_label);
             drive_view.format_requested.connect ((block) => confirm_partitioning (block, false, true));
             drive_view.check_requested.connect ((block, repair) => {
                 if (!repair) {
@@ -90,6 +93,68 @@ namespace MajorisDisks {
             refresh ();
         }
 
+        private void edit_partition_metadata (StorageBlock block) {
+            var part = block.partition;
+            if (part == null) return;
+            var disk = backend.snapshot.blocks.lookup (part.table_path);
+            string scheme = disk?.table?.scheme ?? "";
+            if (scheme != "gpt" && scheme != "dos") return;
+            bool gpt = scheme == "gpt";
+            string identity = backend.modification_identity (block);
+            var dialog = new PartitionMetadataDialog (block, part, gpt);
+            dialog.response.connect ((response) => {
+                if (response != "apply" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.modify_partitioning.begin (block, gpt ? "name" : "bootable", identity,
+                    dialog.partition_name, dialog.is_bootable, (obj, result) => {
+                        pending.remove (block.path);
+                        try {
+                            backend.modify_partitioning.end (result);
+                            notifications.add_toast (new Adw.Toast ("Partition metadata updated"));
+                        } catch (Error error) {
+                            show_check_message ("Could not update partition metadata", operation_error (error));
+                        }
+                    });
+            });
+            dialog.present (this);
+        }
+        private void confirm_ownership (StorageBlock block) {
+            string identity = backend.modification_identity (block);
+            var dialog = new OwnershipDialog (block);
+            dialog.response.connect ((response) => {
+                if (response != "apply" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.modify_partitioning.begin (block, "ownership", identity, "", dialog.recursive_change,
+                    (obj, result) => {
+                        pending.remove (block.path);
+                        try {
+                            backend.modify_partitioning.end (result);
+                            notifications.add_toast (new Adw.Toast ("Filesystem ownership updated"));
+                        } catch (Error error) {
+                            show_check_message ("Could not change ownership", operation_error (error));
+                        }
+                    });
+            });
+            dialog.present (this);
+        }
+        private void edit_filesystem_label (StorageBlock block) {
+            string identity = backend.modification_identity (block);
+            var dialog = new LabelDialog (block);
+            dialog.response.connect ((response) => {
+                if (response != "apply" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.modify_partitioning.begin (block, "label", identity, dialog.label_text, false, (obj, result) => {
+                    pending.remove (block.path);
+                    try {
+                        backend.modify_partitioning.end (result);
+                        notifications.add_toast (new Adw.Toast ("Filesystem label updated"));
+                    } catch (Error error) {
+                        show_check_message ("Could not update the filesystem label", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
         private void confirm_partitioning (StorageBlock block, bool deleting, bool volume = false) {
             string identity = backend.modification_identity (block);
             string device = block.preferred;
@@ -127,7 +192,7 @@ namespace MajorisDisks {
                 checks_running++;
                 check_progress.visible = true;
                 check_progress.start ();
-                backend.modify_partitioning.begin (block, command, identity, (obj, result) => {
+                backend.modify_partitioning.begin (block, command, identity, "", false, (obj, result) => {
                     pending.remove (block.path);
                     if (--checks_running == 0) {
                         check_progress.stop ();
@@ -283,6 +348,51 @@ namespace MajorisDisks {
             var fs = block.encrypted?.mapping?.filesystem ?? block.filesystem;
             if (fs != null) summary += fs.mounted ? " · " + string.joinv (", ", fs.mounts) : " · Unmounted";
             return summary;
+        }
+    }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/edit-filesystem-dialog.ui")]
+    public class LabelDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow entry;
+        public string label_text { owned get { return entry.text; } }
+
+        public LabelDialog (StorageBlock block) {
+            body = block.preferred + " · ext4 · Up to 16 bytes";
+            entry.text = block.label;
+            set_response_enabled ("apply", false);
+            string original = block.label;
+            entry.changed.connect (() => set_response_enabled ("apply",
+                entry.text != original && entry.text.length <= 16 && !entry.text.contains ("\n")));
+        }
+    }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/ownership-dialog.ui")]
+    public class OwnershipDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Gtk.CheckButton recursive;
+        public bool recursive_change { get { return recursive.active; } }
+
+        public OwnershipDialog (StorageBlock block) {
+            body = "%s · %s\n\nThe filesystem root directory will belong to you. A recursive change can affect files owned by other users or services.".printf (
+                block.preferred, block.type_id);
+        }
+    }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/edit-partition-dialog.ui")]
+    public class PartitionMetadataDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow name_entry;
+        [GtkChild] private unowned Gtk.CheckButton bootable;
+        public string partition_name { owned get { return name_entry.text; } }
+        public bool is_bootable { get { return bootable.active; } }
+
+        public PartitionMetadataDialog (StorageBlock block, StoragePartition part, bool gpt) {
+            body = block.preferred + (gpt ? " · GPT" : " · MBR\n\nChanging the bootable flag can affect system startup.");
+            name_entry.visible = gpt;
+            bootable.visible = !gpt;
+            string original_name = part.name;
+            bool original_bootable = (part.flags & 0x80) != 0;
+            name_entry.text = original_name;
+            bootable.active = original_bootable;
+            set_response_enabled ("apply", false);
+            name_entry.changed.connect (() => set_response_enabled ("apply",
+                name_entry.text != original_name && name_entry.text.char_count () <= 36));
+            bootable.toggled.connect (() => set_response_enabled ("apply", bootable.active != original_bootable));
         }
     }
 }

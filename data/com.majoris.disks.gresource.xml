@@ -9,6 +9,8 @@
     <file>ui/partition-segment.ui</file>
     <file>ui/sidebar-group-heading.ui</file>
     <file>ui/information-row.ui</file>
+    <file>ui/edit-filesystem-dialog.ui</file>
+    <file>ui/ownership-dialog.ui</file>
+    <file>ui/edit-partition-dialog.ui</file>
   </gresource>
 </gresources>
-

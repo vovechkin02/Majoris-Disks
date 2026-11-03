@@ -289,21 +289,33 @@ namespace MajorisDisks {
             }
         }
 
-        public async void modify_partitioning (StorageBlock block, string command, string confirmed_identity) throws Error {
+        public static bool supports_ownership (StorageBlock block) {
+            if (!block.available || block.read_only || block.system_hint ||
+                block.filesystem == null || block.filesystem.mounted) return false;
+            return block.type_id == "ext4" || block.type_id == "xfs" ||
+                   block.type_id == "btrfs" || block.type_id == "f2fs";
+        }
+        public async void modify_partitioning (StorageBlock block, string command, string confirmed_identity, string label = "", bool recursive = false) throws Error {
             bool deleting = command == "delete";
-            bool volume = command.has_prefix ("format:");
-            string format = volume ? command.substring (7) : command;
-            if (!volume && !deleting && command != "gpt" && command != "dos" && command != "empty")
+            bool rename = command == "label";
+            bool ownership = command == "ownership";
+            bool metadata = command == "name" || command == "bootable";
+            bool partition_operation = deleting || metadata;
+            bool volume = ownership || rename || command.has_prefix ("format:");
+            string format = volume && !rename ? command.substring (7) : command;
+            if (!volume && !partition_operation && command != "gpt" && command != "dos" && command != "empty")
                 throw new IOError.INVALID_ARGUMENT ("Unknown partitioning operation.");
-            string iface = deleting ? "Partition" : "Block";
+            if (rename && (block.type_id != "ext4" || label.length > 16 || !label.validate () || label.contains ("\n")))
+                throw new IOError.INVALID_ARGUMENT ("Enter a valid ext4 label of up to 16 bytes.");
+            string iface = rename || ownership ? "Filesystem" : partition_operation ? "Partition" : "Block";
             var proxy = require_volume (block, iface);
             var lifetime = backend_lifetime;
-            validate_modification (block, deleting, volume);
+            validate_modification (block, partition_operation, volume);
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The target changed after confirmation.");
             locks.acquire (block, snapshot.dependencies);
             try {
-                if (volume && format != "empty") {
+                if (volume && !rename && !ownership && format != "empty") {
                     var daemon = manager?.get_interface ("/org/freedesktop/UDisks2/Manager", PREFIX + "Manager") as DBusProxy;
                     if (daemon == null) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
                     var capability = yield daemon.call ("CanFormat", new Variant ("(s)", format),
@@ -323,11 +335,35 @@ namespace MajorisDisks {
                 if (lifetime.is_cancelled () || require_volume (block, iface) != proxy ||
                     modification_identity (block) != confirmed_identity)
                     throw new IOError.NOT_FOUND ("The target changed before the operation started.");
-                validate_modification (block, deleting, volume);
+                validate_modification (block, partition_operation, volume);
+                if (rename && block.type_id != "ext4")
+                    throw new IOError.NOT_FOUND ("The filesystem changed before the label could be applied.");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
-                var parameters = deleting ? new Variant.tuple ({ options.end () }) :
-                    new Variant.tuple ({ new Variant.string (format), options.end () });
-                yield proxy.call (deleting ? "Delete" : "Format", parameters,
+                if (ownership) {
+                    if (!supports_ownership (block))
+                        throw new IOError.NOT_SUPPORTED ("Ownership changes are unavailable for this filesystem.");
+                    options.add ("{sv}", "recursive", new Variant.boolean (recursive));
+                }
+                if (metadata) {
+                    var part = block.partition;
+                    var disk = part == null ? null : snapshot.blocks.lookup (part.table_path);
+                    string scheme = disk?.table?.scheme ?? "";
+                    if (part == null || (command == "name" && (scheme != "gpt" || !label.validate () ||
+                        label.char_count () > 36 || label.contains ("\n"))) ||
+                        (command == "bootable" && (scheme != "dos" || part.logical)))
+                        throw new IOError.INVALID_ARGUMENT ("The requested metadata is invalid for this partition table.");
+                    Variant value;
+                    if (command == "name") value = new Variant.string (label);
+                    else value = new Variant.uint64 (recursive ? part.flags | 0x80 : part.flags & ~((uint64) 0x80));
+                    yield proxy.call (command == "name" ? "SetName" : "SetFlags",
+                        new Variant.tuple ({ value, options.end () }),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
+                    synchronize ();
+                    return;
+                }
+                var parameters = deleting || ownership ? new Variant.tuple ({ options.end () }) :
+                    new Variant.tuple ({ new Variant.string (rename ? label : format), options.end () });
+                yield proxy.call (ownership ? "TakeOwnership" : rename ? "SetLabel" : deleting ? "Delete" : "Format", parameters,
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
                 synchronize ();
             } finally {

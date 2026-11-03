@@ -1,0 +1,16 @@
+<interface>
+  <template class="MajorisDisksOwnershipDialog" parent="AdwAlertDialog">
+    <property name="heading">Take Filesystem Ownership?</property>
+    <property name="extra-child">
+      <object class="GtkCheckButton" id="recursive">
+        <property name="label">Also change ownership of existing files and folders</property>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="apply" appearance="destructive">Take Ownership</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>
