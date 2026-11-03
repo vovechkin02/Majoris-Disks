@@ -6,5 +6,7 @@ deps = [
   dependency('gio-2.0', version: '>=2.74'),
 ]
 subdir('src')
-subdir('tests')
+layout_test = executable('storage-model-test', 'tests/storage-model-test.vala',
+  storage_model_sources, dependencies: dependency('gio-2.0'))
+test('storage-model', layout_test)
 install_data('data/com.majoris.disks.desktop', install_dir: get_option('datadir') / 'applications')

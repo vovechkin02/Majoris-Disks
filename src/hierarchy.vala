@@ -15,13 +15,19 @@ namespace MajorisDisks {
                 if (part != null) {
                     var disk = snapshot.blocks.lookup (part.table_path);
                     if (disk != null && disk.table != null) {
-                        disk.table.partitions += block;
+                        var partitions = disk.table.partitions;
+                        partitions += block;
+                        disk.table.partitions = partitions;
                         block.parent = disk;
                     }
                 }
                 var physical = snapshot.drives.lookup (block.drive_path);
                 block.physical_drive = physical;
-                if (physical != null) physical.blocks += block;
+                if (physical != null) {
+                    var blocks = physical.blocks;
+                    blocks += block;
+                    physical.blocks = blocks;
+                }
                 if (block.partition != null || block.backing_path != "/" || block.ignored ||
                     block.device.has_prefix ("/dev/ram") || block.device.has_prefix ("/dev/zram") ||
                     (block.loop != null && block.loop.backing_file == "")) continue;
@@ -30,7 +36,12 @@ namespace MajorisDisks {
                     drive = previous.lookup (block.path) ?? new StorageDrive (block.path);
                     drive.blocks = { block };
                     drive.name = block.loop != null ? Path.get_basename (block.loop.backing_file) : block.name;
-                    drive.category = block.loop != null ? "Disk Images" : "Other";
+                    if (block.raid_path != "/")
+                        drive.category = "RAID Arrays";
+                    else if (block.logical_volume_path != "/")
+                        drive.category = "Logical Volumes";
+                    else
+                        drive.category = block.loop != null ? "Disk Images" : "Other";
                     drive.size = block.size;
                     drive.available = block.available;
                     snapshot.drives.insert (drive.path, drive);
@@ -56,6 +67,7 @@ namespace MajorisDisks {
                     }
                     parts[position] = item;
                 }
+                table.partitions = parts;
                 foreach (var logical in parts) {
                     if (table.scheme != "dos" || !logical.partition.logical || logical.partition.container) continue;
                     foreach (var container in parts) {

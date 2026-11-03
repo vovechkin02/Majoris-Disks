@@ -108,17 +108,17 @@ namespace MajorisDisks {
 
         public override void snapshot (Gtk.Snapshot snapshot) {
             for (var child = get_first_child (); child != null; child = child.get_next_sibling ())
-                if (child.child_visible) snapshot_child (child, snapshot);
+                if (child.get_child_visible ()) snapshot_child (child, snapshot);
         }
         public override void size_allocate (int width, int height, int baseline) {
             for (var child = get_first_child (); child != null; child = child.get_next_sibling ()) {
                 var segment = (PartitionSegment) child;
                 int start = PartitionLayoutService.pixel (segment.start, capacity, width);
                 int end = PartitionLayoutService.pixel (segment.end, capacity, width);
-                segment.child_visible = end > start;
+                segment.set_child_visible (end > start);
                 if (end <= start) continue;
-                Gtk.Allocation allocation = { start, 0, end - start, height };
-                segment.size_allocate (allocation, -1);
+                Graphene.Point origin = { start, 0 };
+                segment.allocate (end - start, height, -1, new Gsk.Transform ().translate (origin));
             }
         }
     }
@@ -130,7 +130,7 @@ namespace MajorisDisks {
         public uint64 end;
 
         public void describe (StorageDevice region) {
-            caption.label = region is StorageFreeSpace ? "Free" : region.name;
+            caption.label = (region is StorageFreeSpace) ? "Free" : region.name;
             tooltip_text = region.name + " · " + VolumeRow.describe (region);
             update_property (Gtk.AccessibleProperty.LABEL, region.name,
                              Gtk.AccessibleProperty.DESCRIPTION, VolumeRow.describe (region), -1);

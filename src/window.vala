@@ -36,6 +36,7 @@ namespace MajorisDisks {
                 split.show_content = true;
             });
             backend.changed.connect (update_devices);
+            drive_view.backend = backend;
             drive_view.action_requested.connect ((block, method) => {
                 if (pending.contains (block.path)) return;
                 pending.insert (block.path, block);

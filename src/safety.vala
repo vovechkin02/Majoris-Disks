@@ -21,6 +21,8 @@ namespace MajorisDisks {
             new HashTable<StorageDevice, GenericArray<StorageDevice>> (direct_hash, direct_equal);
         private HashTable<StorageDevice, StorageDevice> unresolved =
             new HashTable<StorageDevice, StorageDevice> (direct_hash, direct_equal);
+        private HashTable<StorageDevice, GenericArray<StorageDevice>> parents =
+            new HashTable<StorageDevice, GenericArray<StorageDevice>> (direct_hash, direct_equal);
 
         public void add (StorageDevice source, StorageDevice? dependent) {
             if (dependent == null) {
@@ -33,6 +35,28 @@ namespace MajorisDisks {
                 edges.insert (source, list);
             }
             list.add (dependent);
+            var upstream = parents.lookup (dependent);
+            if (upstream == null) {
+                upstream = new GenericArray<StorageDevice> ();
+                parents.insert (dependent, upstream);
+            }
+            upstream.add (source);
+        }
+
+        public StorageDevice[] ancestors (StorageDevice device) {
+            var seen = new HashTable<StorageDevice, StorageDevice> (direct_hash, direct_equal);
+            StorageDevice[] result = { device };
+            seen.insert (device, device);
+            for (int i = 0; i < result.length; i++) {
+                var upstream = parents.lookup (result[i]);
+                if (upstream == null) continue;
+                foreach (var parent in upstream) {
+                    if (seen.contains (parent)) continue;
+                    seen.insert (parent, parent);
+                    result += parent;
+                }
+            }
+            return result;
         }
 
         public StorageDevice[] children (StorageDevice source) {
@@ -104,11 +128,13 @@ namespace MajorisDisks {
                         result.system_critical = true;
                 }
             }
-            if (result.system_critical) result.reasons += "Supports a running system filesystem";
-            if (result.active_dependents) result.reasons += "Has active storage dependencies";
-            if (result.mounted) result.reasons += "Filesystem is mounted";
-            if (result.unknown_dependencies) result.reasons += "Dependencies could not be fully resolved";
-            if (result.read_only) result.reasons += "Device is read-only";
+            string[] reasons = {};
+            if (result.system_critical) reasons += "Supports a running system filesystem";
+            if (result.active_dependents) reasons += "Has active storage dependencies";
+            if (result.mounted) reasons += "Filesystem is mounted";
+            if (result.unknown_dependencies) reasons += "Dependencies could not be fully resolved";
+            if (result.read_only) reasons += "Device is read-only";
+            result.reasons = reasons;
             return result;
         }
     }

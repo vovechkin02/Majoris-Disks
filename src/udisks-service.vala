@@ -17,7 +17,7 @@ namespace MajorisDisks {
                 try {
                     manager = yield new DBusObjectManagerClient.for_bus (
                         BusType.SYSTEM, DBusObjectManagerClientFlags.NONE,
-                        "org.freedesktop.UDisks2", "/org/freedesktop/UDisks2");
+                        "org.freedesktop.UDisks2", "/org/freedesktop/UDisks2", null, null);
                 } finally {
                     connecting = false;
                 }
@@ -258,15 +258,21 @@ namespace MajorisDisks {
         }
 
         public string modification_identity (StorageBlock block) {
-            var identity = new StringBuilder ();
+            var records = new GenericArray<string> ();
             foreach (var node in snapshot.dependencies.descendants (block)) {
                 var child = node as StorageBlock;
                 if (child == null) continue;
-                identity.append_printf ("%s|%s|%s|%s|%s|%s|%s\n", child.path, child.device,
-                    child.number.to_string (), child.size.to_string (), child.uuid,
-                    child.partition?.uuid ?? "", child.partition?.offset.to_string () ?? "");
+                var partition = child.partition;
+                var drive = child.physical_drive;
+                records.add (new Variant ("(ssssssssssttttu)", child.path, child.device,
+                    child.parent?.path ?? "", child.drive_path, drive?.serial ?? "", drive?.wwn ?? "",
+                    child.uuid, partition?.uuid ?? "", partition?.table_path ?? "",
+                    child.table?.scheme ?? "", child.number, child.size, partition?.offset ?? 0,
+                    child.logical_sector_size, partition?.number ?? 0).print (false));
             }
-            identity.append (block.physical_drive?.serial ?? "");
+            records.sort ((left, right) => strcmp (left, right));
+            var identity = new StringBuilder ();
+            foreach (var record in records) identity.append (record).append_c ('\n');
             return identity.str;
         }
 
@@ -381,6 +387,24 @@ namespace MajorisDisks {
                 throw new IOError.BUSY ("The volume has active or unresolved storage dependencies.");
         }
 
+        private async Variant query_filesystem_capability (string method, string filesystem_type) throws Error {
+            var daemon = manager?.get_interface ("/org/freedesktop/UDisks2/Manager", PREFIX + "Manager") as DBusProxy;
+            if (daemon == null) throw new IOError.NOT_CONNECTED ("The UDisks manager is unavailable.");
+            return yield daemon.call (method,
+                new Variant ("(s)", filesystem_type), DBusCallFlags.NONE, -1, backend_lifetime);
+        }
+
+        public async FilesystemResizeMode filesystem_resize_modes (string filesystem_type,
+            out string missing_utility) throws Error {
+            var capability = yield query_filesystem_capability ("CanResize", filesystem_type);
+            return FilesystemCapabilityService.resize_modes (capability, out missing_utility);
+        }
+
+        public async bool maintenance_available (string filesystem_type, bool repair) throws Error {
+            var capability = yield query_filesystem_capability (repair ? "CanRepair" : "CanCheck", filesystem_type);
+            return FilesystemCapabilityService.check_available (capability, repair);
+        }
+
         public async bool check_filesystem (StorageBlock block, bool repair = false) throws Error {
             var filesystem = require_volume (block, "Filesystem");
             validate_check (block);
@@ -389,14 +413,10 @@ namespace MajorisDisks {
             string filesystem_type = block.type_id;
             string filesystem_uuid = block.uuid;
             uint64 device_number = block.number;
-            var daemon = manager?.get_interface ("/org/freedesktop/UDisks2/Manager", PREFIX + "Manager") as DBusProxy;
-            if (daemon == null) throw new IOError.NOT_CONNECTED ("The UDisks manager is unavailable.");
             var lifetime = backend_lifetime;
             locks.acquire (block, snapshot.dependencies);
             try {
-                var capability = yield daemon.call (repair ? "CanRepair" : "CanCheck", new Variant ("(s)", filesystem_type),
-                    DBusCallFlags.NONE, -1, lifetime);
-                if (!FilesystemCapabilityService.check_available (capability, repair))
+                if (!(yield maintenance_available (filesystem_type, repair)))
                     throw new IOError.NOT_SUPPORTED (repair ? "UDisks does not support repairing this filesystem." :
                         "UDisks does not support checking this filesystem.");
                 yield KernelStorageSafety.require_idle (block, lifetime);

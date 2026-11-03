@@ -26,6 +26,8 @@ namespace MajorisDisks {
         public signal void partitioning_requested (StorageBlock block, bool deleting);
         private StorageBlock? selected_block;
         public signal void check_requested (StorageBlock block, bool repair);
+        public UDisksService? backend { private get; set; }
+        private uint maintenance_generation;
         private StorageDrive? current;
         private StorageBlock? target;
         private string method = "";
@@ -154,6 +156,7 @@ namespace MajorisDisks {
             map.select (selected);
             properties.visible = row != null;
             target = null;
+            maintenance_generation++;
             method = "";
             operation.visible = false;
             open_files.visible = false;
@@ -234,8 +237,28 @@ namespace MajorisDisks {
             check_filesystem.visible = fs != null && !fs.mounted && target.available && !target.ignored &&
                 target.type_id != "" && target.encrypted == null;
             repair_filesystem.visible = check_filesystem.visible && !target.read_only && !target.system_hint;
+            uint generation = ++maintenance_generation;
+            probe_maintenance (check_filesystem, target.type_id, false, generation);
+            probe_maintenance (repair_filesystem, target.type_id, true, generation);
             if (fs != null) usage.label = usage_service.show (target);
             else usage_service.clear ();
+        }
+
+        private void probe_maintenance (Gtk.Button button, string filesystem_type, bool repair, uint generation) {
+            button.sensitive = false;
+            button.tooltip_text = null;
+            var service = backend;
+            if (!button.visible || service == null) return;
+            service.maintenance_available.begin (filesystem_type, repair, (object, result) => {
+                try {
+                    bool supported = service.maintenance_available.end (result);
+                    if (generation != maintenance_generation) return;
+                    button.sensitive = supported;
+                    if (!supported) button.tooltip_text = "UDisks does not support this operation.";
+                } catch (Error error) {
+                    if (generation == maintenance_generation) button.tooltip_text = error.message;
+                }
+            });
         }
 
         private void add_volume_field (string title, string value, bool copy = false) {
