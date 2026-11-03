@@ -1,0 +1,11 @@
+<interface>
+  <template class="MajorisDisksInformationRow" parent="AdwActionRow">
+    <property name="use-markup">false</property>
+    <child type="suffix">
+      <object class="GtkButton" id="copy_button">
+        <property name="label">Copy</property>
+        <property name="valign">center</property>
+      </object>
+    </child>
+  </template>
+</interface>

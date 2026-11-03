@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksDriveInformationDialog" parent="AdwDialog">
+<property name="title">Drive Information</property><property name="content-width">520</property><property name="content-height">520</property>
+<property name="child"><object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar"/></child><property name="content">
+<object class="AdwPreferencesPage"><child><object class="AdwPreferencesGroup" id="fields"/></child></object>
+</property></object></property>
+  </template>
+</interface>

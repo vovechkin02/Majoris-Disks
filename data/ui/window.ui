@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksDisksWindow" parent="AdwApplicationWindow">
+<property name="title">Disks</property>
+<property name="default-width">900</property><property name="default-height">650</property>
+<property name="content"><object class="AdwNavigationSplitView" id="split">
+<property name="sidebar"><object class="AdwNavigationPage"><property name="title">Devices</property><property name="child">
+<object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar"><child type="end"><object class="GtkButton" id="refresh_button"><property name="label">Refresh</property></object></child></object></child>
+<property name="content"><object class="GtkScrolledWindow"><property name="child"><object class="GtkListBox" id="sidebar"><style><class name="navigation-sidebar"/></style></object></property></object></property>
+</object></property></object></property>
+<property name="content"><object class="AdwNavigationPage"><property name="title">Storage</property><property name="child">
+<object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar">
+<child type="end"><object class="GtkSpinner" id="check_progress"><property name="visible">false</property><property name="tooltip-text">Storage operation in progress</property></object></child>
+</object></child><property name="content">
+<object class="AdwToastOverlay" id="notifications"><property name="child"><object class="GtkStack" id="states">
+<child><object class="AdwStatusPage" id="status"><property name="title">Connecting to UDisks…</property><property name="icon-name">drive-harddisk-symbolic</property></object></child>
+<child><object class="MajorisDisksDriveView" id="drive_view"/></child>
+</object></property></object></property></object>
+</property></object></property></object></property>
+    <child>
+      <object class="AdwBreakpoint">
+        <condition>max-width: 600px</condition>
+        <setter object="split" property="collapsed">True</setter>
+      </object>
+    </child>
+  </template>
+</interface>

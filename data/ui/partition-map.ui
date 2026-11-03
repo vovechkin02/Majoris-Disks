@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksPartitionMap" parent="GtkBox">
+<property name="orientation">vertical</property><child><object class="GtkScrolledWindow"><property name="vscrollbar-policy">never</property><property name="child"><object class="GtkBox" id="tracks"><property name="orientation">vertical</property><property name="spacing">4</property></object></property></object></child>
+  </template>
+</interface>

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Disks
+Comment=Inspect and manage storage devices
+Exec=majoris-disks
+Icon=drive-harddisk
+Type=Application
+Categories=GTK;System;Filesystem;
+Terminal=false

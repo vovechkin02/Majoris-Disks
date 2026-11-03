@@ -1,0 +1,11 @@
+<interface>
+  <template class="MajorisDisksSidebarGroupHeading" parent="GtkBox">
+    <child>
+      <object class="GtkLabel" id="caption">
+        <property name="xalign">0</property>
+        <style><class name="heading"/></style>
+      </object>
+    </child>
+  </template>
+</interface>
+

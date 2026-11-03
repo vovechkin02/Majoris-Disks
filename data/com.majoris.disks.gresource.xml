@@ -1,0 +1,14 @@
+<gresources>
+  <gresource prefix="/com/majoris/disks">
+    <file>ui/window.ui</file>
+    <file>ui/device-row.ui</file>
+    <file>ui/volume-row.ui</file>
+    <file>ui/partition-map.ui</file>
+    <file>ui/drive-view.ui</file>
+    <file>ui/drive-information-dialog.ui</file>
+    <file>ui/partition-segment.ui</file>
+    <file>ui/sidebar-group-heading.ui</file>
+    <file>ui/information-row.ui</file>
+  </gresource>
+</gresources>
+

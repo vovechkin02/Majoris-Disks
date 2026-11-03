@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksDriveView" parent="GtkBox">
+<property name="orientation">vertical</property>
+<child><object class="GtkScrolledWindow"><property name="vexpand">true</property><property name="hscrollbar-policy">never</property><property name="child">
+<object class="GtkBox"><property name="orientation">vertical</property>
+
+<child><object class="AdwPreferencesGroup"><child><object class="AdwActionRow" id="summary"><property name="use-markup">false</property>
+<child type="prefix"><object class="GtkImage" id="drive_icon"/></child>
+<child type="suffix"><object class="GtkButton" id="initialize_disk"><property name="label">Initialize Disk</property><property name="valign">center</property></object></child>
+<child type="suffix"><object class="GtkButton" id="information"><property name="label">Information</property><property name="valign">center</property></object></child></object></child></object></child>
+<child><object class="MajorisDisksPartitionMap" id="map"/></child>
+<child><object class="GtkListBox" id="volumes"><style><class name="boxed-list"/></style></object></child>
+<child><object class="AdwPreferencesGroup" id="properties"><property name="title">Volume information</property>
+
+<child><object class="GtkLabel" id="usage"><property name="xalign">0</property><property name="wrap">true</property></object></child>
+<child><object class="GtkBox">
+<child><object class="GtkButton" id="operation"><property name="label">Mount</property></object></child>
+<child><object class="GtkButton" id="check_filesystem"><property name="label">Check Filesystem</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="repair_filesystem"><property name="label">Repair Filesystem</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="format_volume"><property name="label">Format Volume</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="delete_partition"><property name="label">Delete Partition</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="open_files"><property name="label">Open in Files</property></object></child>
+</object></child></object></child>
+</object></property></object></child>
+  </template>
+</interface>

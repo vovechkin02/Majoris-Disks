@@ -1,0 +1,10 @@
+<interface>
+  <template class="MajorisDisksPartitionSegment" parent="GtkToggleButton">
+    <property name="overflow">hidden</property>
+    <property name="child">
+      <object class="GtkLabel" id="caption">
+        <property name="ellipsize">end</property>
+      </object>
+    </property>
+  </template>
+</interface>
