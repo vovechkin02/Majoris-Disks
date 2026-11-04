@@ -21,9 +21,16 @@ namespace MajorisDisks {
         }
         private HashTable<string, CacheEntry> cache = new HashTable<string, CacheEntry> (str_hash, str_equal);
 
+        public void invalidate (string object_path = "") {
+            if (object_path == "") { cache.remove_all (); return; }
+            foreach (var key in cache.get_keys ()) if (key.has_prefix (object_path + "\n")) cache.remove (key);
+        }
+
         public async uint64 query (StorageBlock block, Cancellable token) throws Error {
-            string key = "%s\n%s\n%s\n%" + uint64.FORMAT;
-            key = key.printf (block.path, block.uuid, block.type_id, block.size);
+            string mounts = block.filesystem == null ? "" : string.joinv ("\n", block.filesystem.mounts);
+            string key = "%s\n%s\n%s\n%s\n%s\n%s\n%" + uint64.FORMAT + "\n%" + uint64.FORMAT + "\n%s";
+            key = key.printf (block.path, block.preferred, block.physical_drive?.serial ?? "",
+                block.physical_drive?.wwn ?? "", block.uuid, block.type_id, block.number, block.size, mounts);
             var cached = cache.lookup (key);
             if (cached != null && get_monotonic_time () - cached.recorded < 60 * TimeSpan.SECOND)
                 return cached.size;
@@ -36,16 +43,16 @@ namespace MajorisDisks {
                     uint64 blocks = parse_named_number (estimate, "Estimated minimum size of the filesystem:");
                     if (block_size == 0 || blocks == 0 || blocks > uint64.MAX / block_size)
                         throw new IOError.INVALID_DATA ("The ext filesystem minimum-size estimate was invalid.");
-                    minimum = blocks * block_size;
+                    minimum = validated_boundary (blocks * block_size, block, true);
                     break;
                 case "ntfs":
-                    minimum = parse_named_number (yield run ({ "ntfsresize", "--info", "--force", block.preferred }, token), "Minsize");
+                    minimum = validated_boundary (parse_named_number (yield run ({ "ntfsresize", "--info", "--force", block.preferred }, token), "Minsize"), block, false);
                     break;
                 case "btrfs":
                     var fs = block.filesystem;
                     if (fs == null || !fs.mounted)
                         throw new IOError.NOT_SUPPORTED ("Btrfs minimum size can only be queried while mounted.");
-                    minimum = parse_first_number (yield run ({ "btrfs", "inspect-internal", "min-dev-size", fs.mounts[0] }, token));
+                    minimum = validated_boundary (parse_first_number (yield run ({ "btrfs", "inspect-internal", "min-dev-size", fs.mounts[0] }, token)), block, false);
                     break;
                 default:
                     throw new IOError.NOT_SUPPORTED ("No reliable minimum-size backend is available for this filesystem.");
@@ -54,6 +61,18 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_DATA ("The filesystem minimum-size backend returned an unsafe value.");
             var entry = new CacheEntry (); entry.size = minimum; cache.insert (key, entry);
             return minimum;
+        }
+
+        private static uint64 validated_boundary (uint64 reported, StorageBlock block, bool estimate) throws Error {
+            uint64 alignment = uint64.max (block.logical_sector_size, block.physical_sector_size);
+            alignment = uint64.max (alignment, 1024 * 1024);
+            uint64 margin = estimate ? uint64.max (64 * 1024 * 1024, reported / 20) : 16 * 1024 * 1024;
+            if (reported > uint64.MAX - margin) throw new IOError.INVALID_DATA ("The minimum-size estimate overflowed.");
+            uint64 safe = reported + margin;
+            if (safe % alignment != 0) safe += alignment - safe % alignment;
+            if (safe >= block.size)
+                throw new IOError.NOT_SUPPORTED ("No reliably validated shrink range remains after the required safety margin.");
+            return safe;
         }
 
         private static async string run (string[] argv, Cancellable token) throws Error {

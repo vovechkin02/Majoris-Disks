@@ -1,5 +1,8 @@
 <interface>
   <template class="MajorisDisksFormatDiskDialog" parent="AdwAlertDialog">
+    <property name="extra-child"><object class="AdwPreferencesGroup">
+      <child><object class="AdwSwitchRow" id="overwrite_row"><property name="title">Overwrite existing data</property><property name="subtitle">Writes zeroes to accessible logical blocks before creating the selected table. This can take a long time and is not guaranteed secure erasure, especially on SSDs.</property><property name="subtitle-lines">4</property></object></child>
+    </object></property>
     <responses>
       <response id="cancel">Cancel</response>
       <response id="gpt" appearance="destructive">Create GPT</response>

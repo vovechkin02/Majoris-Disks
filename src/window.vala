@@ -3,8 +3,6 @@ namespace MajorisDisks {
     public class DisksWindow : Adw.ApplicationWindow {
         [GtkChild] private unowned Gtk.ListBox sidebar;
         [GtkChild] private unowned Gtk.Button refresh_button;
-        [GtkChild] private unowned Gtk.Spinner check_progress;
-        private uint checks_running;
         [GtkChild] private unowned Adw.NavigationSplitView split;
         [GtkChild] private unowned Gtk.Stack states;
         [GtkChild] private unowned Adw.StatusPage status;
@@ -45,6 +43,7 @@ namespace MajorisDisks {
                     pending.remove (block.path);
                     try {
                         backend.volume_action.end (result);
+                        drive_view.invalidate_usage (block);
                         notifications.add_toast (new Adw.Toast (method == "Mount" ? "Volume mounted" :
                             method == "Unmount" ? "Volume unmounted" : method == "Start" ? "Swap activated" : "Swap deactivated"));
                     } catch (Error error) {
@@ -138,6 +137,7 @@ namespace MajorisDisks {
                         pending.remove (block.path);
                         try {
                             backend.modify_partitioning.end (result);
+                            drive_view.invalidate_usage (block);
                             notifications.add_toast (new Adw.Toast ("Filesystem ownership updated"));
                         } catch (Error error) {
                             show_check_message ("Could not change ownership", operation_error (error));
@@ -156,6 +156,7 @@ namespace MajorisDisks {
                     pending.remove (block.path);
                     try {
                         backend.modify_partitioning.end (result);
+                        drive_view.invalidate_usage (block);
                         notifications.add_toast (new Adw.Toast ("Filesystem label updated"));
                     } catch (Error error) {
                         show_check_message ("Could not update the filesystem label", operation_error (error));
@@ -186,6 +187,8 @@ namespace MajorisDisks {
                 if (command == "cancel" || pending.contains (block.path)) return;
                 string backend_command = command;
                 string format_label = "";
+                if (!volume && !deleting && ((FormatDiskDialog) dialog).overwrite)
+                    backend_command += "-zero";
                 if (volume) {
                     var format_dialog = (FormatVolumeDialog) dialog;
                     if (command != "format") return;
@@ -193,17 +196,11 @@ namespace MajorisDisks {
                     format_label = format_dialog.volume_label;
                 }
                 pending.insert (block.path, block);
-                checks_running++;
-                check_progress.visible = true;
-                check_progress.start ();
                 backend.modify_partitioning.begin (block, backend_command, identity, format_label, false, (obj, result) => {
                     pending.remove (block.path);
-                    if (--checks_running == 0) {
-                        check_progress.stop ();
-                        check_progress.visible = false;
-                    }
                     try {
                         backend.modify_partitioning.end (result);
+                        drive_view.invalidate_usage (block);
                         notifications.add_toast (new Adw.Toast (volume ? "Volume formatted" : deleting ? "Partition deleted" : "Disk initialized"));
                     } catch (Error error) {
                         show_check_message ("Could not modify " + device, operation_error (error));
@@ -225,8 +222,9 @@ namespace MajorisDisks {
                         pending.remove (disk.path);
                         try {
                             var result = backend.create_partition.end (async_result);
-                            if (result.partial) show_check_message ("Partition partially created", result.summary +
-                                (result.technical_error == "" ? "" : "\n\n" + result.technical_error));
+                            if (result.partial || result.status == StorageOperationStatus.NEEDS_ATTENTION)
+                                show_check_message (result.status == StorageOperationStatus.NEEDS_ATTENTION ?
+                                    "Partition needs attention" : "Partition partially created", operation_result_details (result));
                             else notifications.add_toast (new Adw.Toast (result.summary));
                         } catch (Error error) {
                             show_check_message ("Could not create partition", operation_error (error));
@@ -249,8 +247,10 @@ namespace MajorisDisks {
                         pending.remove (block.path);
                         try {
                             var result = backend.resize_volume.end (async_result);
-                            if (result.partial) show_check_message ("Volume partially resized", result.summary +
-                                (result.technical_error == "" ? "" : "\n\n" + result.technical_error));
+                            drive_view.invalidate_usage (block);
+                            if (result.partial || result.status == StorageOperationStatus.NEEDS_ATTENTION)
+                                show_check_message (result.status == StorageOperationStatus.NEEDS_ATTENTION ?
+                                    "Volume needs attention" : "Volume partially resized", operation_result_details (result));
                             else notifications.add_toast (new Adw.Toast (result.summary));
                         } catch (Error error) {
                             show_check_message ("Could not resize volume", operation_error (error));
@@ -262,18 +262,12 @@ namespace MajorisDisks {
         private void run_maintenance (StorageBlock block, bool repair) {
             if (pending.contains (block.path)) return;
             pending.insert (block.path, block);
-            checks_running++;
-            check_progress.visible = true;
-            check_progress.start ();
             string device = block.preferred;
             backend.check_filesystem.begin (block, repair, (obj, result) => {
                 pending.remove (block.path);
-                if (--checks_running == 0) {
-                    check_progress.stop ();
-                    check_progress.visible = false;
-                }
                 try {
                     if (backend.check_filesystem.end (result)) {
+                        drive_view.invalidate_usage (block);
                         var message = repair ? "Repaired %s." : "%s appears consistent.";
                         notifications.add_toast (new Adw.Toast (message.printf (device)));
                     } else {
@@ -289,6 +283,14 @@ namespace MajorisDisks {
         private void show_check_message (string title, string body) {
             var dialog = new OperationResultDialog () { heading = title, body = body };
             dialog.present (this);
+        }
+        private static string operation_result_details (StorageOperationResult result) {
+            var details = new StringBuilder (result.summary);
+            if (result.completed_steps.length != 0)
+                details.append ("\n\nCompleted: ").append (string.joinv (", ", result.completed_steps));
+            if (result.actual_state != "") details.append ("\n\nActual state: ").append (result.actual_state);
+            if (result.technical_error != "") details.append ("\n\n").append (result.technical_error);
+            return details.str;
         }
         private static string operation_error (Error error) {
             string? remote = DBusError.get_remote_error (error);
@@ -430,6 +432,7 @@ namespace MajorisDisks {
     }
     [GtkTemplate (ui = "/com/majoris/disks/ui/edit-partition-dialog.ui")]
     public class PartitionMetadataDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow type_row;
         [GtkChild] private unowned Adw.EntryRow type_entry;
         [GtkChild] private unowned Adw.EntryRow name_entry;
         [GtkChild] private unowned Gtk.CheckButton bootable;
@@ -439,8 +442,12 @@ namespace MajorisDisks {
         private uint64 original_flags;
         private string original_name;
         private string original_type;
+        private Gtk.StringList type_names = new Gtk.StringList (null);
+        private string[] type_ids = {};
         public string partition_name { owned get { return name_entry.text; } }
-        public string partition_type { owned get { return type_entry.text; } }
+        public string partition_type { owned get {
+            return type_row.selected < type_ids.length ? type_ids[type_row.selected] : type_entry.text;
+        } }
         public bool is_bootable { get { return bootable.active; } }
         public uint64 partition_flags { get {
             uint64 known = required.visible ? (uint64) 7 : (uint64) 0x80;
@@ -460,7 +467,25 @@ namespace MajorisDisks {
             no_block_io.visible = gpt;
             legacy_boot.visible = gpt;
             original_type = part.type_id;
+            type_row.model = type_names;
+            if (gpt) {
+                add_type ("c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "EFI System");
+                add_type ("0fc63daf-8483-4772-8e79-3d69d8477de4", "Linux filesystem");
+                add_type ("0657fd6d-a4ab-43c4-84e5-0933c84b4f4f", "Linux swap");
+                add_type ("e6d6d379-f507-44c2-a23c-238f2a3df928", "Linux LVM");
+                add_type ("a19d880f-05fc-4d3b-a006-743f0f84911e", "Linux RAID");
+                add_type ("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7", "Microsoft basic data");
+            } else {
+                add_type ("0x83", "Linux filesystem"); add_type ("0x82", "Linux swap");
+                add_type ("0x8e", "Linux LVM"); add_type ("0xfd", "Linux RAID autodetect");
+                add_type ("0x07", "NTFS / exFAT"); add_type ("0x0c", "FAT32 (LBA)");
+            }
+            add_type ("", "Other…");
+            uint selected_type = (uint) (type_ids.length - 1);
+            for (uint i = 0; i + 1 < type_ids.length; i++) if (type_ids[i].down () == original_type.down ()) selected_type = i;
+            type_row.selected = selected_type;
             type_entry.text = original_type;
+            type_entry.visible = selected_type + 1 == type_ids.length;
             original_name = part.name;
             original_flags = part.flags;
             bool original_bootable = (original_flags & 0x80) != 0;
@@ -471,17 +496,20 @@ namespace MajorisDisks {
             legacy_boot.active = (original_flags & 4) != 0;
             set_response_enabled ("apply", false);
             type_entry.changed.connect (update_enabled);
+            type_row.notify["selected"].connect (() => { type_entry.visible = type_row.selected + 1 == type_ids.length; update_enabled (); });
             name_entry.changed.connect (update_enabled);
             bootable.toggled.connect (update_enabled);
             required.toggled.connect (update_enabled);
             no_block_io.toggled.connect (update_enabled);
             legacy_boot.toggled.connect (update_enabled);
         }
+        private void add_type (string id, string title) { type_ids += id; type_names.append (title); }
         private void update_enabled () {
-            bool valid = type_entry.text.strip () != "" && type_entry.text.validate () &&
+            string selected_type = partition_type;
+            bool valid = selected_type.strip () != "" && selected_type.validate () &&
                 (!name_entry.visible || (name_entry.text.validate () && name_entry.text.char_count () <= 36 && !name_entry.text.contains ("\n")));
             set_response_enabled ("apply", valid && (partition_flags != original_flags ||
-                name_entry.text != original_name || type_entry.text != original_type));
+                name_entry.text != original_name || selected_type != original_type));
         }
     }
     [GtkTemplate (ui = "/com/majoris/disks/ui/operation-result-dialog.ui")]
@@ -494,7 +522,10 @@ namespace MajorisDisks {
     public class DeleteConfirmationDialog : Adw.AlertDialog {}
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/format-disk-dialog.ui")]
-    public class FormatDiskDialog : Adw.AlertDialog {}
+    public class FormatDiskDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.SwitchRow overwrite_row;
+        public bool overwrite { get { return overwrite_row.active; } }
+    }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/format-volume-dialog.ui")]
     public class FormatVolumeDialog : Adw.AlertDialog {
@@ -554,7 +585,8 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.SpinRow size_row;
         [GtkChild] private unowned Adw.ActionRow remaining_row;
         [GtkChild] private unowned Adw.ComboRow kind_row;
-        [GtkChild] private unowned Adw.EntryRow type_row;
+        [GtkChild] private unowned Adw.ComboRow type_row;
+        [GtkChild] private unowned Adw.EntryRow custom_type_row;
         [GtkChild] private unowned Adw.EntryRow name_row;
         [GtkChild] private unowned Adw.ComboRow filesystem_row;
         [GtkChild] private unowned Adw.EntryRow label_row;
@@ -564,6 +596,8 @@ namespace MajorisDisks {
         private PartitionLayoutService.PartitionKind[] kind_ids = {};
         private Gtk.StringList formats = new Gtk.StringList (null);
         private string[] format_ids = {};
+        private Gtk.StringList type_names = new Gtk.StringList (null);
+        private string[] type_ids = {};
         private const uint64 MIB = 1024 * 1024;
 
         public uint64 requested_size { get {
@@ -571,7 +605,10 @@ namespace MajorisDisks {
             return gap.size - uint64.min (gap.size, value) < uint64.max (disk.logical_sector_size, MIB) ? 0 : value;
         } }
         public PartitionLayoutService.PartitionKind partition_kind { get { return kind_ids[kind_row.selected]; } }
-        public string partition_type { owned get { return type_row.text; } }
+        public string partition_type { owned get {
+            if (partition_kind == PartitionLayoutService.PartitionKind.MBR_EXTENDED) return "0x05";
+            return type_row.selected < type_ids.length ? type_ids[type_row.selected] : custom_type_row.text;
+        } }
         public string partition_name { owned get { return name_entry_allowed () ? name_row.text : ""; } }
         public string filesystem_type { owned get { return format_ids[filesystem_row.selected]; } }
         public string volume_label { owned get { return label_row.text; } }
@@ -581,6 +618,7 @@ namespace MajorisDisks {
             this.gap = gap;
             kind_row.model = kinds;
             filesystem_row.model = formats;
+            type_row.model = type_names;
             available_row.subtitle = "%s at byte offset %s".printf (format_size (gap.size), gap.offset.to_string ());
             double maximum = double.max (1, (double) gap.size / MIB);
             size_row.adjustment.upper = maximum;
@@ -594,6 +632,19 @@ namespace MajorisDisks {
                 foreach (var existing in disk.table.partitions) extended |= existing.partition?.container == true;
                 if (!extended) add_kind (PartitionLayoutService.PartitionKind.MBR_EXTENDED, "Extended partition");
             }
+            if (disk.table?.scheme == "gpt") {
+                add_type ("0fc63daf-8483-4772-8e79-3d69d8477de4", "Linux filesystem");
+                add_type ("c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "EFI System");
+                add_type ("0657fd6d-a4ab-43c4-84e5-0933c84b4f4f", "Linux swap");
+                add_type ("e6d6d379-f507-44c2-a23c-238f2a3df928", "Linux LVM");
+                add_type ("a19d880f-05fc-4d3b-a006-743f0f84911e", "Linux RAID");
+                add_type ("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7", "Microsoft basic data");
+            } else {
+                add_type ("0x83", "Linux filesystem"); add_type ("0x82", "Linux swap");
+                add_type ("0x8e", "Linux LVM"); add_type ("0xfd", "Linux RAID autodetect");
+                add_type ("0x07", "NTFS / exFAT"); add_type ("0x0c", "FAT32 (LBA)");
+            }
+            add_type ("", "Other…");
             add_format ("empty", "Unformatted");
             string[] candidates = { "ext4", "btrfs", "xfs", "f2fs", "ntfs", "vfat", "exfat", "udf", "swap" };
             foreach (var candidate in candidates) probe_format.begin (backend, candidate);
@@ -602,12 +653,14 @@ namespace MajorisDisks {
             size_row.notify["value"].connect (validate);
             name_row.changed.connect (validate);
             label_row.changed.connect (validate);
-            type_row.changed.connect (validate);
+            type_row.notify["selected"].connect (validate);
+            custom_type_row.changed.connect (validate);
             validate ();
         }
 
         private void add_kind (PartitionLayoutService.PartitionKind id, string title) { kind_ids += id; kinds.append (title); }
         private void add_format (string id, string title) { format_ids += id; formats.append (title); }
+        private void add_type (string id, string title) { type_ids += id; type_names.append (title); }
         private bool name_entry_allowed () { return partition_kind == PartitionLayoutService.PartitionKind.GPT; }
         private async void probe_format (UDisksService backend, string type) {
             try {
@@ -620,12 +673,9 @@ namespace MajorisDisks {
             name_row.visible = name_entry_allowed ();
             bool extended = partition_kind == PartitionLayoutService.PartitionKind.MBR_EXTENDED;
             filesystem_row.sensitive = !extended;
+            type_row.sensitive = !extended;
+            custom_type_row.visible = !extended && type_row.selected + 1 == type_ids.length;
             label_row.sensitive = !extended && filesystem_type != "empty" && filesystem_type != "swap";
-            string desired_type = extended ? "0x05" : disk.table?.scheme == "gpt" ?
-                (type_row.text == "" || type_row.text == "0x83" || type_row.text == "0x05" ?
-                    "0fc63daf-8483-4772-8e79-3d69d8477de4" : type_row.text) :
-                (type_row.text == "" || type_row.text.contains ("-") ? "0x83" : type_row.text);
-            if (type_row.text != desired_type) type_row.text = desired_type;
             remaining_row.subtitle = format_size (gap.size - uint64.min (gap.size, (uint64) size_row.value * MIB));
             try {
                 uint64 offset, size;
@@ -633,6 +683,8 @@ namespace MajorisDisks {
                 if (name_entry_allowed () && (name_row.text.char_count () > 36 || !name_row.text.validate ()))
                     throw new IOError.INVALID_ARGUMENT ("The GPT name is invalid.");
                 FilesystemCapabilityService.validate_label (filesystem_type, label_row.sensitive ? label_row.text : "");
+                if (partition_type.strip () == "" || !partition_type.validate ())
+                    throw new IOError.INVALID_ARGUMENT ("The partition type identifier is invalid.");
                 set_response_enabled ("create", true);
             } catch (Error error) { set_response_enabled ("create", false); }
         }
@@ -666,14 +718,17 @@ namespace MajorisDisks {
             maximum = PartitionLayoutService.maximum_resize (disk, block);
             sector = disk.logical_sector_size;
             current_row.subtitle = format_size (block.size);
-            filesystem_type_row.subtitle = block.filesystem == null ?
+            bool container = block.partition?.container == true;
+            heading = container ? "Resize Extended Partition" : "Resize Volume";
+            filesystem_type_row.title = container ? "Contents" : "Filesystem";
+            filesystem_type_row.subtitle = container ? "Logical-partition container (not a filesystem)" : block.filesystem == null ?
                 (block.type_id == "" ? "Unformatted" : block.type_id) : block.type_id;
             maximum_row.subtitle = format_size (maximum);
             range_row.subtitle = "Awaiting filesystem safety information";
             size_row.adjustment.lower = double.max (1, (double) disk.logical_sector_size / MIB);
             size_row.adjustment.upper = double.max (size_row.adjustment.lower, (double) maximum / MIB);
             size_row.value = (double) block.size / MIB;
-            filesystem_row.visible = block.filesystem != null;
+            filesystem_row.visible = block.filesystem != null && !container;
             filesystem_row.active = block.filesystem != null;
             size_row.notify["value"].connect (validate);
             filesystem_row.notify["active"].connect (validate);

@@ -7,7 +7,8 @@
       <child><object class="AdwSpinRow" id="size_row"><property name="title">Partition size (MiB)</property><property name="digits">0</property><property name="adjustment"><object class="GtkAdjustment"><property name="lower">1</property><property name="upper">1</property><property name="step-increment">1</property><property name="page-increment">128</property></object></property></object></child>
       <child><object class="AdwActionRow" id="remaining_row"><property name="title">Space remaining</property></object></child>
       <child><object class="AdwComboRow" id="kind_row"><property name="title">Partition kind</property></object></child>
-      <child><object class="AdwEntryRow" id="type_row"><property name="title">Partition type</property></object></child>
+      <child><object class="AdwComboRow" id="type_row"><property name="title">Partition type</property></object></child>
+      <child><object class="AdwEntryRow" id="custom_type_row"><property name="title">Custom type identifier</property></object></child>
       <child><object class="AdwEntryRow" id="name_row"><property name="title">GPT partition name</property></object></child>
       <child><object class="AdwComboRow" id="filesystem_row"><property name="title">Filesystem</property></object></child>
       <child><object class="AdwEntryRow" id="label_row"><property name="title">Volume label</property></object></child>

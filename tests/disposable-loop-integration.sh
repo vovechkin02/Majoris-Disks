@@ -50,4 +50,34 @@ gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
 gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
   --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
 
+# Reinitialise the same verified disposable image as MBR and exercise its
+# container hierarchy. No caller-supplied block device is ever accepted.
+call --method org.freedesktop.UDisks2.Block.Format dos "{}" >/dev/null
+primary_reply=$(call --method org.freedesktop.UDisks2.PartitionTable.CreatePartition \
+  1048576 16777216 "0x83" "" "{'partition-type': <'primary'>}")
+primary=$(printf '%s\n' "$primary_reply" | sed -n "s/.*'\([^']*\)'.*/\1/p")
+[ -n "$primary" ] || { echo "UDisks did not return the MBR primary partition" >&2; exit 1; }
+extended_reply=$(call --method org.freedesktop.UDisks2.PartitionTable.CreatePartition \
+  25165824 83886080 "0x05" "" "{'partition-type': <'extended'>}")
+extended=$(printf '%s\n' "$extended_reply" | sed -n "s/.*'\([^']*\)'.*/\1/p")
+[ -n "$extended" ] || { echo "UDisks did not return the MBR extended partition" >&2; exit 1; }
+logical_reply=$(call --method org.freedesktop.UDisks2.PartitionTable.CreatePartition \
+  27262976 16777216 "0x83" "" "{'partition-type': <'logical'>}")
+logical=$(printf '%s\n' "$logical_reply" | sed -n "s/.*'\([^']*\)'.*/\1/p")
+[ -n "$logical" ] || { echo "UDisks did not return the MBR logical partition" >&2; exit 1; }
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
+  --method org.freedesktop.UDisks2.Block.Format ext4 "{'label': <'MAJORIS_MBR'>}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
+  --method org.freedesktop.UDisks2.Filesystem.SetLabel MAJORIS_EDITED "{}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
+  --method org.freedesktop.UDisks2.Filesystem.Check "{}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$extended" \
+  --method org.freedesktop.UDisks2.Partition.Resize 94371840 "{}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
+  --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$extended" \
+  --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$primary" \
+  --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
+
 echo "Disposable UDisks loop integration completed"

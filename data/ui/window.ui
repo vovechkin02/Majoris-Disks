@@ -11,7 +11,6 @@
 <property name="content"><object class="AdwNavigationPage"><property name="title">Storage</property><property name="child">
 <object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar">
 <child type="end"><object class="GtkMenuButton" id="jobs_button"><property name="label">Jobs</property><property name="visible">false</property></object></child>
-<child type="end"><object class="GtkSpinner" id="check_progress"><property name="visible">false</property><property name="tooltip-text">Storage operation in progress</property></object></child>
 </object></child><property name="content">
 <object class="AdwToastOverlay" id="notifications"><property name="child"><object class="GtkStack" id="states">
 <child><object class="AdwStatusPage" id="status"><property name="title">Connecting to UDisks…</property><property name="icon-name">drive-harddisk-symbolic</property></object></child>

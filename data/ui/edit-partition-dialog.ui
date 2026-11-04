@@ -4,7 +4,8 @@
     <property name="extra-child">
       <object class="GtkBox">
         <property name="orientation">vertical</property>
-        <child><object class="AdwEntryRow" id="type_entry"><property name="title">Partition type</property></object></child>
+        <child><object class="AdwComboRow" id="type_row"><property name="title">Partition type</property></object></child>
+        <child><object class="AdwEntryRow" id="type_entry"><property name="title">Custom type identifier</property></object></child>
         <child><object class="AdwEntryRow" id="name_entry"><property name="title">GPT partition name</property></object></child>
         <child><object class="GtkCheckButton" id="bootable"><property name="label">Bootable</property></object></child>
         <child><object class="GtkCheckButton" id="required"><property name="label">Required partition</property></object></child>

@@ -4,9 +4,10 @@ namespace MajorisDisks {
         private const uint REFRESH_SECONDS = 15;
         private class Usage : Object {
             public string description;
+            public string path;
             public int64 recorded;
-            public Usage (string description) {
-                this.description = description;
+            public Usage (string path, string description) {
+                this.path = path; this.description = description;
                 recorded = get_monotonic_time ();
             }
         }
@@ -14,12 +15,14 @@ namespace MajorisDisks {
         private string? key;
         private Cancellable? pending;
         private uint refresh_source;
+        private string selected_path = "";
         public signal void updated (string description);
 
         public void clear () {
             pending?.cancel ();
             pending = null;
             key = null;
+            selected_path = "";
             if (refresh_source != 0) {
                 Source.remove (refresh_source);
                 refresh_source = 0;
@@ -36,6 +39,7 @@ namespace MajorisDisks {
                 block.number, block.size, new Variant.strv (fs.mounts)).print (false);
             if (key != identity) {
                 clear ();
+                selected_path = block.path;
                 key = identity;
                 string mount = fs.mounts[0];
                 if (cached (identity) == null) refresh (identity, mount);
@@ -43,7 +47,7 @@ namespace MajorisDisks {
                     refresh (identity, mount);
                     return Source.CONTINUE;
                 });
-            }
+            } else selected_path = block.path;
             return cached (identity)?.description ?? "Used space unavailable";
         }
 
@@ -59,10 +63,16 @@ namespace MajorisDisks {
         private void refresh (string identity, string mount) {
             if (pending != null) return;
             pending = new Cancellable ();
-            query.begin (identity, mount, pending);
+            query.begin (identity, selected_path, mount, pending);
         }
 
-        private async void query (string identity, string path, Cancellable token) {
+        public void invalidate (string path) {
+            bool selected = selected_path == path;
+            foreach (var identity in values.get_keys ()) if (values.lookup (identity).path == path) values.remove (identity);
+            if (selected) clear ();
+        }
+
+        private async void query (string identity, string block_path, string path, Cancellable token) {
             try {
                 var info = yield File.new_for_path (path).query_filesystem_info_async (
                     "filesystem::size,filesystem::used,filesystem::free", Priority.DEFAULT, token);
@@ -87,7 +97,7 @@ namespace MajorisDisks {
                     }
                     if (oldest != null) values.remove (oldest);
                 }
-                values.insert (identity, new Usage (description));
+                values.insert (identity, new Usage (block_path, description));
                 if (key == identity && !token.is_cancelled ()) updated (description);
             } catch (Error error) {
                 if (!token.is_cancelled ()) debug ("Filesystem usage unavailable: %s", error.message);

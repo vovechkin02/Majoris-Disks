@@ -409,6 +409,37 @@ private void test_preparation_journal () {
     swap.restored = true; mount.restored = true; assert (journal.fully_restored ());
 }
 
+private void test_create_partition_safety () {
+    var disk = make_disk ("gpt"); var graph = new StorageDependencyService ();
+    var ordinary = StorageSafetyService.assess_operation (StorageOperationKind.CREATE_PARTITION, disk, graph);
+    assert (ordinary.allowed && ordinary.changes_partition_table && !ordinary.overwrites_storage);
+    disk.read_only = true;
+    var readonly = StorageSafetyService.assess_operation (StorageOperationKind.CREATE_PARTITION, disk, graph);
+    assert (!readonly.allowed && readonly.blocked);
+    disk.read_only = false;
+    graph.add (disk, null);
+    var unknown = StorageSafetyService.assess_operation (StorageOperationKind.CREATE_PARTITION, disk, graph);
+    assert (!unknown.allowed && unknown.unknown);
+}
+
+private void test_create_partition_active_dependency () {
+    var disk = make_disk ("gpt"); var child = partition (disk, "/system", 1024 * 1024, 8 * 1024 * 1024);
+    child.filesystem = new StorageFilesystem (); child.filesystem.mounts = { "/" }; child.parent = disk;
+    var graph = new StorageDependencyService (); graph.add (disk, child);
+    var result = StorageSafetyService.assess_operation (StorageOperationKind.CREATE_PARTITION, disk, graph);
+    assert (result.allowed && result.requires_preparation && result.affects_active_dependencies);
+}
+
+private void test_operation_terminal_states () {
+    var manager = new StorageJobManager (); var block = new StorageBlock ("/state"); block.preferred = "/dev/state";
+    var graph = new StorageDependencyService (); var job = manager.begin ("Test", block, graph);
+    var cancelled = new StorageOperationResult (); cancelled.fail ("Cancelled", new IOError.CANCELLED ("cancelled"));
+    manager.finish (job, cancelled); assert (job.state == StorageJobState.CANCELLED);
+    var uncertain = manager.begin ("Test", block, graph); var outcome = new StorageOperationResult ();
+    outcome.status = StorageOperationStatus.NEEDS_ATTENTION; outcome.summary = "Unknown";
+    manager.finish (uncertain, outcome); assert (uncertain.state == StorageJobState.NEEDS_ATTENTION);
+}
+
 private void test_job_correlation () {
     var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
     var block = new StorageBlock ("/target"); block.preferred = "/dev/test";
@@ -416,7 +447,7 @@ private void test_job_correlation () {
     manager.observe ("/backend/unrelated", "Resize", { "/different" }, 0, false, false, 1);
     assert (manager.jobs.get_n_items () == 2 && local.backend_path == "");
     manager.observe ("/backend/related", "other-name", { "/target" }, 0, false, false, 2);
-    assert (manager.jobs.get_n_items () == 2 && local.backend_path == "/backend/related");
+    assert (manager.jobs.get_n_items () == 3 && local.backend_path == "");
 }
 
 private async void query_mock_capability () throws Error {
@@ -473,6 +504,9 @@ public static int main (string[] args) {
     Test.add_func ("/operations/resize-planner-safety", test_resize_planner_safety);
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
     Test.add_func ("/operations/preparation-journal", test_preparation_journal);
+    Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);
+    Test.add_func ("/operations/create-active-dependency", test_create_partition_active_dependency);
+    Test.add_func ("/operations/terminal-states", test_operation_terminal_states);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     return Test.run ();
 }

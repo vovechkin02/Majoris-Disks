@@ -40,6 +40,7 @@ namespace MajorisDisks {
         private FilesystemUsageService usage_service = new FilesystemUsageService ();
         public signal void action_requested (StorageBlock block, string method);
         public signal void open_failed ();
+        public void invalidate_usage (StorageBlock block) { usage_service.invalidate (block.path); if (target == block) usage.label = usage_service.show (block); }
 
         static construct {
             typeof (PartitionMap).ensure ();
@@ -86,7 +87,7 @@ namespace MajorisDisks {
                 if (selected_block != null) resize_requested (selected_block);
             });
             take_ownership.clicked.connect (() => {
-                if (selected_block != null) ownership_requested (selected_block);
+                if (target != null) ownership_requested (target);
             });
             edit_label.clicked.connect (() => {
                 if (selected_block != null) label_requested (selected_block);
@@ -203,23 +204,26 @@ namespace MajorisDisks {
                 add_volume_field ("Size", format_size (gap.size));
                 var disk = current?.medium;
                 create_partition.visible = disk?.table != null && disk.available && !disk.read_only &&
-                    !disk.system_hint && disk.logical_sector_size != 0 && gap.size >= disk.logical_sector_size;
+                    disk.logical_sector_size != 0 && gap.size >= disk.logical_sector_size;
                 add_volume_field ("Allocatable space", create_partition.visible ?
                     "Validated when Create is opened" : "Unavailable");
                 return;
             }
             selected_block = block;
-            take_ownership.visible = UDisksService.supports_ownership (block);
             edit_label.visible = block.available && !block.read_only && !block.system_hint &&
                 FilesystemCapabilityService.supports_label (block.type_id) && block.filesystem != null && !block.filesystem.mounted;
             format_volume.visible = block.table == null && block.partition?.container != true &&
                 block.available && !block.read_only && !block.system_hint && block.filesystem?.mounted != true;
-            delete_partition.visible = block.partition != null && !block.partition.container &&
+            bool container_has_children = false;
+            if (block.partition?.container == true && backend != null)
+                foreach (var child in backend.snapshot.dependencies.children (block))
+                    container_has_children |= (child as StorageBlock)?.partition?.logical == true;
+            delete_partition.visible = block.partition != null && (!block.partition.container || !container_has_children) &&
                 block.available && !block.read_only && !block.system_hint;
             var scheme = current?.medium?.table?.scheme;
             edit_partition.visible = delete_partition.visible && block.filesystem?.mounted != true &&
                 (scheme == "gpt" || (scheme == "dos" && block.partition?.logical != true));
-            resize_volume.visible = block.partition != null && !block.partition.container && block.available &&
+            resize_volume.visible = block.partition != null && block.available &&
                 !block.read_only && !block.system_hint && block.backing_path == "/" && block.raid_path == "/" &&
                 block.logical_volume_path == "/";
             add_volume_field ("Device", block.preferred, true);
@@ -239,6 +243,8 @@ namespace MajorisDisks {
             if (block.logical_volume != null) add_volume_field ("Logical volume", block.logical_volume.name);
             if (block.volume_group != null) add_volume_field ("LVM volume group", block.volume_group.name);
             target = block.encrypted?.mapping ?? block;
+            take_ownership.visible = UDisksService.supports_ownership (target) &&
+                !StorageSafetyService.assess (target, backend?.snapshot.dependencies).system_critical;
             if (block.encrypted != null) add_volume_field ("Encryption", target == block ? "Locked" : "Unlocked");
             if (target != block) add_volume_field ("Mapped device", target.preferred, true);
             var fs = target.filesystem;
@@ -264,7 +270,7 @@ namespace MajorisDisks {
             }
             operation.visible = method != "";
             open_files.visible = fs != null && fs.mounted;
-            check_filesystem.visible = fs != null && !fs.mounted && target.available && !target.ignored &&
+            check_filesystem.visible = fs != null && target.available && !target.ignored &&
                 target.type_id != "" && target.encrypted == null;
             repair_filesystem.visible = check_filesystem.visible && !target.read_only && !target.system_hint;
             uint generation = ++maintenance_generation;
@@ -285,6 +291,8 @@ namespace MajorisDisks {
                     if (generation != maintenance_generation) return;
                     button.sensitive = supported;
                     if (!supported) button.tooltip_text = "UDisks does not support this operation.";
+                    else if (target.filesystem?.mounted == true)
+                        button.tooltip_text = "The filesystem will be safely unmounted and restored after this offline operation.";
                 } catch (Error error) {
                     if (generation == maintenance_generation) button.tooltip_text = error.message;
                 }

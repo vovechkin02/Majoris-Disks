@@ -12,3 +12,6 @@ Use only disposable loop images, removable media with backups, or a virtual mach
 8. Cancel a cancelable UDisks job and deny its authorization in a second run. Confirm the UI waits for the backend result.
 9. Repeat check and repair on clean and deliberately damaged disposable filesystems; verify repair always requires confirmation.
 10. Test narrow-window navigation, keyboard traversal, translated long strings, device hot-unplug and UDisks restart.
+11. On mounted data filesystems, start Check and Repair and verify guided unmount plus restoration to the previous UDisks-selected mount location.
+12. Exercise the whole-disk overwrite switch only on a disposable loop image; verify progress appears as a job and the warning does not claim secure erasure.
+13. Edit common GPT and MBR partition types through their readable names, then select Other and verify a custom identifier is preserved.

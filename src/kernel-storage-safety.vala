@@ -7,6 +7,15 @@ namespace MajorisDisks {
         }
 
         public static async void require_idle (StorageBlock block, Cancellable token) throws Error {
+            yield require_no_holders (block, token);
+            string identity = device_number (block.number);
+            uint8[] contents;
+            yield File.new_for_path ("/proc/self/mountinfo").load_contents_async (token, out contents, null);
+            if (has_mount ((string) contents, identity))
+                throw new IOError.BUSY ("The kernel reports an active mount for this volume.");
+        }
+
+        public static async void require_no_holders (StorageBlock block, Cancellable token) throws Error {
             if (block.number == 0)
                 throw new IOError.NOT_SUPPORTED ("The kernel device identity is unavailable.");
             string identity = device_number (block.number);
@@ -16,11 +25,6 @@ namespace MajorisDisks {
             var entries = yield holders.next_files_async (1, Priority.DEFAULT, token);
             if (entries != null)
                 throw new IOError.BUSY ("Another kernel storage device depends on this volume.");
-
-            uint8[] contents;
-            yield File.new_for_path ("/proc/self/mountinfo").load_contents_async (token, out contents, null);
-            if (has_mount ((string) contents, identity))
-                throw new IOError.BUSY ("The kernel reports an active mount for this volume.");
         }
 
         public static bool has_mount (string mountinfo, string identity) {

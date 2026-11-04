@@ -103,6 +103,8 @@ namespace MajorisDisks {
     }
 
     public enum StorageOperationKind {
+        INITIALIZE_DISK, RESIZE_PARTITION, RESIZE_FILESYSTEM, FORMAT_VOLUME, EDIT_PARTITION,
+        EDIT_FILESYSTEM_LABEL, CHECK_FILESYSTEM, REPAIR_FILESYSTEM,
         CREATE_PARTITION, DELETE_PARTITION, RESIZE, FORMAT, CHECK, REPAIR, TAKE_OWNERSHIP,
         ENCRYPT, UNLOCK, LOCK, MOUNT, UNMOUNT, SWAP_START, SWAP_STOP, IMAGE_RESTORE,
         POWER_OFF, EJECT, BENCHMARK_WRITE, LVM_CHANGE, RAID_CHANGE, BTRFS_CHANGE
@@ -116,6 +118,10 @@ namespace MajorisDisks {
         public string reason = "";
         public string[] affected = {};
         public string[] preparation = {};
+        public bool overwrites_storage;
+        public bool changes_partition_table;
+        public bool modifies_filesystem;
+        public bool affects_active_dependencies;
     }
 
     public class StorageSafetyService {
@@ -133,6 +139,7 @@ namespace MajorisDisks {
                 if (graph != null && graph.unknown (node)) result.unknown_dependencies = true;
                 if (lv?.active == true || (node != device && node is StorageRaid)) result.active_dependents = true;
                 if (volume == null) continue;
+                if (volume.system_hint) result.system_critical = true;
                 if (volume.swap_active || volume.encrypted?.mapping != null ||
                     (volume != block && volume.filesystem?.mounted == true))
                     result.active_dependents = true;
@@ -163,23 +170,37 @@ namespace MajorisDisks {
             foreach (var node in nodes) affected += node.path;
             eligibility.affected = affected;
             bool destructive = operation == StorageOperationKind.DELETE_PARTITION ||
-                operation == StorageOperationKind.RESIZE || operation == StorageOperationKind.FORMAT ||
+                operation == StorageOperationKind.CREATE_PARTITION || operation == StorageOperationKind.INITIALIZE_DISK ||
+                operation == StorageOperationKind.RESIZE_PARTITION || operation == StorageOperationKind.RESIZE_FILESYSTEM ||
+                operation == StorageOperationKind.RESIZE || operation == StorageOperationKind.FORMAT || operation == StorageOperationKind.FORMAT_VOLUME ||
                 operation == StorageOperationKind.ENCRYPT || operation == StorageOperationKind.IMAGE_RESTORE ||
                 operation == StorageOperationKind.BENCHMARK_WRITE || operation == StorageOperationKind.LVM_CHANGE ||
                 operation == StorageOperationKind.RAID_CHANGE || operation == StorageOperationKind.BTRFS_CHANGE;
+            eligibility.changes_partition_table = operation == StorageOperationKind.CREATE_PARTITION ||
+                operation == StorageOperationKind.INITIALIZE_DISK || operation == StorageOperationKind.DELETE_PARTITION ||
+                operation == StorageOperationKind.RESIZE_PARTITION || operation == StorageOperationKind.RESIZE ||
+                operation == StorageOperationKind.IMAGE_RESTORE;
+            eligibility.overwrites_storage = operation == StorageOperationKind.FORMAT || operation == StorageOperationKind.FORMAT_VOLUME ||
+                operation == StorageOperationKind.ENCRYPT || operation == StorageOperationKind.IMAGE_RESTORE;
+            eligibility.modifies_filesystem = operation == StorageOperationKind.RESIZE || operation == StorageOperationKind.RESIZE_FILESYSTEM ||
+                operation == StorageOperationKind.FORMAT || operation == StorageOperationKind.FORMAT_VOLUME ||
+                operation == StorageOperationKind.REPAIR || operation == StorageOperationKind.REPAIR_FILESYSTEM ||
+                operation == StorageOperationKind.TAKE_OWNERSHIP;
+            eligibility.affects_active_dependencies = assessment.active_dependents || assessment.mounted;
             if (graph == null || assessment.unknown_dependencies) {
                 eligibility.unknown = true; eligibility.blocked = destructive;
                 eligibility.reason = "The full dependency graph is not known; destructive operations fail closed.";
-            } else if (assessment.read_only && operation != StorageOperationKind.CHECK) {
+            } else if (assessment.read_only && operation != StorageOperationKind.CHECK && operation != StorageOperationKind.CHECK_FILESYSTEM) {
                 eligibility.blocked = true; eligibility.reason = "The selected device is read-only.";
-            } else if (assessment.system_critical && destructive) {
+            } else if (assessment.system_critical && destructive && operation != StorageOperationKind.CREATE_PARTITION) {
                 eligibility.blocked = true; eligibility.reason = "The operation could affect the running system.";
             } else if (assessment.active_dependents && destructive) {
                 eligibility.requires_preparation = true;
                 eligibility.preparation = { "Deactivate dependent mounts, swap, mappings, RAID, and logical volumes" };
                 eligibility.reason = "Active dependents must be prepared before this operation.";
             } else if (assessment.mounted && (destructive || operation == StorageOperationKind.REPAIR ||
-                operation == StorageOperationKind.TAKE_OWNERSHIP)) {
+                operation == StorageOperationKind.REPAIR_FILESYSTEM || operation == StorageOperationKind.CHECK ||
+                operation == StorageOperationKind.CHECK_FILESYSTEM || operation == StorageOperationKind.EDIT_FILESYSTEM_LABEL)) {
                 eligibility.requires_preparation = true;
                 eligibility.preparation = { "Unmount the filesystem and restore it afterwards" };
                 eligibility.reason = "The filesystem must be prepared offline.";

@@ -5,11 +5,14 @@ namespace MajorisDisks {
         public StoragePreparationKind kind { get; construct; }
         public string object_path { get; construct; }
         public string[] state { get; construct; }
+        public string operation_type { get; construct; }
         public bool prepared { get; set; }
+        public bool restoration_allowed { get; set; default = true; }
         public bool restored { get; set; }
         public string error { get; set; default = ""; }
-        public StoragePreparationEntry (StoragePreparationKind kind, string object_path, string[] state) {
-            Object (kind: kind, object_path: object_path, state: state);
+        public StoragePreparationEntry (StoragePreparationKind kind, string object_path, string[] state,
+            string operation_type = "prepare") {
+            Object (kind: kind, object_path: object_path, state: state, operation_type: operation_type);
         }
     }
 
@@ -27,7 +30,7 @@ namespace MajorisDisks {
         public StoragePreparationEntry[] restoration_order () {
             StoragePreparationEntry[] result = {};
             for (int i = (int) records.length - 1; i >= 0; i--)
-                if (records[(uint) i].prepared) result += records[(uint) i];
+                if (records[(uint) i].prepared && records[(uint) i].restoration_allowed) result += records[(uint) i];
             return result;
         }
         public bool fully_restored () {
@@ -184,6 +187,10 @@ namespace MajorisDisks {
         public string summary = "";
         public string technical_error = "";
         public string resulting_path = "";
+        public string failed_step = "";
+        public string actual_state = "";
+        public bool restoration_attempted;
+        public bool restoration_succeeded;
         public string[] completed_steps = {};
 
         public void completed (string step) {
@@ -198,6 +205,7 @@ namespace MajorisDisks {
             if (error != null && error is IOError.CANCELLED) status = StorageOperationStatus.CANCELLED;
             else status = partial ? StorageOperationStatus.PARTIAL : StorageOperationStatus.FAILED;
             summary = message;
+            failed_step = message;
             technical_error = error?.message ?? "";
         }
     }
@@ -262,14 +270,7 @@ namespace MajorisDisks {
             StorageJob? match = null;
             for (uint i = 0; i < jobs.get_n_items (); i++) {
                 var candidate = jobs.get_item (i) as StorageJob;
-                bool active = candidate.state == StorageJobState.PREPARING ||
-                    candidate.state == StorageJobState.RUNNING || candidate.state == StorageJobState.CANCELLING ||
-                    candidate.state == StorageJobState.FINALIZING;
-                bool related = false;
-                foreach (var object_path in objects)
-                    foreach (var affected_path in candidate.affected)
-                        related |= object_path == affected_path;
-                if (candidate.backend_path == path || (candidate.backend_path == "" && active && related)) {
+                if (candidate.backend_path == path) {
                     match = candidate;
                     break;
                 }
