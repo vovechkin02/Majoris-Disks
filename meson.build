@@ -9,4 +9,16 @@ subdir('src')
 layout_test = executable('storage-model-test', 'tests/storage-model-test.vala',
   storage_model_sources, dependencies: dependency('gio-2.0'))
 test('storage-model', layout_test)
+xvfb = find_program('xvfb-run', required: false)
+if xvfb.found()
+  ui_test = executable('ui-template-test', 'tests/ui-template-test.vala',
+    storage_model_sources + files('src/udisks-service.vala', 'src/window.vala',
+      'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala'),
+    resources, dependencies: deps)
+  test('ui-templates', xvfb, args: ['-a', ui_test])
+endif
+sh = find_program('sh')
+test('disposable-loop-integration', sh,
+  args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],
+  timeout: 120)
 install_data('data/com.majoris.disks.desktop', install_dir: get_option('datadir') / 'applications')

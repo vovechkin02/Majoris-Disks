@@ -1,5 +1,25 @@
 using MajorisDisks;
 
+[DBus (signature = "(bs)")]
+private struct MockCapabilityResponse {
+    public bool supported;
+    public string utility;
+}
+
+[DBus (name = "org.test.Manager")]
+private interface MockCapabilityManager : Object {
+    public abstract MockCapabilityResponse can_format (string type) throws Error;
+}
+
+private class MockCapabilityService : Object, MockCapabilityManager {
+    public MockCapabilityResponse can_format (string type) throws Error {
+        MockCapabilityResponse response = {};
+        response.supported = type == "ext4";
+        response.utility = "";
+        return response;
+    }
+}
+
 private void test_gaps () {
     assert (PartitionLayoutService.gaps (0, 0, {}).length == 0);
     var empty = PartitionLayoutService.gaps (0, 100, {});
@@ -155,13 +175,13 @@ private void test_operation_locks () {
 
 private void test_check_capability () {
     try {
-        assert (FilesystemCapabilityService.check_available (new Variant ("(bs)", true, "")));
-        assert (!FilesystemCapabilityService.check_available (new Variant ("(bs)", false, "")));
+        assert (FilesystemCapabilityService.check_available (new Variant ("((bs))", true, "")));
+        assert (!FilesystemCapabilityService.check_available (new Variant ("((bs))", false, "")));
     } catch (Error error) {
         assert_not_reached ();
     }
     try {
-        FilesystemCapabilityService.check_available (new Variant ("(bs)", false, "e2fsck"));
+        FilesystemCapabilityService.check_available (new Variant ("((bs))", false, "e2fsck"));
         assert_not_reached ();
     } catch (Error error) {
         assert (error is IOError.NOT_SUPPORTED && error.message.contains ("e2fsck"));
@@ -171,14 +191,51 @@ private void test_resize_capability () {
     try {
         string utility;
         var modes = FilesystemCapabilityService.resize_modes (
-            new Variant ("(bts)", true, (uint64) 0x8000000000000012, ""), out utility);
+            new Variant ("((bts))", true, (uint64) 0x8000000000000012, ""), out utility);
         assert (modes == (FilesystemResizeMode.OFFLINE_SHRINK | FilesystemResizeMode.ONLINE_GROW));
         assert (utility == "");
         modes = FilesystemCapabilityService.resize_modes (
-            new Variant ("(bts)", false, (uint64) 0x12, "resize2fs"), out utility);
+            new Variant ("((bts))", false, (uint64) 0x12, "resize2fs"), out utility);
         assert (modes == 0 && utility == "resize2fs");
     } catch (Error error) {
         assert_not_reached ();
+    }
+}
+
+private void test_capability_invalid_responses () {
+    Variant[] invalid = {
+        new Variant ("()"),
+        new Variant ("(bs)", true, ""),
+        new Variant ("((bs)s)", true, "", "unexpected"),
+        new Variant ("((bts))", true, (uint64) 2, "")
+    };
+    foreach (var reply in invalid) {
+        try {
+            FilesystemCapabilityService.decode (reply);
+            assert_not_reached ();
+        } catch (Error error) {
+            assert (error is IOError.INVALID_DATA);
+        }
+    }
+    try {
+        FilesystemCapabilityService.decode (new Variant ("((bs))", true, ""), true);
+        assert_not_reached ();
+    } catch (Error error) {
+        assert (error is IOError.INVALID_DATA);
+    }
+}
+
+private void test_resize_capability_combinations () {
+    for (uint64 bits = 0; bits < 16; bits++) {
+        uint64 flags = bits << 1;
+        try {
+            var capability = FilesystemCapabilityService.decode (
+                new Variant ("((bts))", true, flags, ""), true);
+            assert (capability.supported);
+            assert ((uint64) capability.modes == flags);
+        } catch (Error error) {
+            assert_not_reached ();
+        }
     }
 }
 
@@ -188,6 +245,147 @@ private void test_kernel_identity () {
     string mounts = "36 25 8:10 / /srv/data rw - ext4 /dev/sda10 rw\n";
     assert (KernelStorageSafety.has_mount (mounts, "8:10"));
     assert (!KernelStorageSafety.has_mount (mounts, "8:1"));
+}
+
+private StorageBlock make_disk (string scheme) {
+    var disk = new StorageBlock ("/disk-" + scheme);
+    disk.size = 64 * 1024 * 1024;
+    disk.logical_sector_size = 512;
+    disk.table = new StoragePartitionTable (scheme);
+    return disk;
+}
+
+private void test_partition_creation_geometry () {
+    var gpt = make_disk ("gpt");
+    var gap = new StorageFreeSpace (gpt, Extent (34 * 512, 20 * 1024 * 1024));
+    try {
+        uint64 offset, size;
+        PartitionLayoutService.validate_create (gpt, gap, 8 * 1024 * 1024,
+            PartitionLayoutService.PartitionKind.GPT, out offset, out size);
+        assert (offset == 1024 * 1024 && size == 8 * 1024 * 1024);
+        PartitionLayoutService.validate_create (gpt, gap, 0,
+            PartitionLayoutService.PartitionKind.GPT, out offset, out size);
+        assert (size == 0);
+    } catch (Error error) { assert_not_reached (); }
+
+    var dos = make_disk ("dos");
+    var outer = new StorageFreeSpace (dos, Extent (1024 * 1024, 30 * 1024 * 1024));
+    try {
+        uint64 offset, size;
+        PartitionLayoutService.validate_create (dos, outer, 4 * 1024 * 1024,
+            PartitionLayoutService.PartitionKind.MBR_PRIMARY, out offset, out size);
+        PartitionLayoutService.validate_create (dos, outer, 4 * 1024 * 1024,
+            PartitionLayoutService.PartitionKind.MBR_EXTENDED, out offset, out size);
+    } catch (Error error) { assert_not_reached (); }
+    var container = partition (dos, "/extended", 1024 * 1024, 30 * 1024 * 1024);
+    container.partition.container = true;
+    container.parent = dos;
+    dos.table.partitions = { container };
+    var inner = new StorageFreeSpace (container, Extent (2 * 1024 * 1024, 10 * 1024 * 1024));
+    try {
+        uint64 offset, size;
+        PartitionLayoutService.validate_create (dos, inner, 4 * 1024 * 1024,
+            PartitionLayoutService.PartitionKind.MBR_LOGICAL, out offset, out size);
+    } catch (Error error) { assert_not_reached (); }
+    try {
+        uint64 offset, size;
+        PartitionLayoutService.validate_create (dos, inner, 4 * 1024 * 1024,
+            PartitionLayoutService.PartitionKind.MBR_PRIMARY, out offset, out size);
+        assert_not_reached ();
+    } catch (Error error) { assert (error is IOError.INVALID_ARGUMENT); }
+}
+
+private void test_mbr_slot_limits () {
+    var disk = make_disk ("dos");
+    StorageBlock[] entries = {};
+    for (int i = 0; i < 4; i++) {
+        var item = partition (disk, "/p" + i.to_string (), (uint64) (i + 1) * 1024 * 1024, 1024 * 1024);
+        item.parent = disk;
+        entries += item;
+    }
+    disk.table.partitions = entries;
+    var gap = new StorageFreeSpace (disk, Extent (8 * 1024 * 1024, 8 * 1024 * 1024));
+    try {
+        uint64 offset, size;
+        PartitionLayoutService.validate_create (disk, gap, 1024 * 1024,
+            PartitionLayoutService.PartitionKind.MBR_PRIMARY, out offset, out size);
+        assert_not_reached ();
+    } catch (Error error) { assert (error is IOError.NO_SPACE); }
+}
+
+private void test_resize_maximum () {
+    var disk = make_disk ("gpt");
+    var first = partition (disk, "/first", 1024 * 1024, 4 * 1024 * 1024);
+    var second = partition (disk, "/second", 12 * 1024 * 1024, 4 * 1024 * 1024);
+    first.parent = disk; second.parent = disk; disk.table.partitions = { first, second };
+    try { assert (PartitionLayoutService.maximum_resize (disk, first) == 11 * 1024 * 1024); }
+    catch (Error error) { assert_not_reached (); }
+}
+
+private void test_label_validation () {
+    try {
+        FilesystemCapabilityService.validate_label ("ext4", "Majoris");
+        FilesystemCapabilityService.validate_label ("xfs", "DATA");
+        FilesystemCapabilityService.validate_label ("vfat", "MAJORIS");
+    } catch (Error error) { assert_not_reached (); }
+    foreach (var pair in new string[] { "ext4:12345678901234567", "xfs:1234567890123", "vfat:lower" }) {
+        var fields = pair.split (":", 2);
+        try { FilesystemCapabilityService.validate_label (fields[0], fields[1]); assert_not_reached (); }
+        catch (Error error) { assert (error is IOError.INVALID_ARGUMENT); }
+    }
+    assert (FilesystemCapabilityService.supports_label ("ntfs"));
+    assert (!FilesystemCapabilityService.supports_label ("swap"));
+}
+
+private void test_job_lifecycle () {
+    var manager = new StorageJobManager ();
+    var block = new StorageBlock ("/job-target"); block.preferred = "/dev/test";
+    var graph = new StorageDependencyService ();
+    var job = manager.begin ("Resize volume", block, graph);
+    assert (job.state == StorageJobState.PENDING && manager.jobs.get_n_items () == 1);
+    manager.phase (job, StorageJobState.RUNNING, "Growing partition");
+    assert (job.state == StorageJobState.RUNNING && !job.progress_valid);
+    var outcome = new StorageOperationResult (); outcome.completed ("Partition grown");
+    outcome.fail ("Filesystem growth failed");
+    manager.finish (job, outcome);
+    assert (job.state == StorageJobState.PARTIALLY_COMPLETED && job.result.partial);
+    manager.observe ("/job/1", "format-mkfs", { "/block/1" }, 0.5, true, true, 10);
+    assert (manager.jobs.get_n_items () == 2);
+    var observed = manager.jobs.get_item (1) as StorageJob;
+    assert (observed.progress_valid && observed.cancelable && observed.progress == 0.5);
+    manager.backend_removed ("/job/1");
+    assert (observed.state == StorageJobState.COMPLETED);
+}
+
+private async void query_mock_capability () throws Error {
+    var bus = new TestDBus (TestDBusFlags.NONE);
+    bus.up ();
+    try {
+        var flags = DBusConnectionFlags.AUTHENTICATION_CLIENT | DBusConnectionFlags.MESSAGE_BUS_CONNECTION;
+        var server = yield new DBusConnection.for_address (bus.get_bus_address (), flags);
+        var client = yield new DBusConnection.for_address (bus.get_bus_address (), flags);
+        uint registration = server.register_object<MockCapabilityManager> (
+            "/org/test/Manager", new MockCapabilityService ());
+        var proxy = yield new DBusProxy (client, DBusProxyFlags.NONE, null, server.unique_name,
+            "/org/test/Manager", "org.test.Manager", null);
+        var reply = yield proxy.call ("CanFormat", new Variant ("(s)", "ext4"), DBusCallFlags.NONE, -1, null);
+        var capability = FilesystemCapabilityService.decode (reply);
+        assert (capability.supported && capability.missing_utility == "");
+        server.unregister_object (registration);
+        yield client.close ();
+        yield server.close ();
+    } finally { bus.down (); }
+}
+
+private void test_mock_capability_query () {
+    var loop = new MainLoop ();
+    Error? failure = null;
+    query_mock_capability.begin ((object, result) => {
+        try { query_mock_capability.end (result); } catch (Error error) { failure = error; }
+        loop.quit ();
+    });
+    loop.run ();
+    if (failure != null) error ("Mock D-Bus capability query failed: %s", failure.message);
 }
 public static int main (string[] args) {
     Test.init (ref args);
@@ -200,6 +398,14 @@ public static int main (string[] args) {
     Test.add_func ("/operations/locks", test_operation_locks);
     Test.add_func ("/operations/check-capability", test_check_capability);
     Test.add_func ("/operations/resize-capability", test_resize_capability);
+    Test.add_func ("/operations/capability-invalid-responses", test_capability_invalid_responses);
+    Test.add_func ("/operations/resize-capability-combinations", test_resize_capability_combinations);
     Test.add_func ("/operations/kernel-identity", test_kernel_identity);
+    Test.add_func ("/layout/partition-creation", test_partition_creation_geometry);
+    Test.add_func ("/layout/mbr-slot-limits", test_mbr_slot_limits);
+    Test.add_func ("/layout/resize-maximum", test_resize_maximum);
+    Test.add_func ("/operations/label-validation", test_label_validation);
+    Test.add_func ("/operations/job-lifecycle", test_job_lifecycle);
+    Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     return Test.run ();
 }

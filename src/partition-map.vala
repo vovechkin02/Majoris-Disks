@@ -51,7 +51,9 @@ namespace MajorisDisks {
             var track = rebuild ? new PartitionTrack (capacity) : null;
             uint64 cursor = 0;
             foreach (var region in StorageHierarchy.regions (disk, owner)) {
-                uint64 first = offset (region) - start;
+                uint64 absolute = offset (region);
+                if (absolute < start || absolute - start >= capacity || region.size == 0) continue;
+                uint64 first = absolute - start;
                 uint64 end = first + uint64.min (region.size, capacity - first);
                 first = uint64.max (first, cursor);
                 if (end <= first) continue;

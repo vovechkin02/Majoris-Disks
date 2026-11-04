@@ -1,0 +1,10 @@
+<interface>
+  <template class="MajorisDisksRepairConfirmationDialog" parent="AdwAlertDialog">
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="repair" appearance="destructive">Repair</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

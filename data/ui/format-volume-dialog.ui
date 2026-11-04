@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksFormatVolumeDialog" parent="AdwAlertDialog">
+    <property name="heading">Format Volume</property>
+    <property name="extra-child"><object class="AdwPreferencesGroup">
+      <child><object class="AdwActionRow" id="target_row"><property name="title">Target</property></object></child>
+      <child><object class="AdwComboRow" id="filesystem_row"><property name="title">Filesystem</property></object></child>
+      <child><object class="AdwEntryRow" id="label_row"><property name="title">Volume label</property></object></child>
+      <child><object class="AdwSwitchRow" id="erase_row"><property name="title">Overwrite existing data</property><property name="subtitle">Slower; writes zeroes before creating the filesystem</property></object></child>
+      <child><object class="GtkLabel"><property name="label">Formatting destroys existing data on this volume.</property><property name="wrap">true</property><property name="xalign">0</property></object></child>
+    </object></property>
+    <responses><response id="cancel">Cancel</response><response id="format" appearance="destructive">Format</response></responses>
+    <property name="default-response">cancel</property><property name="close-response">cancel</property>
+  </template>
+</interface>

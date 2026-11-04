@@ -38,26 +38,219 @@ namespace MajorisDisks {
         ONLINE_GROW = 1 << 4
     }
 
+    public struct FilesystemCapability {
+        public bool supported;
+        public string missing_utility;
+        public FilesystemResizeMode modes;
+        public string reason;
+
+        public bool online_grow { get { return (modes & FilesystemResizeMode.ONLINE_GROW) != 0; } }
+        public bool offline_grow { get { return (modes & FilesystemResizeMode.OFFLINE_GROW) != 0; } }
+        public bool online_shrink { get { return (modes & FilesystemResizeMode.ONLINE_SHRINK) != 0; } }
+        public bool offline_shrink { get { return (modes & FilesystemResizeMode.OFFLINE_SHRINK) != 0; } }
+    }
+
     public class FilesystemCapabilityService {
+        public static FilesystemCapability decode (Variant reply, bool resize = false) throws Error {
+            if (!reply.is_of_type (new VariantType (resize ? "((bts))" : "((bs))")))
+                throw new IOError.INVALID_DATA ("UDisks returned invalid filesystem capability information.");
+
+            var output = reply.get_child_value (0);
+            FilesystemCapability capability = {};
+            capability.supported = output.get_child_value (0).get_boolean ();
+            capability.missing_utility = output.get_child_value (resize ? 2 : 1).get_string ();
+            if (resize && capability.supported) {
+                uint64 known = FilesystemResizeMode.OFFLINE_SHRINK | FilesystemResizeMode.OFFLINE_GROW |
+                    FilesystemResizeMode.ONLINE_SHRINK | FilesystemResizeMode.ONLINE_GROW;
+                capability.modes = (FilesystemResizeMode) (output.get_child_value (1).get_uint64 () & known);
+            }
+            if (!capability.supported)
+                capability.reason = capability.missing_utility == "" ? "The UDisks backend does not support this operation." :
+                    "The required utility is not installed: " + capability.missing_utility;
+            else if (resize && capability.modes == 0)
+                capability.reason = "The filesystem has no supported resize mode.";
+            else capability.reason = "";
+            return capability;
+        }
+
         public static FilesystemResizeMode resize_modes (Variant reply, out string missing_utility) throws Error {
-            missing_utility = "";
-            if (!reply.is_of_type (new VariantType ("(bts)")))
-                throw new IOError.INVALID_DATA ("UDisks returned invalid filesystem resize capability information.");
-            missing_utility = reply.get_child_value (2).get_string ();
-            if (!reply.get_child_value (0).get_boolean ()) return 0;
-            uint64 known = FilesystemResizeMode.OFFLINE_SHRINK | FilesystemResizeMode.OFFLINE_GROW |
-                FilesystemResizeMode.ONLINE_SHRINK | FilesystemResizeMode.ONLINE_GROW;
-            return (FilesystemResizeMode) (reply.get_child_value (1).get_uint64 () & known);
+            var capability = decode (reply, true);
+            missing_utility = capability.missing_utility;
+            return capability.modes;
         }
 
         public static bool check_available (Variant reply, bool repair = false) throws Error {
-            if (!reply.is_of_type (new VariantType ("(bs)")))
-                throw new IOError.INVALID_DATA ("UDisks returned invalid filesystem capability information.");
-            if (reply.get_child_value (0).get_boolean ()) return true;
-            string utility = reply.get_child_value (1).get_string ();
-            if (utility != "")
-                throw new IOError.NOT_SUPPORTED (("The filesystem %s operation requires %s.").printf (repair ? "repair" : "check", utility));
-            return false;
+            var capability = decode (reply);
+            if (!capability.supported && capability.missing_utility != "")
+                throw new IOError.NOT_SUPPORTED (("The filesystem %s operation requires %s.").printf (
+                    repair ? "repair" : "check", capability.missing_utility));
+            return capability.supported;
+        }
+
+        public static bool supports_label (string type) {
+            switch (type.down ()) {
+                case "ext2": case "ext3": case "ext4": case "btrfs": case "xfs":
+                case "f2fs": case "ntfs": case "vfat": case "exfat": case "udf":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        public static void validate_label (string type, string label) throws Error {
+            if (!label.validate () || label.contains ("\n") || label.contains ("/"))
+                throw new IOError.INVALID_ARGUMENT ("The volume label contains unsupported characters.");
+            int bytes = label.length;
+            int characters = label.char_count ();
+            switch (type.down ()) {
+                case "ext2": case "ext3": case "ext4":
+                    if (bytes > 16) throw new IOError.INVALID_ARGUMENT ("Ext filesystems use labels of at most 16 bytes.");
+                    break;
+                case "xfs":
+                    if (bytes > 12) throw new IOError.INVALID_ARGUMENT ("XFS labels are limited to 12 bytes.");
+                    break;
+                case "btrfs":
+                    if (bytes > 255) throw new IOError.INVALID_ARGUMENT ("Btrfs labels are limited to 255 bytes.");
+                    break;
+                case "f2fs":
+                    if (characters > 512) throw new IOError.INVALID_ARGUMENT ("F2FS labels are limited to 512 characters.");
+                    break;
+                case "vfat":
+                    if (characters > 11 || label != label.up () || label.contains ("+") || label.contains (",") ||
+                        label.contains (";") || label.contains ("=") || label.contains ("[") || label.contains ("]"))
+                        throw new IOError.INVALID_ARGUMENT ("FAT labels use at most 11 upper-case characters.");
+                    break;
+                case "exfat": case "ntfs":
+                    if (characters > 32) throw new IOError.INVALID_ARGUMENT ("This filesystem uses labels of at most 32 characters.");
+                    break;
+                case "udf":
+                    if (bytes > 126) throw new IOError.INVALID_ARGUMENT ("UDF labels are limited to 126 bytes.");
+                    break;
+                default:
+                    if (label != "") throw new IOError.NOT_SUPPORTED ("This filesystem does not support volume labels.");
+                    break;
+            }
+        }
+    }
+
+    public enum StorageJobState {
+        PENDING, PREPARING, RUNNING, FINALIZING, COMPLETED, FAILED, CANCELLED, PARTIALLY_COMPLETED
+    }
+
+    public class StorageOperationResult : Object {
+        public bool successful;
+        public bool partial;
+        public string summary = "";
+        public string technical_error = "";
+        public string resulting_path = "";
+        public string[] completed_steps = {};
+
+        public void completed (string step) {
+            string[] updated = new string[completed_steps.length + 1];
+            for (int i = 0; i < completed_steps.length; i++) updated[i] = completed_steps[i];
+            updated[completed_steps.length] = step;
+            completed_steps = updated;
+        }
+        public void fail (string message, Error? error = null) {
+            successful = false;
+            partial = completed_steps.length != 0;
+            summary = message;
+            technical_error = error?.message ?? "";
+        }
+    }
+
+    public class StorageJob : Object {
+        public string id { get; construct; }
+        public string operation { get; construct; }
+        public string target { get; construct; }
+        public string[] affected { get; construct; }
+        public int64 start_time { get; construct; }
+        public string phase { get; set; default = "Waiting"; }
+        public StorageJobState state { get; set; default = StorageJobState.PENDING; }
+        public double progress { get; set; default = 0.0; }
+        public bool progress_valid { get; set; default = false; }
+        public bool cancelable { get; set; default = false; }
+        public string backend_path { get; set; default = ""; }
+        public string error_message { get; set; default = ""; }
+        public StorageOperationResult? result { get; set; }
+        public Cancellable cancellable { get; private set; default = new Cancellable (); }
+
+        public StorageJob (string id, string operation, string target, string[] affected) {
+            Object (id: id, operation: operation, target: target, affected: affected,
+                start_time: get_real_time ());
+        }
+    }
+
+    public class StorageJobManager : Object {
+        public ListStore jobs { get; private set; default = new ListStore (typeof (StorageJob)); }
+        private uint64 serial;
+        public signal void changed ();
+
+        public StorageJob begin (string operation, StorageBlock target, StorageDependencyService graph) {
+            string[] affected = {};
+            foreach (var node in graph.descendants (target)) affected += node.path;
+            var job = new StorageJob ((++serial).to_string (), operation, target.preferred, affected);
+            jobs.append (job);
+            changed ();
+            return job;
+        }
+
+        public void phase (StorageJob job, StorageJobState state, string phase) {
+            job.state = state;
+            job.phase = phase;
+            changed ();
+        }
+
+        public void finish (StorageJob job, StorageOperationResult result) {
+            job.result = result;
+            job.progress = 1.0;
+            job.progress_valid = result.successful;
+            job.state = result.successful ? StorageJobState.COMPLETED :
+                result.partial ? StorageJobState.PARTIALLY_COMPLETED : StorageJobState.FAILED;
+            job.phase = result.summary;
+            changed ();
+        }
+
+        public void observe (string path, string operation, string[] objects, double progress,
+            bool valid, bool cancelable, uint64 start_time) {
+            StorageJob? match = null;
+            for (uint i = 0; i < jobs.get_n_items (); i++) {
+                var candidate = jobs.get_item (i) as StorageJob;
+                bool active = candidate.state == StorageJobState.PREPARING ||
+                    candidate.state == StorageJobState.RUNNING || candidate.state == StorageJobState.FINALIZING;
+                bool related = false;
+                foreach (var object_path in objects)
+                    foreach (var affected_path in candidate.affected)
+                        related |= object_path == affected_path;
+                if (candidate.backend_path == path || (candidate.backend_path == "" && active &&
+                    (candidate.operation == operation || related))) {
+                    match = candidate;
+                    break;
+                }
+            }
+            if (match == null) {
+                match = new StorageJob ("udisks:" + path, operation, objects.length == 0 ? "Storage device" : objects[0], objects);
+                jobs.append (match);
+            }
+            match.backend_path = path;
+            match.state = StorageJobState.RUNNING;
+            match.phase = operation;
+            match.progress = progress;
+            match.progress_valid = valid;
+            match.cancelable = cancelable;
+            changed ();
+        }
+
+        public void backend_removed (string path) {
+            for (uint i = 0; i < jobs.get_n_items (); i++) {
+                var job = jobs.get_item (i) as StorageJob;
+                if (job.backend_path == path && job.state == StorageJobState.RUNNING) {
+                    job.state = StorageJobState.COMPLETED;
+                    job.phase = "Completed";
+                    job.progress = 1.0;
+                    changed ();
+                }
+            }
         }
     }
 }

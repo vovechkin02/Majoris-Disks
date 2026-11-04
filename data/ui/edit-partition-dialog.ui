@@ -4,8 +4,12 @@
     <property name="extra-child">
       <object class="GtkBox">
         <property name="orientation">vertical</property>
+        <child><object class="AdwEntryRow" id="type_entry"><property name="title">Partition type</property></object></child>
         <child><object class="AdwEntryRow" id="name_entry"><property name="title">GPT partition name</property></object></child>
         <child><object class="GtkCheckButton" id="bootable"><property name="label">Bootable</property></object></child>
+        <child><object class="GtkCheckButton" id="required"><property name="label">Required partition</property></object></child>
+        <child><object class="GtkCheckButton" id="no_block_io"><property name="label">No block I/O protocol</property></object></child>
+        <child><object class="GtkCheckButton" id="legacy_boot"><property name="label">Legacy BIOS bootable</property></object></child>
       </object>
     </property>
     <responses>

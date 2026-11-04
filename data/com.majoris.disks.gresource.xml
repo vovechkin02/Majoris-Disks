@@ -12,5 +12,14 @@
     <file>ui/edit-filesystem-dialog.ui</file>
     <file>ui/ownership-dialog.ui</file>
     <file>ui/edit-partition-dialog.ui</file>
+    <file>ui/operation-result-dialog.ui</file>
+    <file>ui/repair-confirmation-dialog.ui</file>
+    <file>ui/delete-confirmation-dialog.ui</file>
+    <file>ui/format-disk-dialog.ui</file>
+    <file>ui/format-volume-dialog.ui</file>
+    <file>ui/create-partition-dialog.ui</file>
+    <file>ui/resize-volume-dialog.ui</file>
+    <file>ui/job-row.ui</file>
+    <file>ui/jobs-popover.ui</file>
   </gresource>
 </gresources>

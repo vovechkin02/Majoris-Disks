@@ -1,0 +1,12 @@
+<interface>
+  <template class="MajorisDisksFormatDiskDialog" parent="AdwAlertDialog">
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="gpt" appearance="destructive">Create GPT</response>
+      <response id="dos" appearance="destructive">Create MBR</response>
+      <response id="empty" appearance="destructive">Make Empty</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksResizeVolumeDialog" parent="AdwAlertDialog">
+    <property name="heading">Resize Volume</property>
+    <property name="extra-child"><object class="AdwPreferencesGroup">
+      <child><object class="AdwActionRow" id="current_row"><property name="title">Current partition size</property></object></child>
+      <child><object class="AdwActionRow" id="range_row"><property name="title">Permitted range</property></object></child>
+      <child><object class="AdwSpinRow" id="size_row"><property name="title">New size (MiB)</property><property name="digits">0</property><property name="adjustment"><object class="GtkAdjustment"><property name="lower">1</property><property name="upper">1</property><property name="step-increment">1</property><property name="page-increment">128</property></object></property></object></child>
+      <child><object class="AdwSwitchRow" id="filesystem_row"><property name="title">Resize filesystem too</property><property name="subtitle">Uses the safe online or offline workflow supported by UDisks</property><property name="active">true</property></object></child>
+      <child><object class="AdwActionRow" id="mode_row"><property name="title">Operation mode</property></object></child>
+    </object></property>
+    <responses><response id="cancel">Cancel</response><response id="resize" appearance="destructive">Resize</response></responses>
+    <property name="default-response">cancel</property><property name="close-response">cancel</property>
+  </template>
+</interface>

@@ -19,11 +19,15 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button edit_label;
         [GtkChild] private unowned Gtk.Button take_ownership;
         [GtkChild] private unowned Gtk.Button edit_partition;
+        [GtkChild] private unowned Gtk.Button create_partition;
+        [GtkChild] private unowned Gtk.Button resize_volume;
         public signal void metadata_requested (StorageBlock block);
         public signal void ownership_requested (StorageBlock block);
         public signal void label_requested (StorageBlock block);
         public signal void format_requested (StorageBlock block);
         public signal void partitioning_requested (StorageBlock block, bool deleting);
+        public signal void create_requested (StorageBlock disk, StorageFreeSpace gap);
+        public signal void resize_requested (StorageBlock block);
         private StorageBlock? selected_block;
         public signal void check_requested (StorageBlock block, bool repair);
         public UDisksService? backend { private get; set; }
@@ -72,6 +76,15 @@ namespace MajorisDisks {
             edit_partition.clicked.connect (() => {
                 if (selected_block != null) metadata_requested (selected_block);
             });
+            create_partition.clicked.connect (() => {
+                var gap = volumes.get_selected_row () as VolumeRow;
+                var space = gap?.device as StorageFreeSpace;
+                var disk = current?.medium;
+                if (space != null && disk != null) create_requested (disk, space);
+            });
+            resize_volume.clicked.connect (() => {
+                if (selected_block != null) resize_requested (selected_block);
+            });
             take_ownership.clicked.connect (() => {
                 if (selected_block != null) ownership_requested (selected_block);
             });
@@ -101,6 +114,11 @@ namespace MajorisDisks {
         public void clear () {
             current = null;
             show_volume (null);
+        }
+
+        public void select_identity (string identity) {
+            selected = identity;
+            if (current != null) show_drive (current);
         }
 
         public void show_drive (StorageDrive drive) {
@@ -167,6 +185,8 @@ namespace MajorisDisks {
             edit_label.visible = false;
             take_ownership.visible = false;
             edit_partition.visible = false;
+            create_partition.visible = false;
+            resize_volume.visible = false;
             selected_block = null;
             usage.label = "";
             foreach (var field in metadata) properties.remove (field);
@@ -181,13 +201,17 @@ namespace MajorisDisks {
                 var gap = (StorageFreeSpace) row.device;
                 add_volume_field ("Offset", gap.offset.to_string () + " bytes");
                 add_volume_field ("Size", format_size (gap.size));
-                add_volume_field ("Allocatable space", "Unconfirmed");
+                var disk = current?.medium;
+                create_partition.visible = disk?.table != null && disk.available && !disk.read_only &&
+                    !disk.system_hint && disk.logical_sector_size != 0 && gap.size >= disk.logical_sector_size;
+                add_volume_field ("Allocatable space", create_partition.visible ?
+                    "Validated when Create is opened" : "Unavailable");
                 return;
             }
             selected_block = block;
             take_ownership.visible = UDisksService.supports_ownership (block);
             edit_label.visible = block.available && !block.read_only && !block.system_hint &&
-                block.type_id == "ext4" && block.filesystem != null && !block.filesystem.mounted;
+                FilesystemCapabilityService.supports_label (block.type_id) && block.filesystem != null && !block.filesystem.mounted;
             format_volume.visible = block.table == null && block.partition?.container != true &&
                 block.available && !block.read_only && !block.system_hint && block.filesystem?.mounted != true;
             delete_partition.visible = block.partition != null && !block.partition.container &&
@@ -195,6 +219,9 @@ namespace MajorisDisks {
             var scheme = current?.medium?.table?.scheme;
             edit_partition.visible = delete_partition.visible && block.filesystem?.mounted != true &&
                 (scheme == "gpt" || (scheme == "dos" && block.partition?.logical != true));
+            resize_volume.visible = block.partition != null && !block.partition.container && block.available &&
+                !block.read_only && !block.system_hint && block.backing_path == "/" && block.raid_path == "/" &&
+                block.logical_volume_path == "/";
             add_volume_field ("Device", block.preferred, true);
             var part = block.partition;
             if (part != null) {
@@ -231,6 +258,9 @@ namespace MajorisDisks {
             } else if (capabilities.activate_swap) {
                 method = "Start";
                 operation.label = "Activate Swap";
+            } else if (capabilities.deactivate_swap) {
+                method = "Stop";
+                operation.label = "Deactivate Swap";
             }
             operation.visible = method != "";
             open_files.visible = fs != null && fs.mounted;

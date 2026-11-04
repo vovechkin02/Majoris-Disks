@@ -175,6 +175,7 @@ namespace MajorisDisks {
         public bool mount;
         public bool unmount;
         public bool activate_swap;
+        public bool deactivate_swap;
 
         public StorageCapabilities (StorageBlock block) {
             if (!block.available || block.ignored) return;
@@ -183,6 +184,7 @@ namespace MajorisDisks {
             var safety = StorageSafetyService.assess (block, block.dependencies);
             unmount = fs != null && fs.mounted && !safety.system_critical && !safety.active_dependents;
             activate_swap = block.has_swap && !block.swap_active && !block.read_only;
+            deactivate_swap = block.has_swap && block.swap_active;
         }
     }
 }

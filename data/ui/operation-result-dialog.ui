@@ -1,0 +1,9 @@
+<interface>
+  <template class="MajorisDisksOperationResultDialog" parent="AdwAlertDialog">
+    <responses>
+      <response id="close">Close</response>
+    </responses>
+    <property name="default-response">close</property>
+    <property name="close-response">close</property>
+  </template>
+</interface>

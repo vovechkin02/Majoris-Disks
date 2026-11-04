@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface><template class="MajorisDisksJobRow" parent="AdwActionRow"><property name="use-markup">false</property>
+  <child type="suffix"><object class="GtkProgressBar" id="progress"><property name="valign">center</property><property name="width-request">120</property></object></child>
+  <child type="suffix"><object class="GtkButton" id="cancel"><property name="label">Cancel</property><property name="valign">center</property></object></child>
+</template></interface>

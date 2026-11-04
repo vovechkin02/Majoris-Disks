@@ -22,6 +22,8 @@
 <child><object class="GtkButton" id="edit_label"><property name="label">Edit Label</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="format_volume"><property name="label">Format Volume</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="edit_partition"><property name="label">Edit Partition</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="create_partition"><property name="label">Create Partition</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="resize_volume"><property name="label">Resize Volume</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="delete_partition"><property name="label">Delete Partition</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="open_files"><property name="label">Open in Files</property></object></child>
 </object></child></object></child>

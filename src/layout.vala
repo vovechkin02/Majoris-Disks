@@ -10,6 +10,70 @@ namespace MajorisDisks {
     }
 
     public class PartitionLayoutService {
+        public enum PartitionKind { GPT, MBR_PRIMARY, MBR_EXTENDED, MBR_LOGICAL }
+
+        public static uint64 aligned_up (uint64 value, uint64 alignment) {
+            if (alignment == 0 || value % alignment == 0) return value;
+            uint64 addition = alignment - value % alignment;
+            return value > uint64.MAX - addition ? uint64.MAX : value + addition;
+        }
+
+        public static void validate_create (StorageBlock disk, StorageFreeSpace gap, uint64 requested_size,
+            PartitionKind kind, out uint64 offset, out uint64 size) throws Error {
+            var table = disk.table;
+            if (table == null || (table.scheme != "gpt" && table.scheme != "dos") || disk.size == 0)
+                throw new IOError.NOT_SUPPORTED ("A GPT or MBR partition table is required.");
+            if (gap.parent == null || gap.size == 0 || gap.offset >= disk.size || gap.size > disk.size - gap.offset)
+                throw new IOError.INVALID_DATA ("The selected free-space geometry is no longer valid.");
+            uint64 sector = disk.logical_sector_size;
+            if (sector == 0) throw new IOError.NOT_SUPPORTED ("The device sector size is unavailable.");
+            uint64 alignment = uint64.max (sector, 1024 * 1024);
+            offset = aligned_up (gap.offset, alignment);
+            if (offset >= gap.end) throw new IOError.NO_SPACE ("No aligned space remains in this region.");
+            uint64 available = gap.end - offset;
+            size = requested_size == 0 ? 0 : requested_size - requested_size % sector;
+            if (requested_size != 0 && (size == 0 || size > available))
+                throw new IOError.NO_SPACE ("The requested partition does not fit in the selected region.");
+
+            int primary = 0;
+            int containers = 0;
+            StorageBlock? containing = null;
+            foreach (var block in table.partitions) {
+                var part = block.partition;
+                if (part == null || block.size == 0) throw new IOError.INVALID_DATA ("Existing partition geometry is incomplete.");
+                if (part.offset < gap.end && gap.offset < part.offset + uint64.min (block.size, disk.size - uint64.min (part.offset, disk.size)) &&
+                    block != gap.parent)
+                    throw new IOError.INVALID_DATA ("The selected region overlaps an existing partition.");
+                if (table.scheme == "dos" && !part.logical) primary++;
+                if (part.container) {
+                    containers++;
+                    if (gap.offset >= part.offset && gap.end <= part.offset + block.size) containing = block;
+                }
+            }
+            if (table.scheme == "gpt") {
+                if (kind != PartitionKind.GPT) throw new IOError.INVALID_ARGUMENT ("MBR partition types cannot be used on GPT.");
+                if (gap.parent != disk) throw new IOError.INVALID_DATA ("GPT free space must belong to the disk.");
+                return;
+            }
+            switch (kind) {
+                case PartitionKind.MBR_PRIMARY:
+                    if (containing != null) throw new IOError.INVALID_ARGUMENT ("Primary partitions cannot be created inside an extended partition.");
+                    if (primary >= 4) throw new IOError.NO_SPACE ("The MBR primary partition limit has been reached.");
+                    break;
+                case PartitionKind.MBR_EXTENDED:
+                    if (containing != null) throw new IOError.INVALID_ARGUMENT ("An extended partition cannot be nested.");
+                    if (containers != 0) throw new IOError.EXISTS ("This disk already has an extended partition.");
+                    if (primary >= 4) throw new IOError.NO_SPACE ("The MBR primary partition limit has been reached.");
+                    break;
+                case PartitionKind.MBR_LOGICAL:
+                    if (containing == null || gap.parent != containing)
+                        throw new IOError.INVALID_ARGUMENT ("Logical partitions must be created inside the extended partition.");
+                    break;
+                default:
+                    throw new IOError.INVALID_ARGUMENT ("GPT partitions cannot be created on MBR.");
+            }
+        }
+
         public static void validate_resize (StorageBlock disk, StorageBlock target, uint64 size) throws Error {
             var table = disk.table;
             var part = target.partition;
@@ -50,6 +114,22 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_DATA ("The current partition geometry is inconsistent.");
             if (size > limit - part.offset)
                 throw new IOError.NO_SPACE ("The requested size crosses the next partition or container boundary.");
+        }
+
+        public static uint64 maximum_resize (StorageBlock disk, StorageBlock target) throws Error {
+            var part = target.partition;
+            var parent = target.parent as StorageBlock;
+            if (disk.table == null || part == null || parent == null || part.container || part.offset >= disk.size)
+                throw new IOError.NOT_SUPPORTED ("The partition resize boundary is unavailable.");
+            uint64 limit = part.logical ? parent.partition.offset + parent.size : disk.size;
+            foreach (var sibling in disk.table.partitions) {
+                if (sibling == target || sibling.parent != parent || sibling.partition == null) continue;
+                if (sibling.partition.offset > part.offset) limit = uint64.min (limit, sibling.partition.offset);
+            }
+            if (limit <= part.offset) throw new IOError.INVALID_DATA ("The adjacent partition geometry is invalid.");
+            uint64 maximum = limit - part.offset;
+            uint64 sector = disk.logical_sector_size;
+            return sector == 0 ? maximum : maximum - maximum % sector;
         }
 
         public static Extent[] normalize (uint64 start, uint64 end, Extent[] occupied) {
