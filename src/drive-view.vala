@@ -18,6 +18,8 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button format_volume;
         [GtkChild] private unowned Gtk.Button edit_label;
         [GtkChild] private unowned Gtk.Button mount_options;
+        [GtkChild] private unowned Gtk.Button unlock_volume;
+        [GtkChild] private unowned Gtk.Button lock_volume;
         [GtkChild] private unowned Gtk.Button take_ownership;
         [GtkChild] private unowned Gtk.Button edit_partition;
         [GtkChild] private unowned Gtk.Button create_partition;
@@ -26,6 +28,7 @@ namespace MajorisDisks {
         public signal void ownership_requested (StorageBlock block);
         public signal void label_requested (StorageBlock block);
         public signal void mount_options_requested (StorageBlock block);
+        public signal void encryption_requested (StorageBlock block, bool unlock);
         public signal void format_requested (StorageBlock block);
         public signal void partitioning_requested (StorageBlock block, bool deleting);
         public signal void create_requested (StorageBlock disk, StorageFreeSpace gap);
@@ -95,6 +98,8 @@ namespace MajorisDisks {
                 if (selected_block != null) label_requested (selected_block);
             });
             mount_options.clicked.connect (() => { if (target != null) mount_options_requested (target); });
+            unlock_volume.clicked.connect (() => { if (selected_block != null) encryption_requested (selected_block, true); });
+            lock_volume.clicked.connect (() => { if (selected_block != null) encryption_requested (selected_block, false); });
             format_volume.clicked.connect (() => {
                 if (selected_block != null) format_requested (selected_block);
             });
@@ -251,6 +256,8 @@ namespace MajorisDisks {
             take_ownership.visible = UDisksService.supports_ownership (target) &&
                 !StorageSafetyService.assess (target, backend?.snapshot.dependencies).system_critical;
             if (block.encrypted != null) add_volume_field ("Encryption", target == block ? "Locked" : "Unlocked");
+            unlock_volume.visible = block.encrypted != null && block.encrypted.mapping == null && block.available;
+            lock_volume.visible = block.encrypted?.mapping != null && block.available && !block.system_hint;
             if (target != block) add_volume_field ("Mapped device", target.preferred, true);
             var fs = target.filesystem;
             if (fs != null) {

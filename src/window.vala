@@ -62,6 +62,7 @@ namespace MajorisDisks {
             drive_view.ownership_requested.connect (confirm_ownership);
             drive_view.label_requested.connect (edit_filesystem_label);
             drive_view.mount_options_requested.connect (edit_mount_options);
+            drive_view.encryption_requested.connect (manage_encryption);
             drive_view.format_requested.connect ((block) => confirm_partitioning (block, false, true));
             var jobs_popover = new JobsPopover (backend);
             jobs_button.popover = jobs_popover;
@@ -190,6 +191,48 @@ namespace MajorisDisks {
                     });
             });
             dialog.present (this);
+        }
+        private void manage_encryption (StorageBlock block, bool unlock) {
+            if (pending.contains (block.path)) return;
+            string identity = backend.modification_identity (block);
+            if (unlock) {
+                var dialog = new UnlockVolumeDialog (block);
+                dialog.response.connect ((response) => {
+                    if (response != "unlock" || pending.contains (block.path)) return;
+                    string passphrase = dialog.passphrase;
+                    dialog.clear_secret ();
+                    pending.insert (block.path, block);
+                    backend.unlock_volume.begin (block, passphrase, identity, (object, result) => {
+                        passphrase = ""; pending.remove (block.path);
+                        try {
+                            backend.unlock_volume.end (result);
+                            notifications.add_toast (new Adw.Toast ("Encrypted volume unlocked"));
+                        } catch (Error error) {
+                            show_check_message ("Could not unlock the volume", operation_error (error));
+                        }
+                    });
+                });
+                dialog.present (this);
+                return;
+            }
+            var confirmation = new Adw.AlertDialog ("Lock encrypted volume?",
+                "Mounted filesystems in the clear-text mapping will be safely unmounted before locking.");
+            confirmation.add_response ("cancel", "Cancel"); confirmation.add_response ("lock", "Lock");
+            confirmation.set_response_appearance ("lock", Adw.ResponseAppearance.DESTRUCTIVE);
+            confirmation.response.connect ((response) => {
+                if (response != "lock" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.lock_volume.begin (block, identity, (object, result) => {
+                    pending.remove (block.path);
+                    try {
+                        backend.lock_volume.end (result);
+                        notifications.add_toast (new Adw.Toast ("Encrypted volume locked"));
+                    } catch (Error error) {
+                        show_check_message ("Could not lock the volume", operation_error (error));
+                    }
+                });
+            });
+            confirmation.present (this);
         }
         private void confirm_partitioning (StorageBlock block, bool deleting, bool volume = false) {
             string identity = backend.modification_identity (block);
@@ -385,7 +428,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.EntryRow filesystem;
         [GtkChild] private unowned Adw.EntryRow options;
         [GtkChild] private unowned Adw.EntryRow display_name;
-        [GtkChild] private unowned Adw.SwitchRow show_files;
+        [GtkChild] private unowned Adw.ComboRow files_visibility;
         [GtkChild] private unowned Adw.ActionRow identifier;
         public bool enabled { get { return custom.active; } }
         public bool startup_mount { get { return startup.active; } }
@@ -395,21 +438,17 @@ namespace MajorisDisks {
         public string confirmed_identity { get; private set; }
         public string confirmed_uuid { get; private set; }
         private Gtk.StringList entries = new Gtk.StringList (null);
+        private Gtk.StringList visibility_choices = new Gtk.StringList ({ "Use system default", "Show", "Hide" });
         public Variant? original_item { owned get {
             return entry.selected < block.mount_configurations.length ? block.mount_configurations[entry.selected].backend_item : null;
         } }
         public string mount_options { owned get {
-            string[] kept = {};
-            foreach (var token in options.text.split (","))
-                if (!token.has_prefix ("x-gvfs-name=") && token != "x-gvfs-show" && token != "x-gvfs-hide") kept += token;
-            string value = string.joinv (",", kept);
-            if (display_name.text.strip () != "") value += ",x-gvfs-name=" + display_name.text.strip ();
-            if (show_files.active) value += ",x-gvfs-show";
-            else value += ",x-gvfs-hide";
-            return value;
+            try { return MountOptionService.compose (options.text, display_name.text,
+                (MountVisibility) files_visibility.selected); }
+            catch (Error error) { return options.text; }
         } }
         public MountOptionsDialog (StorageBlock block, string identity) {
-            this.block = block; confirmed_identity = identity;
+            this.block = block; confirmed_identity = identity; files_visibility.model = visibility_choices;
             confirmed_uuid = block.uuid; entry.model = entries;
             foreach (var item in block.mount_configurations) entries.append (item.directory + " · " + item.device);
             entries.append ("New configuration");
@@ -417,30 +456,44 @@ namespace MajorisDisks {
             entry.notify["selected"].connect (load_selected);
             load_selected ();
             custom.notify["active"].connect (validate); directory.changed.connect (validate);
-            filesystem.changed.connect (validate); options.changed.connect (validate); validate ();
+            filesystem.changed.connect (validate); options.changed.connect (validate);
+            display_name.changed.connect (validate); files_visibility.notify["selected"].connect (validate); validate ();
         }
         private void load_selected () {
             var config = entry.selected < block.mount_configurations.length ? block.mount_configurations[entry.selected] : null;
             custom.active = config != null; startup.active = config == null || !("," + config.options + ",").contains (",noauto,");
             directory.text = config?.directory ?? "/mnt/" + (block.label == "" ? block.uuid : block.label);
             filesystem.text = config?.filesystem ?? block.type_id; options.text = config?.options ?? "defaults";
-            display_name.text = option_value (options.text, "x-gvfs-name=");
-            show_files.active = ("," + options.text + ",").contains (",x-gvfs-show,");
+            display_name.text = MountOptionService.display_name (options.text);
+            files_visibility.selected = (uint) MountOptionService.visibility (options.text);
             identifier.subtitle = "UUID=" + block.uuid;
             validate ();
-        }
-        private static string option_value (string options, string prefix) {
-            foreach (var option in options.split (",")) if (option.has_prefix (prefix)) return option.substring (prefix.length);
-            return "";
         }
         private void validate () {
             bool fields = custom.active;
             startup.sensitive = fields; directory.sensitive = fields; filesystem.sensitive = fields; options.sensitive = fields;
-            display_name.sensitive = fields; show_files.sensitive = fields;
+            display_name.sensitive = fields; files_visibility.sensitive = fields;
             bool valid = !fields || (Path.is_absolute (directory.text) && !directory.text.contains ("\n") &&
                 filesystem.text.strip () != "" && !options.text.contains ("\n"));
+            if (valid && fields) {
+                try { MountOptionService.compose (options.text, display_name.text,
+                    (MountVisibility) files_visibility.selected); }
+                catch (Error error) { valid = false; }
+            }
             set_response_enabled ("apply", valid);
         }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/unlock-volume-dialog.ui")]
+    public class UnlockVolumeDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.PasswordEntryRow secret;
+        public string passphrase { owned get { return secret.text; } }
+        public UnlockVolumeDialog (StorageBlock block) {
+            body = "%s · %s".printf (block.preferred, format_size (block.size));
+            secret.changed.connect (() => set_response_enabled ("unlock", secret.text.length > 0));
+            set_response_enabled ("unlock", false);
+        }
+        public void clear_secret () { secret.text = ""; }
     }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/sidebar-group-heading.ui")]

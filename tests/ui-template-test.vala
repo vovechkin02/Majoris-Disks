@@ -27,7 +27,8 @@ public static int main (string[] args) {
         new OperationResultDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
         new FormatDiskDialog (), new FormatVolumeDialog (backend, block),
         new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block),
-        new JobRow (backend, job), new JobsPopover (backend), new ActiveJobsDialog (), new MountOptionsDialog (block, "identity")
+        new JobRow (backend, job), new JobsPopover (backend), new ActiveJobsDialog (),
+        new MountOptionsDialog (block, "identity"), new UnlockVolumeDialog (block)
     };
     string[] resources = {
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
@@ -36,7 +37,7 @@ public static int main (string[] args) {
         "ownership-dialog.ui", "operation-result-dialog.ui", "repair-confirmation-dialog.ui",
         "delete-confirmation-dialog.ui", "format-disk-dialog.ui", "format-volume-dialog.ui",
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
-        "active-jobs-dialog.ui", "mount-options-dialog.ui"
+        "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui"
     };
     foreach (var name in resources) {
         try { resources_lookup_data ("/com/majoris/disks/ui/" + name, ResourceLookupFlags.NONE); }

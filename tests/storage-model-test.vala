@@ -334,7 +334,7 @@ private void test_extended_resize_boundaries () {
         PartitionLayoutService.validate_resize (disk, extended, 10 * 1024 * 1024);
         try { PartitionLayoutService.validate_resize (disk, extended, 8 * 1024 * 1024); assert_not_reached (); }
         catch (Error error) { assert (error is IOError.NO_SPACE); }
-    } catch (Error error) { assert_not_reached (); }
+    } catch (Error error) { GLib.error ("Unexpected mount-option error: %s", error.message); }
 }
 
 private void test_label_validation () {
@@ -468,9 +468,25 @@ private void test_job_terminal_precedence () {
 }
 
 private void test_mount_option_normalization () {
-    assert (MountOptionService.normalize ("defaults,noauto,rw,noauto,rw", true) == "defaults,rw");
-    assert (MountOptionService.normalize ("rw,noauto,rw", false) == "rw,noauto");
-    assert (MountOptionService.normalize ("", false) == "defaults,noauto");
+    try {
+        assert (MountOptionService.normalize ("defaults,noauto,rw", true) == "defaults,rw");
+        assert (MountOptionService.normalize ("rw,noauto", false) == "rw,noauto");
+        assert (MountOptionService.normalize ("", false) == "defaults,noauto");
+        assert (MountOptionService.compose ("defaults", "Archive, 2026", MountVisibility.DEFAULT) ==
+            "defaults,x-gvfs-name=Archive\\054\\0402026");
+        string saved = "defaults,x-gvfs-name=Archive\\054\\0402026";
+        assert (MountOptionService.display_name (saved) == "Archive, 2026");
+        assert (MountOptionService.visibility (saved) == MountVisibility.DEFAULT);
+        assert (MountOptionService.compose (saved, "Archive, 2026", MountVisibility.DEFAULT) == saved);
+        assert (MountOptionService.compose (saved, "Archive, 2026", MountVisibility.SHOW).has_suffix (",x-gvfs-show"));
+        bool rejected = false;
+        try { MountOptionService.parse ("rw,rw"); } catch (IOError error) { rejected = true; }
+        assert (rejected); rejected = false;
+        try { MountOptionService.parse ("ro,rw"); } catch (IOError error) { rejected = true; }
+        assert (rejected); rejected = false;
+        try { MountOptionService.parse ("x-gvfs-show,x-gvfs-hide"); } catch (IOError error) { rejected = true; }
+        assert (rejected);
+    } catch (Error error) { GLib.error ("Unexpected mount-option error: %s", error.message); }
 }
 
 private void test_job_correlation () {

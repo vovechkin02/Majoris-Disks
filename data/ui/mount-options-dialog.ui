@@ -8,7 +8,7 @@
     <child><object class="AdwEntryRow" id="filesystem"><property name="title">Filesystem type</property></object></child>
     <child><object class="AdwEntryRow" id="options"><property name="title">Mount options</property></object></child>
     <child><object class="AdwEntryRow" id="display_name"><property name="title">Display name</property></object></child>
-    <child><object class="AdwSwitchRow" id="show_files"><property name="title">Show in Files</property></object></child>
+    <child><object class="AdwComboRow" id="files_visibility"><property name="title">Show in Files</property><property name="subtitle">Preserve the system default or choose an explicit setting</property></object></child>
     <child><object class="AdwActionRow" id="identifier"><property name="title">Stable device identifier</property></object></child>
   </object></property>
   <responses><response id="cancel">Cancel</response><response id="apply" appearance="suggested">Apply</response></responses>

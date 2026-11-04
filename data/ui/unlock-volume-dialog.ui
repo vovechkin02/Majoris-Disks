@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksUnlockVolumeDialog" parent="AdwAlertDialog">
+    <property name="heading">Unlock Encrypted Volume</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwPasswordEntryRow" id="secret"><property name="title">Passphrase</property><property name="show-apply-button">false</property></object></child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="unlock" appearance="suggested">Unlock</response>
+    </responses>
+    <property name="default-response">unlock</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

@@ -1152,8 +1152,9 @@ namespace MajorisDisks {
             string confirmed_identity, string confirmed_uuid) throws Error {
             if (block.filesystem == null || block.uuid == "" || block.read_only || block.system_hint)
                 throw new IOError.NOT_SUPPORTED ("Persistent mount configuration is unavailable for this volume.");
-            if (enabled && (!Path.is_absolute (directory) || directory.contains ("\n") || directory.contains ("\0") ||
-                filesystem.contains ("\n") || mount_options.contains ("\n") || mount_options.contains ("\0")))
+            if (enabled && (!Path.is_absolute (directory) || directory.contains ("\n") || directory.contains ("\r") ||
+                filesystem.contains ("\n") || filesystem.contains ("\r") || mount_options.contains ("\n") ||
+                mount_options.contains ("\r")))
                 throw new IOError.INVALID_ARGUMENT ("The mount path or options are invalid.");
             if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
                 throw new IOError.NOT_FOUND ("The volume changed after the mount configuration dialog was opened.");
@@ -1199,6 +1200,90 @@ namespace MajorisDisks {
                 result.successful = true; result.summary = "Mount configuration updated"; jobs.finish (job, result);
             } catch (Error error) { result.fail ("Mount configuration was not updated", error); jobs.finish (job, result); throw error; }
             finally { locks.release (block); }
+        }
+        public async StorageBlock unlock_volume (StorageBlock block, string passphrase,
+            string confirmed_identity) throws Error {
+            if (block.encrypted == null)
+                throw new IOError.NOT_SUPPORTED ("The selected volume is not exposed as encrypted storage by UDisks.");
+            if (block.encrypted.mapping != null)
+                throw new IOError.EXISTS ("The encrypted volume is already unlocked.");
+            if (passphrase == "") throw new IOError.INVALID_ARGUMENT ("Enter the encryption passphrase.");
+            if (modification_identity (block) != confirmed_identity)
+                throw new IOError.NOT_FOUND ("The encrypted volume changed before it could be unlocked.");
+            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.MOUNT,
+                block, snapshot.dependencies);
+            if (!eligibility.allowed || eligibility.unknown)
+                throw new IOError.PERMISSION_DENIED (eligibility.reason);
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Unlock encrypted volume", block, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            try {
+                jobs.phase (job, StorageJobState.RUNNING, "Authorizing and unlocking encrypted storage");
+                if (modification_identity (block) != confirmed_identity || block.encrypted?.mapping != null)
+                    throw new IOError.NOT_FOUND ("The encrypted volume changed before the unlock request was sent.");
+                var options = new VariantBuilder (new VariantType ("a{sv}"));
+                var reply = yield require_volume (block, "Encrypted").call ("Unlock",
+                    new Variant ("(s@a{sv})", passphrase, options.end ()),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                string cleartext_path = reply.get_child_value (0).get_string ();
+                StorageBlock? mapping = null;
+                for (int attempt = 0; attempt < 50 && mapping == null; attempt++) {
+                    synchronize ();
+                    mapping = snapshot.blocks.lookup (cleartext_path);
+                    if (mapping == null) yield settle_delay (backend_lifetime);
+                }
+                if (mapping == null || mapping.backing_path != block.path)
+                    throw new IOError.FAILED ("UDisks unlocked the volume but its clear-text mapping could not be verified.");
+                result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
+                result.summary = "Encrypted volume unlocked"; result.resulting_path = mapping.path;
+                result.actual_state = mapping.preferred; jobs.finish (job, result);
+                return mapping;
+            } catch (Error error) {
+                result.fail ("The encrypted volume could not be unlocked", error); jobs.finish (job, result); throw error;
+            } finally { locks.release (block); }
+        }
+
+        public async void lock_volume (StorageBlock block, string confirmed_identity) throws Error {
+            var mapping = block.encrypted?.mapping;
+            if (block.encrypted == null || mapping == null)
+                throw new IOError.NOT_SUPPORTED ("The encrypted volume is not unlocked.");
+            if (modification_identity (block) != confirmed_identity)
+                throw new IOError.NOT_FOUND ("The encrypted volume changed before it could be locked.");
+            var safety = StorageSafetyService.assess (mapping, snapshot.dependencies);
+            if (safety.system_critical || safety.unknown_dependencies)
+                throw new IOError.PERMISSION_DENIED ("System-critical or unresolved encrypted storage cannot be locked.");
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Lock encrypted volume", block, snapshot.dependencies);
+            var result = new StorageOperationResult (); StoragePreparationJournal? preparation = null;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Preparing the clear-text mapping");
+                preparation = yield prepare_for_modification (mapping, backend_lifetime);
+                if (modification_identity (block) != confirmed_identity || block.encrypted?.mapping != mapping)
+                    throw new IOError.NOT_FOUND ("The encrypted mapping changed during preparation.");
+                jobs.phase (job, StorageJobState.RUNNING, "Locking encrypted storage");
+                var options = new VariantBuilder (new VariantType ("a{sv}"));
+                yield require_volume (block, "Encrypted").call ("Lock",
+                    new Variant ("(@a{sv})", options.end ()), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
+                    int.MAX, backend_lifetime);
+                bool locked = false;
+                for (int attempt = 0; attempt < 50 && !locked; attempt++) {
+                    synchronize (); locked = block.encrypted?.mapping == null;
+                    if (!locked) yield settle_delay (backend_lifetime);
+                }
+                if (!locked) throw new IOError.FAILED ("UDisks did not confirm that the encrypted mapping was removed.");
+                result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
+                result.summary = "Encrypted volume locked"; result.actual_state = "locked"; jobs.finish (job, result);
+            } catch (Error error) {
+                synchronize ();
+                if (preparation != null && block.encrypted?.mapping == mapping && !preparation.fully_restored ()) {
+                    try { yield restore_preparation (preparation, backend_lifetime); }
+                    catch (Error restore_error) {
+                        result.completed ("Clear-text mapping remains available");
+                        result.technical_error = restore_error.message;
+                    }
+                }
+                result.fail ("The encrypted volume could not be locked", error); jobs.finish (job, result); throw error;
+            } finally { locks.release (block); }
         }
         public async void volume_action (StorageBlock block, string method) throws Error {
             if (!available ()) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");

@@ -1,15 +1,83 @@
 namespace MajorisDisks {
+    public enum MountVisibility { DEFAULT, SHOW, HIDE }
+
     public class MountOptionService {
-        public static string normalize (string input, bool startup) {
+        private static bool contains (string[] values, string value) {
+            foreach (var candidate in values) if (candidate == value) return true;
+            return false;
+        }
+
+        public static string escape_value (string value) throws Error {
+            if (value.contains ("\n") || value.contains ("\r"))
+                throw new IOError.INVALID_ARGUMENT ("The display name contains an invalid control character.");
+            return value.replace ("\\", "\\134").replace (",", "\\054")
+                .replace (" ", "\\040").replace ("\t", "\\011");
+        }
+
+        public static string unescape_value (string value) {
+            return value.replace ("\\011", "\t").replace ("\\040", " ")
+                .replace ("\\054", ",").replace ("\\134", "\\");
+        }
+
+        public static string[] parse (string input) throws Error {
             string[] result = {};
             foreach (var raw in input.split (",")) {
-                string option = raw.strip (); bool duplicate = false;
-                foreach (var existing in result) duplicate |= existing == option;
-                if (option == "" || option == "noauto" || duplicate) continue;
+                string option = raw.strip ();
+                if (option == "") throw new IOError.INVALID_ARGUMENT ("Mount options cannot contain empty entries.");
+                if (option.contains ("\n") || option.contains ("\r"))
+                    throw new IOError.INVALID_ARGUMENT ("A mount option contains an invalid control character.");
+                if (contains (result, option))
+                    throw new IOError.INVALID_ARGUMENT ("The mount option ‘%s’ is duplicated.".printf (option));
                 result += option;
             }
+            string[,] conflicts = { { "ro", "rw" }, { "dev", "nodev" }, { "suid", "nosuid" },
+                { "exec", "noexec" }, { "auto", "noauto" }, { "user", "nouser" },
+                { "x-gvfs-show", "x-gvfs-hide" } };
+            for (int i = 0; i < conflicts.length[0]; i++)
+                if (contains (result, conflicts[i, 0]) && contains (result, conflicts[i, 1]))
+                    throw new IOError.INVALID_ARGUMENT ("Conflicting mount options ‘%s’ and ‘%s’ were specified."
+                        .printf (conflicts[i, 0], conflicts[i, 1]));
+            return result;
+        }
+
+        public static string normalize (string input, bool startup) throws Error {
+            string[] result = {};
+            foreach (var option in parse (input.strip () == "" ? "defaults" : input))
+                if (option != "noauto" && option != "auto") result += option;
             if (result.length == 0) result += "defaults";
             if (!startup) result += "noauto";
+            return string.joinv (",", result);
+        }
+
+        public static string display_name (string input) {
+            try {
+                foreach (var option in parse (input))
+                    if (option.has_prefix ("x-gvfs-name="))
+                        return unescape_value (option.substring ("x-gvfs-name=".length));
+            } catch (Error error) {}
+            return "";
+        }
+
+        public static MountVisibility visibility (string input) {
+            try {
+                foreach (var option in parse (input)) {
+                    if (option == "x-gvfs-show") return MountVisibility.SHOW;
+                    if (option == "x-gvfs-hide") return MountVisibility.HIDE;
+                }
+            } catch (Error error) {}
+            return MountVisibility.DEFAULT;
+        }
+
+        public static string compose (string input, string display_name,
+            MountVisibility visibility) throws Error {
+            string[] result = {};
+            foreach (var option in parse (input.strip () == "" ? "defaults" : input))
+                if (!option.has_prefix ("x-gvfs-name=") && option != "x-gvfs-show" && option != "x-gvfs-hide")
+                    result += option;
+            string name = display_name.strip ();
+            if (name != "") result += "x-gvfs-name=" + escape_value (name);
+            if (visibility == MountVisibility.SHOW) result += "x-gvfs-show";
+            else if (visibility == MountVisibility.HIDE) result += "x-gvfs-hide";
             return string.joinv (",", result);
         }
     }

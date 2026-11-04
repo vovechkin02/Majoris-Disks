@@ -24,5 +24,6 @@
     <file>ui/jobs-popover.ui</file>
     <file>ui/active-jobs-dialog.ui</file>
     <file>ui/mount-options-dialog.ui</file>
+    <file>ui/unlock-volume-dialog.ui</file>
   </gresource>
 </gresources>
