@@ -5,6 +5,7 @@ namespace MajorisDisks {
         private uint refresh_source;
         private bool connecting;
         private StorageOperationLocks locks = new StorageOperationLocks ();
+        private FilesystemMinimumSizeService minimum_sizes = new FilesystemMinimumSizeService ();
         public StorageJobManager jobs { get; private set; default = new StorageJobManager (); }
         private HashTable<string, string> observed_jobs = new HashTable<string, string> (str_hash, str_equal);
         private string? owner;
@@ -145,6 +146,7 @@ namespace MajorisDisks {
                 var filesystem = block.filesystem ?? new StorageFilesystem ();
                 var points = property (object_proxy, "Filesystem", "MountPoints");
                 filesystem.mounts = points == null ? new string[0] : points.dup_bytestring_array ();
+                filesystem.size = property (object_proxy, "Filesystem", "Size")?.get_uint64 () ?? block.size;
                 block.filesystem = filesystem;
             } else block.filesystem = null;
             if (has (object_proxy, "Encrypted")) {
@@ -301,8 +303,11 @@ namespace MajorisDisks {
 
         private void validate_modification (StorageBlock block, bool deleting, bool volume = false,
             bool allow_mounted = false, bool allow_active = false) throws Error {
-            if (block.partition?.container == true)
-                throw new IOError.NOT_SUPPORTED ("Remove logical partitions separately before deleting an extended partition.");
+            if (block.partition?.container == true) {
+                foreach (var child in snapshot.dependencies.children (block))
+                    if ((child as StorageBlock)?.partition?.logical == true)
+                        throw new IOError.NOT_SUPPORTED ("Remove logical partitions separately before deleting an extended partition.");
+            }
             if ((!volume && (block.partition != null) != deleting) || (volume && block.table != null) ||
                 block.backing_path != "/" ||
                 block.raid_path != "/" || block.logical_volume_path != "/")
@@ -436,6 +441,32 @@ namespace MajorisDisks {
             return FilesystemCapabilityService.resize_modes (capability, out missing_utility);
         }
 
+        public async FilesystemResizePlan resize_plan (StorageBlock block, uint64 requested,
+            bool resize_filesystem) throws Error {
+            var part = block.partition;
+            var disk = part == null ? null : snapshot.blocks.lookup (part.table_path);
+            if (disk == null) throw new IOError.NOT_SUPPORTED ("Only a partition can be resized.");
+            uint64 maximum = PartitionLayoutService.maximum_resize (disk, block);
+            FilesystemCapability capability = {};
+            capability.supported = true;
+            uint64 minimum = PartitionLayoutService.minimum_resize (disk, block);
+            Error? minimum_error = null;
+            if (resize_filesystem && block.filesystem != null) {
+                capability = FilesystemCapabilityService.decode (
+                    yield query_filesystem_capability ("CanResize", block.type_id), true);
+                if (requested < block.size && capability.supported &&
+                    (capability.offline_shrink || capability.online_shrink)) {
+                    try { minimum = uint64.max (minimum, yield minimum_sizes.query (block, backend_lifetime)); }
+                    catch (Error error) { minimum_error = error; }
+                } else minimum = block.size;
+            }
+            var plan = FilesystemResizePlanner.build (block, requested, resize_filesystem,
+                capability, minimum, maximum);
+            if (!plan.supported && plan.direction == ResizeDirection.SHRINK && minimum_error != null)
+                plan.reason = minimum_error.message;
+            return plan;
+        }
+
         public async bool maintenance_available (string filesystem_type, bool repair) throws Error {
             var capability = yield query_filesystem_capability (repair ? "CanRepair" : "CanCheck", filesystem_type);
             return FilesystemCapabilityService.check_available (capability, repair);
@@ -522,13 +553,17 @@ namespace MajorisDisks {
             string partition_name, string filesystem_type, string filesystem_label,
             string confirmed_identity) throws Error {
             var result = new StorageOperationResult ();
-            var job = jobs.begin ("Create partition", disk, snapshot.dependencies);
-            var token = job.cancellable;
             uint64 offset, size;
             PartitionLayoutService.validate_create (disk, gap, requested_size, kind, out offset, out size);
+            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.CREATE_PARTITION,
+                disk, snapshot.dependencies);
+            if (!eligibility.allowed || disk.read_only)
+                throw new IOError.PERMISSION_DENIED (eligibility.reason == "" ? "The disk is read-only." : eligibility.reason);
             if (modification_identity (disk) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The disk changed after confirmation.");
             locks.acquire (disk, snapshot.dependencies);
+            var job = jobs.begin ("Create partition", disk, snapshot.dependencies);
+            var token = job.cancellable;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Validating partition geometry");
                 var table = require_volume (disk, "PartitionTable");
@@ -600,47 +635,62 @@ namespace MajorisDisks {
             var disk = part == null ? null : snapshot.blocks.lookup (part.table_path);
             if (disk == null) throw new IOError.NOT_SUPPORTED ("Only partitions can be resized.");
             PartitionLayoutService.validate_resize (disk, block, new_size);
+            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.RESIZE,
+                block, snapshot.dependencies);
+            if (!eligibility.allowed || eligibility.requires_preparation &&
+                StorageSafetyService.assess (block, snapshot.dependencies).active_dependents)
+                throw new IOError.BUSY (eligibility.reason);
             bool shrinking = new_size < block.size;
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The volume changed after confirmation.");
             var result = new StorageOperationResult ();
+            var journal = new StoragePreparationJournal ();
+            locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("Resize volume", block, snapshot.dependencies);
             var token = job.cancellable;
-            locks.acquire (block, snapshot.dependencies);
             bool remount = false;
             try {
                 var partition = require_volume (block, "Partition");
+                string partition_uuid = part.uuid;
+                uint64 partition_offset = part.offset;
+                uint64 device_number = block.number;
                 DBusProxy? filesystem = null;
-                FilesystemCapability capability = {};
-                bool online = false;
+                var plan = yield resize_plan (block, new_size, resize_filesystem);
+                if (!plan.supported) throw new IOError.NOT_SUPPORTED (plan.reason);
                 if (resize_filesystem) {
                     filesystem = require_volume (block, "Filesystem");
-                    capability = FilesystemCapabilityService.decode (
-                        yield query_filesystem_capability ("CanResize", block.type_id), true);
-                    if (!capability.supported || capability.modes == 0) throw new IOError.NOT_SUPPORTED (capability.reason);
-                    bool mounted = block.filesystem?.mounted ?? false;
-                    online = shrinking ? capability.online_shrink : capability.online_grow;
-                    bool offline = shrinking ? capability.offline_shrink : capability.offline_grow;
-                    if (mounted && !online) {
-                        if (!offline) throw new IOError.NOT_SUPPORTED ("This filesystem cannot be resized while mounted.");
+                    if (plan.requires_unmount) {
                         jobs.phase (job, StorageJobState.PREPARING, "Unmounting filesystem");
+                        var mount_record = new StoragePreparationEntry (StoragePreparationKind.MOUNT,
+                            block.path, block.filesystem?.mounts ?? new string[0]);
+                        journal.add (mount_record);
                         remount = yield prepare_unmounted (block, token);
-                    } else if (!mounted && !offline) {
-                        throw new IOError.NOT_SUPPORTED ("This resize mode requires the filesystem to be mounted first.");
+                        mount_record.prepared = remount;
                     }
                 }
+                journal.operation_started = true;
+                validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
+                plan = yield resize_plan (block, new_size, resize_filesystem);
+                if (!plan.supported) throw new IOError.NOT_SUPPORTED (plan.reason);
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
                 if (shrinking && resize_filesystem) {
-                    jobs.phase (job, StorageJobState.RUNNING, "Checking filesystem");
-                    var checked_reply = yield filesystem.call ("Check", new Variant.tuple ({ options.end () }),
-                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
-                    if (!checked_reply.is_of_type (new VariantType ("(b)")) || !checked_reply.get_child_value (0).get_boolean ())
-                        throw new IOError.FAILED ("Filesystem inconsistencies must be repaired before shrinking.");
-                    options = new VariantBuilder (new VariantType ("a{sv}"));
+                    if (plan.requires_check) {
+                        if (!(yield maintenance_available (block.type_id, false)))
+                            throw new IOError.NOT_SUPPORTED ("A required pre-shrink filesystem check is unavailable.");
+                        jobs.phase (job, StorageJobState.RUNNING, "Checking filesystem");
+                        var checked_reply = yield filesystem.call ("Check", new Variant.tuple ({ options.end () }),
+                            DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
+                        if (!checked_reply.is_of_type (new VariantType ("(b)")) || !checked_reply.get_child_value (0).get_boolean ())
+                            throw new IOError.FAILED ("Filesystem inconsistencies must be repaired before shrinking.");
+                        result.completed ("Filesystem checked");
+                        options = new VariantBuilder (new VariantType ("a{sv}"));
+                    }
+                    validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                     jobs.phase (job, StorageJobState.RUNNING, "Shrinking filesystem");
                     yield filesystem.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed ("Filesystem shrunk");
+                    validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                     options = new VariantBuilder (new VariantType ("a{sv}"));
                     jobs.phase (job, StorageJobState.RUNNING, "Shrinking partition");
                     yield partition.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
@@ -648,12 +698,14 @@ namespace MajorisDisks {
                     result.completed ("Partition shrunk");
                     yield wait_for_size (block, new_size, false, token);
                 } else {
+                    validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                     jobs.phase (job, StorageJobState.RUNNING, shrinking ? "Shrinking partition" : "Growing partition");
                     yield partition.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed (shrinking ? "Partition shrunk" : "Partition grown");
                     yield wait_for_size (block, new_size, !shrinking, token);
                     if (resize_filesystem) {
+                        validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                         options = new VariantBuilder (new VariantType ("a{sv}"));
                         jobs.phase (job, StorageJobState.RUNNING, "Growing filesystem");
                         yield filesystem.call ("Resize", new Variant.tuple ({ new Variant.uint64 (0), options.end () }),
@@ -663,7 +715,10 @@ namespace MajorisDisks {
                 }
                 if (remount) {
                     jobs.phase (job, StorageJobState.FINALIZING, "Restoring mount");
-                    try { yield restore_mount (block, token); result.completed ("Mount restored"); }
+                    try {
+                        yield restore_mount (block, backend_lifetime); result.completed ("Mount restored");
+                        foreach (var record in journal.entries ()) if (record.kind == StoragePreparationKind.MOUNT) record.restored = true;
+                    }
                     catch (Error error) {
                         result.fail ("The resize completed, but the previous mount could not be restored.", error);
                         jobs.finish (job, result);
@@ -671,14 +726,28 @@ namespace MajorisDisks {
                     }
                 }
                 synchronize ();
+                journal.operation_completed = true;
                 result.successful = true;
                 result.summary = "Volume resized";
                 jobs.finish (job, result);
                 select_requested (block.path);
                 return result;
             } catch (Error error) {
+                string restoration_error = "";
+                if (remount && !journal.fully_restored ()) {
+                    try {
+                        yield restore_mount (block, backend_lifetime);
+                        foreach (var record in journal.entries ()) if (record.kind == StoragePreparationKind.MOUNT) record.restored = true;
+                    } catch (Error restore_error) { restoration_error = restore_error.message; }
+                }
                 result.fail (result.completed_steps.length == 0 ? "The volume was not resized." :
                     "The resize was partially completed. The displayed geometry has been refreshed.", error);
+                if (restoration_error != "") {
+                    result.partial = true;
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.summary += " The previous mount could not be restored.";
+                    result.technical_error += "\nRestore: " + restoration_error;
+                }
                 synchronize ();
                 jobs.finish (job, result);
                 if (result.partial) return result;
@@ -686,6 +755,16 @@ namespace MajorisDisks {
             } finally {
                 locks.release (block);
             }
+        }
+
+        private void validate_resize_target (StorageBlock block, StorageBlock disk, string partition_uuid,
+            uint64 partition_offset, uint64 device_number) throws Error {
+            var current = snapshot.blocks.lookup (block.path);
+            var part = block.partition;
+            if (current != block || !block.available || block.read_only || part == null ||
+                snapshot.blocks.lookup (part.table_path) != disk || disk.table == null ||
+                part.uuid != partition_uuid || part.offset != partition_offset || block.number != device_number)
+                throw new IOError.NOT_FOUND ("The partition identity or parent table changed during resizing.");
         }
 
         public async StorageOperationResult update_partition_metadata (StorageBlock block, string type,
@@ -699,10 +778,10 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_ARGUMENT ("The requested partition metadata is invalid.");
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The partition changed after confirmation.");
+            locks.acquire (block, snapshot.dependencies);
             var result = new StorageOperationResult ();
             var job = jobs.begin ("Edit partition", block, snapshot.dependencies);
             var token = job.cancellable;
-            locks.acquire (block, snapshot.dependencies);
             try {
                 var proxy = require_volume (block, "Partition");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
@@ -746,9 +825,16 @@ namespace MajorisDisks {
                 throw new IOError.NOT_SUPPORTED ("This operation cannot be cancelled by UDisks.");
             var proxy = manager?.get_interface (job.backend_path, PREFIX + "Job") as DBusProxy;
             if (proxy == null) throw new IOError.NOT_FOUND ("The UDisks job is no longer available.");
+            jobs.phase (job, StorageJobState.CANCELLING, "Requesting cancellation");
             var options = new VariantBuilder (new VariantType ("a{sv}"));
-            yield proxy.call ("Cancel", new Variant.tuple ({ options.end () }),
-                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+            try {
+                yield proxy.call ("Cancel", new Variant.tuple ({ options.end () }),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+            } catch (Error error) {
+                jobs.phase (job, StorageJobState.RUNNING, "Cancellation was not accepted");
+                job.error_message = error.message;
+                throw error;
+            }
             synchronize ();
         }
 

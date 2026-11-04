@@ -97,6 +97,7 @@ namespace MajorisDisks {
 
     public class StorageFilesystem : Object {
         public string[] mounts = {};
+        public uint64 size;
         public bool mounted { get { return mounts.length != 0; } }
     }
 

@@ -641,54 +641,82 @@ namespace MajorisDisks {
     [GtkTemplate (ui = "/com/majoris/disks/ui/resize-volume-dialog.ui")]
     public class ResizeVolumeDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.ActionRow current_row;
+        [GtkChild] private unowned Adw.ActionRow filesystem_type_row;
+        [GtkChild] private unowned Adw.ActionRow minimum_row;
+        [GtkChild] private unowned Adw.ActionRow maximum_row;
         [GtkChild] private unowned Adw.ActionRow range_row;
         [GtkChild] private unowned Adw.SpinRow size_row;
         [GtkChild] private unowned Adw.SwitchRow filesystem_row;
         [GtkChild] private unowned Adw.ActionRow mode_row;
+        [GtkChild] private unowned Adw.ActionRow explanation_row;
+        private UDisksService backend;
         private StorageBlock block;
         private uint64 maximum;
         private uint64 sector;
+        private uint validation_generation;
         private const uint64 MIB = 1024 * 1024;
         public uint64 new_size { get { return (uint64) size_row.value * MIB; } }
         public bool resize_filesystem { get { return filesystem_row.active; } }
 
         public ResizeVolumeDialog (UDisksService backend, StorageBlock block) throws Error {
-            this.block = block;
+            this.backend = backend; this.block = block;
             var part = block.partition;
             var disk = part == null ? null : backend.snapshot.blocks.lookup (part.table_path);
             if (disk == null) throw new IOError.NOT_SUPPORTED ("The parent partition table is unavailable.");
             maximum = PartitionLayoutService.maximum_resize (disk, block);
             sector = disk.logical_sector_size;
             current_row.subtitle = format_size (block.size);
-            range_row.subtitle = "%s to %s".printf (format_size (block.filesystem == null ? disk.logical_sector_size : block.size), format_size (maximum));
-            size_row.adjustment.lower = block.filesystem == null ? double.max (1, (double) disk.logical_sector_size / MIB) : (double) block.size / MIB;
+            filesystem_type_row.subtitle = block.filesystem == null ?
+                (block.type_id == "" ? "Unformatted" : block.type_id) : block.type_id;
+            maximum_row.subtitle = format_size (maximum);
+            range_row.subtitle = "Awaiting filesystem safety information";
+            size_row.adjustment.lower = double.max (1, (double) disk.logical_sector_size / MIB);
             size_row.adjustment.upper = double.max (size_row.adjustment.lower, (double) maximum / MIB);
             size_row.value = (double) block.size / MIB;
             filesystem_row.visible = block.filesystem != null;
             filesystem_row.active = block.filesystem != null;
-            if (block.filesystem != null) probe.begin (backend, block);
             size_row.notify["value"].connect (validate);
             filesystem_row.notify["active"].connect (validate);
+            ulong changed_handler = backend.changed.connect (() => { validation_generation++; validate (); });
+            closed.connect (() => backend.disconnect (changed_handler));
             validate ();
         }
-        private async void probe (UDisksService backend, StorageBlock block) {
+        private async void probe (uint generation, uint64 requested, bool with_filesystem) {
             try {
-                string utility;
-                var modes = yield backend.filesystem_resize_modes (block.type_id, out utility);
-                bool mounted = block.filesystem?.mounted ?? false;
-                bool grow = mounted ? (modes & FilesystemResizeMode.ONLINE_GROW) != 0 :
-                    (modes & FilesystemResizeMode.OFFLINE_GROW) != 0;
-                filesystem_row.sensitive = grow;
-                mode_row.subtitle = grow ? (mounted ? "Online growth" : "Offline growth") :
-                    (utility == "" ? "Filesystem resizing unavailable" : "Requires " + utility);
-                validate ();
-            } catch (Error error) { filesystem_row.sensitive = false; mode_row.subtitle = error.message; validate (); }
+                var plan = yield backend.resize_plan (block, requested, with_filesystem);
+                if (generation != validation_generation) return;
+                minimum_row.subtitle = plan.minimum_size == 0 ? "Unavailable" : format_size (plan.minimum_size);
+                range_row.subtitle = "%s to %s".printf (
+                    format_size (plan.minimum_size == 0 ? sector : plan.minimum_size), format_size (maximum));
+                string direction = plan.direction == ResizeDirection.SHRINK ? "Shrink" :
+                    plan.direction == ResizeDirection.GROW ? "Grow" : "No size change";
+                mode_row.subtitle = plan.supported ? "%s · %s".printf (direction,
+                    plan.online ? "online" : plan.requires_unmount ? "offline after unmount" : "partition only") : "Unavailable";
+                explanation_row.subtitle = plan.supported ? (plan.requires_check ?
+                    "The filesystem will be unmounted, checked, resized, and restored." :
+                    plan.online ? "The mounted filesystem supports this operation online." :
+                    "The operation fits the verified partition boundary.") : plan.reason;
+                set_response_enabled ("resize", plan.supported);
+            } catch (Error error) {
+                if (generation != validation_generation) return;
+                minimum_row.subtitle = "Unavailable";
+                mode_row.subtitle = "Unavailable";
+                explanation_row.subtitle = error.message;
+                set_response_enabled ("resize", false);
+            }
         }
         private void validate () {
-            size_row.adjustment.lower = filesystem_row.active ? (double) block.size / MIB :
-                double.max (1, (double) sector / MIB);
             bool changed = new_size != block.size && new_size > 0 && new_size <= maximum;
-            set_response_enabled ("resize", changed && (!filesystem_row.active || filesystem_row.sensitive));
+            set_response_enabled ("resize", false);
+            uint generation = ++validation_generation;
+            if (!changed) {
+                explanation_row.subtitle = "Choose a different size.";
+                uint64 shrink_probe = block.size > sector ? block.size - sector : block.size;
+                probe.begin (generation, shrink_probe, filesystem_row.active);
+                return;
+            }
+            explanation_row.subtitle = "Checking the current device state…";
+            probe.begin (generation, new_size, filesystem_row.active);
         }
     }
 
@@ -700,7 +728,13 @@ namespace MajorisDisks {
         public StorageJob job;
         public JobRow (UDisksService backend, StorageJob job) {
             this.backend = backend; this.job = job;
-            cancel.clicked.connect (() => backend.cancel_job.begin (job));
+            cancel.clicked.connect (() => request_cancel.begin ());
+            update ();
+        }
+        private async void request_cancel () {
+            cancel.sensitive = false;
+            try { yield backend.cancel_job (job); }
+            catch (Error error) { job.error_message = error.message; cancel.tooltip_text = error.message; }
             update ();
         }
         public void update () {
@@ -709,7 +743,8 @@ namespace MajorisDisks {
             progress.fraction = job.progress_valid ? job.progress : 0.0;
             progress.pulse_step = job.progress_valid ? 0.0 : 0.1;
             if (!job.progress_valid && job.state == StorageJobState.RUNNING) progress.pulse ();
-            cancel.visible = job.cancelable && job.state == StorageJobState.RUNNING;
+            cancel.visible = job.cancelable && (job.state == StorageJobState.RUNNING || job.state == StorageJobState.CANCELLING);
+            cancel.sensitive = job.state == StorageJobState.RUNNING;
         }
     }
 

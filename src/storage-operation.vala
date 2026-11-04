@@ -1,4 +1,41 @@
 namespace MajorisDisks {
+    public enum StoragePreparationKind { MOUNT, SWAP, ENCRYPTED_MAPPING, LOGICAL_VOLUME, RAID }
+
+    public class StoragePreparationEntry : Object {
+        public StoragePreparationKind kind { get; construct; }
+        public string object_path { get; construct; }
+        public string[] state { get; construct; }
+        public bool prepared { get; set; }
+        public bool restored { get; set; }
+        public string error { get; set; default = ""; }
+        public StoragePreparationEntry (StoragePreparationKind kind, string object_path, string[] state) {
+            Object (kind: kind, object_path: object_path, state: state);
+        }
+    }
+
+    public class StoragePreparationJournal : Object {
+        private GenericArray<StoragePreparationEntry> records = new GenericArray<StoragePreparationEntry> ();
+        public bool operation_started;
+        public bool operation_completed;
+
+        public void add (StoragePreparationEntry entry) { records.add (entry); }
+        public StoragePreparationEntry[] entries () {
+            StoragePreparationEntry[] result = {};
+            for (uint i = 0; i < records.length; i++) result += records[i];
+            return result;
+        }
+        public StoragePreparationEntry[] restoration_order () {
+            StoragePreparationEntry[] result = {};
+            for (int i = (int) records.length - 1; i >= 0; i--)
+                if (records[(uint) i].prepared) result += records[(uint) i];
+            return result;
+        }
+        public bool fully_restored () {
+            foreach (var entry in entries ()) if (entry.prepared && !entry.restored) return false;
+            return true;
+        }
+    }
+
     public class StorageOperationLocks : Object {
         private HashTable<string, HashTable<string, string>> active =
             new HashTable<string, HashTable<string, string>> (str_hash, str_equal);
@@ -134,12 +171,16 @@ namespace MajorisDisks {
     }
 
     public enum StorageJobState {
-        PENDING, PREPARING, RUNNING, FINALIZING, COMPLETED, FAILED, CANCELLED, PARTIALLY_COMPLETED
+        PENDING, PREPARING, RUNNING, CANCELLING, FINALIZING, COMPLETED, FAILED, CANCELLED,
+        PARTIALLY_COMPLETED, NEEDS_ATTENTION
     }
+
+    public enum StorageOperationStatus { SUCCEEDED, FAILED, CANCELLED, PARTIAL, NEEDS_ATTENTION }
 
     public class StorageOperationResult : Object {
         public bool successful;
         public bool partial;
+        public StorageOperationStatus status = StorageOperationStatus.FAILED;
         public string summary = "";
         public string technical_error = "";
         public string resulting_path = "";
@@ -154,6 +195,8 @@ namespace MajorisDisks {
         public void fail (string message, Error? error = null) {
             successful = false;
             partial = completed_steps.length != 0;
+            if (error != null && error is IOError.CANCELLED) status = StorageOperationStatus.CANCELLED;
+            else status = partial ? StorageOperationStatus.PARTIAL : StorageOperationStatus.FAILED;
             summary = message;
             technical_error = error?.message ?? "";
         }
@@ -205,8 +248,11 @@ namespace MajorisDisks {
             job.result = result;
             job.progress = 1.0;
             job.progress_valid = result.successful;
-            job.state = result.successful ? StorageJobState.COMPLETED :
-                result.partial ? StorageJobState.PARTIALLY_COMPLETED : StorageJobState.FAILED;
+            if (result.successful) result.status = StorageOperationStatus.SUCCEEDED;
+            job.state = result.status == StorageOperationStatus.SUCCEEDED ? StorageJobState.COMPLETED :
+                result.status == StorageOperationStatus.CANCELLED ? StorageJobState.CANCELLED :
+                result.status == StorageOperationStatus.NEEDS_ATTENTION ? StorageJobState.NEEDS_ATTENTION :
+                result.status == StorageOperationStatus.PARTIAL ? StorageJobState.PARTIALLY_COMPLETED : StorageJobState.FAILED;
             job.phase = result.summary;
             changed ();
         }
@@ -217,13 +263,13 @@ namespace MajorisDisks {
             for (uint i = 0; i < jobs.get_n_items (); i++) {
                 var candidate = jobs.get_item (i) as StorageJob;
                 bool active = candidate.state == StorageJobState.PREPARING ||
-                    candidate.state == StorageJobState.RUNNING || candidate.state == StorageJobState.FINALIZING;
+                    candidate.state == StorageJobState.RUNNING || candidate.state == StorageJobState.CANCELLING ||
+                    candidate.state == StorageJobState.FINALIZING;
                 bool related = false;
                 foreach (var object_path in objects)
                     foreach (var affected_path in candidate.affected)
                         related |= object_path == affected_path;
-                if (candidate.backend_path == path || (candidate.backend_path == "" && active &&
-                    (candidate.operation == operation || related))) {
+                if (candidate.backend_path == path || (candidate.backend_path == "" && active && related)) {
                     match = candidate;
                     break;
                 }
@@ -244,10 +290,11 @@ namespace MajorisDisks {
         public void backend_removed (string path) {
             for (uint i = 0; i < jobs.get_n_items (); i++) {
                 var job = jobs.get_item (i) as StorageJob;
-                if (job.backend_path == path && job.state == StorageJobState.RUNNING) {
-                    job.state = StorageJobState.COMPLETED;
-                    job.phase = "Completed";
-                    job.progress = 1.0;
+                if (job.backend_path == path && (job.state == StorageJobState.RUNNING ||
+                    job.state == StorageJobState.CANCELLING)) {
+                    job.state = StorageJobState.NEEDS_ATTENTION;
+                    job.phase = "Backend job disappeared before its result was confirmed";
+                    job.error_message = "Refresh the device state before attempting another destructive operation.";
                     changed ();
                 }
             }

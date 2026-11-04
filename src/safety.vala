@@ -102,6 +102,22 @@ namespace MajorisDisks {
         }
     }
 
+    public enum StorageOperationKind {
+        CREATE_PARTITION, DELETE_PARTITION, RESIZE, FORMAT, CHECK, REPAIR, TAKE_OWNERSHIP,
+        ENCRYPT, UNLOCK, LOCK, MOUNT, UNMOUNT, SWAP_START, SWAP_STOP, IMAGE_RESTORE,
+        POWER_OFF, EJECT, BENCHMARK_WRITE, LVM_CHANGE, RAID_CHANGE, BTRFS_CHANGE
+    }
+
+    public class StorageOperationEligibility : Object {
+        public bool allowed;
+        public bool requires_preparation;
+        public bool blocked;
+        public bool unknown;
+        public string reason = "";
+        public string[] affected = {};
+        public string[] preparation = {};
+    }
+
     public class StorageSafetyService {
         public static StorageSafetyAssessment assess (StorageDevice device, StorageDependencyService? graph = null) {
             var result = new StorageSafetyAssessment (device);
@@ -136,6 +152,40 @@ namespace MajorisDisks {
             if (result.read_only) reasons += "Device is read-only";
             result.reasons = reasons;
             return result;
+        }
+
+        public static StorageOperationEligibility assess_operation (StorageOperationKind operation,
+            StorageDevice device, StorageDependencyService? graph) {
+            var eligibility = new StorageOperationEligibility ();
+            var assessment = assess (device, graph);
+            StorageDevice[] nodes = graph == null ? new StorageDevice[] { device } : graph.descendants (device);
+            string[] affected = {};
+            foreach (var node in nodes) affected += node.path;
+            eligibility.affected = affected;
+            bool destructive = operation == StorageOperationKind.DELETE_PARTITION ||
+                operation == StorageOperationKind.RESIZE || operation == StorageOperationKind.FORMAT ||
+                operation == StorageOperationKind.ENCRYPT || operation == StorageOperationKind.IMAGE_RESTORE ||
+                operation == StorageOperationKind.BENCHMARK_WRITE || operation == StorageOperationKind.LVM_CHANGE ||
+                operation == StorageOperationKind.RAID_CHANGE || operation == StorageOperationKind.BTRFS_CHANGE;
+            if (graph == null || assessment.unknown_dependencies) {
+                eligibility.unknown = true; eligibility.blocked = destructive;
+                eligibility.reason = "The full dependency graph is not known; destructive operations fail closed.";
+            } else if (assessment.read_only && operation != StorageOperationKind.CHECK) {
+                eligibility.blocked = true; eligibility.reason = "The selected device is read-only.";
+            } else if (assessment.system_critical && destructive) {
+                eligibility.blocked = true; eligibility.reason = "The operation could affect the running system.";
+            } else if (assessment.active_dependents && destructive) {
+                eligibility.requires_preparation = true;
+                eligibility.preparation = { "Deactivate dependent mounts, swap, mappings, RAID, and logical volumes" };
+                eligibility.reason = "Active dependents must be prepared before this operation.";
+            } else if (assessment.mounted && (destructive || operation == StorageOperationKind.REPAIR ||
+                operation == StorageOperationKind.TAKE_OWNERSHIP)) {
+                eligibility.requires_preparation = true;
+                eligibility.preparation = { "Unmount the filesystem and restore it afterwards" };
+                eligibility.reason = "The filesystem must be prepared offline.";
+            }
+            eligibility.allowed = !eligibility.blocked;
+            return eligibility;
         }
     }
 }

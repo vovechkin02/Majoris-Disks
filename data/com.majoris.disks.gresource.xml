@@ -1,5 +1,6 @@
 <gresources>
   <gresource prefix="/com/majoris/disks">
+    <file>com.majoris.disks.metainfo.xml</file>
     <file>ui/window.ui</file>
     <file>ui/device-row.ui</file>
     <file>ui/volume-row.ui</file>

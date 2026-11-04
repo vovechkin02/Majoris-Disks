@@ -1,4 +1,4 @@
-# Majoris Disks
+# Majoris Disks 0.2.0
 
 Disks is the native GTK4 and libadwaita storage inspector for Majoris. It uses the UDisks2 system bus to discover physical drives, removable media, loop images and standalone blocks. GPT and MBR volumes appear in physical order alongside a keyboard-selectable allocation map.
 
@@ -32,4 +32,6 @@ Run as your desktop user with UDisks2 and a session Polkit agent. Discovery read
 4. Repeat with an unpartitioned removable filesystem, an empty optical drive, a loop device, and an encrypted volume unlocked externally. Verify the mapping appears under the encrypted volume and an MBR logical partition appears in its extended container's track.
 5. In a disposable VM, disconnect and reconnect the UDisks service. Verify the status page appears and the device list repopulates. Check narrow-window navigation and map keyboard focus.
 
-The allocation map is informational. RAID and LVM relationships depend on the interfaces exported by UDisks. Partition editing, formatting, encryption changes and disk imaging are outside this stage.
+Destructive operations are serialized per dependency graph and revalidate device identity immediately before writes. Filesystem shrinking is enabled only when UDisks reports an appropriate resize mode and a filesystem-specific minimum-size probe succeeds. The application never performs a partition-only shrink around a recognized or unknown filesystem.
+
+Advanced RAID, LVM and Btrfs relationships are displayed when exported by UDisks. Availability of individual maintenance operations depends on the installed UDisks modules and filesystem utilities.

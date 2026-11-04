@@ -322,6 +322,21 @@ private void test_resize_maximum () {
     catch (Error error) { assert_not_reached (); }
 }
 
+private void test_extended_resize_boundaries () {
+    var disk = make_disk ("dos");
+    var extended = partition (disk, "/extended", 1024 * 1024, 30 * 1024 * 1024);
+    extended.partition.container = true; extended.parent = disk;
+    var logical = partition (disk, "/logical", 2 * 1024 * 1024, 8 * 1024 * 1024);
+    logical.partition.logical = true; logical.parent = extended;
+    disk.table.partitions = { extended, logical };
+    try {
+        assert (PartitionLayoutService.minimum_resize (disk, extended) == 9 * 1024 * 1024);
+        PartitionLayoutService.validate_resize (disk, extended, 10 * 1024 * 1024);
+        try { PartitionLayoutService.validate_resize (disk, extended, 8 * 1024 * 1024); assert_not_reached (); }
+        catch (Error error) { assert (error is IOError.NO_SPACE); }
+    } catch (Error error) { assert_not_reached (); }
+}
+
 private void test_label_validation () {
     try {
         FilesystemCapabilityService.validate_label ("ext4", "Majoris");
@@ -354,7 +369,54 @@ private void test_job_lifecycle () {
     var observed = manager.jobs.get_item (1) as StorageJob;
     assert (observed.progress_valid && observed.cancelable && observed.progress == 0.5);
     manager.backend_removed ("/job/1");
-    assert (observed.state == StorageJobState.COMPLETED);
+    assert (observed.state == StorageJobState.NEEDS_ATTENTION);
+}
+
+private void test_resize_planner_safety () {
+    var block = new StorageBlock ("/resize"); block.size = 1000; block.type_id = "ext4";
+    block.filesystem = new StorageFilesystem ();
+    FilesystemCapability capability = {}; capability.supported = true;
+    capability.modes = FilesystemResizeMode.OFFLINE_SHRINK | FilesystemResizeMode.OFFLINE_GROW;
+    var safe = FilesystemResizePlanner.build (block, 800, true, capability, 700, 2000);
+    assert (safe.supported && safe.direction == ResizeDirection.SHRINK && safe.requires_unmount && safe.requires_check);
+    assert (!FilesystemResizePlanner.build (block, 600, true, capability, 700, 2000).supported);
+    assert (!FilesystemResizePlanner.build (block, 800, false, capability, 0, 2000).supported);
+    block.filesystem = null; block.type_id = ""; block.usage = "";
+    assert (FilesystemResizePlanner.build (block, 800, false, capability, 0, 2000).supported);
+    block.type_id = "mystery";
+    assert (!FilesystemResizePlanner.build (block, 800, false, capability, 0, 2000).supported);
+}
+
+private void test_minimum_size_parsers () {
+    try {
+        assert (FilesystemMinimumSizeService.parse_named_number (
+            "Block count: 10\nBlock size: 4096\n", "Block size:") == 4096);
+        assert (FilesystemMinimumSizeService.parse_named_number (
+            "Estimated minimum size of the filesystem: 12345", "Estimated minimum size of the filesystem:") == 12345);
+        assert (FilesystemMinimumSizeService.parse_named_number ("Minsize : 65536 bytes", "Minsize") == 65536);
+    } catch (Error error) { assert_not_reached (); }
+    try { FilesystemMinimumSizeService.parse_first_number ("not available"); assert_not_reached (); }
+    catch (Error error) { assert (error is IOError.INVALID_DATA); }
+}
+
+private void test_preparation_journal () {
+    var journal = new StoragePreparationJournal ();
+    var mount = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/a", { "/mnt/a" }); mount.prepared = true;
+    var swap = new StoragePreparationEntry (StoragePreparationKind.SWAP, "/b", {}); swap.prepared = true;
+    journal.add (mount); journal.add (swap);
+    var reverse = journal.restoration_order ();
+    assert (reverse.length == 2 && reverse[0] == swap && reverse[1] == mount && !journal.fully_restored ());
+    swap.restored = true; mount.restored = true; assert (journal.fully_restored ());
+}
+
+private void test_job_correlation () {
+    var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
+    var block = new StorageBlock ("/target"); block.preferred = "/dev/test";
+    var local = manager.begin ("Resize", block, graph); manager.phase (local, StorageJobState.RUNNING, "Resize");
+    manager.observe ("/backend/unrelated", "Resize", { "/different" }, 0, false, false, 1);
+    assert (manager.jobs.get_n_items () == 2 && local.backend_path == "");
+    manager.observe ("/backend/related", "other-name", { "/target" }, 0, false, false, 2);
+    assert (manager.jobs.get_n_items () == 2 && local.backend_path == "/backend/related");
 }
 
 private async void query_mock_capability () throws Error {
@@ -404,8 +466,13 @@ public static int main (string[] args) {
     Test.add_func ("/layout/partition-creation", test_partition_creation_geometry);
     Test.add_func ("/layout/mbr-slot-limits", test_mbr_slot_limits);
     Test.add_func ("/layout/resize-maximum", test_resize_maximum);
+    Test.add_func ("/layout/extended-resize-boundaries", test_extended_resize_boundaries);
     Test.add_func ("/operations/label-validation", test_label_validation);
     Test.add_func ("/operations/job-lifecycle", test_job_lifecycle);
+    Test.add_func ("/operations/job-correlation", test_job_correlation);
+    Test.add_func ("/operations/resize-planner-safety", test_resize_planner_safety);
+    Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
+    Test.add_func ("/operations/preparation-journal", test_preparation_journal);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     return Test.run ();
 }

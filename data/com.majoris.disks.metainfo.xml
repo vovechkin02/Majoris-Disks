@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.majoris.disks</id>
+  <name>Majoris Disks</name>
+  <summary>Inspect and manage storage devices</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="com.majoris"><name>Majoris contributors</name></developer>
+  <url type="homepage">https://github.com/vovechkin02/Majoris-Disks</url>
+  <description>
+    <p>Majoris Disks shows physical drives, partitions, filesystems and layered storage through UDisks. It supports guarded partition and filesystem maintenance with explicit safety checks.</p>
+  </description>
+  <launchable type="desktop-id">com.majoris.disks.desktop</launchable>
+  <provides><binary>majoris-disks</binary></provides>
+  <releases><release version="0.2.0" date="2026-11-04"><description><p>Adds guarded partition and filesystem management.</p></description></release></releases>
+  <content_rating type="oars-1.1"/>
+</component>

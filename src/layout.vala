@@ -80,13 +80,16 @@ namespace MajorisDisks {
             var parent = target.parent as StorageBlock;
             uint64 sector = disk.logical_sector_size;
             if (table == null || part == null || parent == null || part.table_path != disk.path ||
-                sector == 0 || disk.size == 0 || target.size == 0 || part.container ||
+                sector == 0 || disk.size == 0 || target.size == 0 ||
                 (table.scheme != "gpt" && table.scheme != "dos"))
                 throw new IOError.NOT_SUPPORTED ("The partition geometry cannot be safely resized.");
             if (size == 0 || size % sector != 0 || part.offset % sector != 0)
                 throw new IOError.INVALID_ARGUMENT ("The new size and partition start must be sector aligned.");
             uint64 limit = disk.size;
-            if (part.logical) {
+            if (part.container) {
+                if (table.scheme != "dos" || parent != disk)
+                    throw new IOError.INVALID_DATA ("The extended partition does not belong to this MBR disk.");
+            } else if (part.logical) {
                 var container = parent.partition;
                 if (table.scheme != "dos" || container == null || !container.container ||
                     container.offset >= limit || parent.size > limit - container.offset ||
@@ -114,12 +117,33 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_DATA ("The current partition geometry is inconsistent.");
             if (size > limit - part.offset)
                 throw new IOError.NO_SPACE ("The requested size crosses the next partition or container boundary.");
+            if (size < minimum_resize (disk, target))
+                throw new IOError.NO_SPACE ("The extended partition must contain every logical partition and its EBR margin.");
+        }
+
+        public static uint64 minimum_resize (StorageBlock disk, StorageBlock target) throws Error {
+            var part = target.partition;
+            uint64 sector = disk.logical_sector_size;
+            if (part == null || sector == 0) throw new IOError.NOT_SUPPORTED ("The minimum partition boundary is unavailable.");
+            if (!part.container) return sector;
+            if (disk.table == null) throw new IOError.NOT_SUPPORTED ("The partition table is unavailable.");
+            uint64 end = part.offset + sector;
+            foreach (var child in disk.table.partitions) {
+                var logical = child.partition;
+                if (child.parent != target || logical == null || !logical.logical || child.size == 0) continue;
+                if (logical.offset < part.offset || logical.offset > uint64.MAX - child.size)
+                    throw new IOError.INVALID_DATA ("A logical partition has invalid geometry.");
+                end = uint64.max (end, logical.offset + child.size);
+            }
+            uint64 minimum = end - part.offset;
+            if (minimum % sector != 0) minimum += sector - minimum % sector;
+            return minimum;
         }
 
         public static uint64 maximum_resize (StorageBlock disk, StorageBlock target) throws Error {
             var part = target.partition;
             var parent = target.parent as StorageBlock;
-            if (disk.table == null || part == null || parent == null || part.container || part.offset >= disk.size)
+            if (disk.table == null || part == null || parent == null || part.offset >= disk.size)
                 throw new IOError.NOT_SUPPORTED ("The partition resize boundary is unavailable.");
             uint64 limit = part.logical ? parent.partition.offset + parent.size : disk.size;
             foreach (var sibling in disk.table.partitions) {

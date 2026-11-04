@@ -2,7 +2,9 @@
 Name=Disks
 Comment=Inspect and manage storage devices
 Exec=majoris-disks
-Icon=drive-harddisk
+Icon=com.majoris.disks
 Type=Application
 Categories=GTK;System;Filesystem;
 Terminal=false
+StartupNotify=true
+Keywords=disk;drive;partition;filesystem;storage;
