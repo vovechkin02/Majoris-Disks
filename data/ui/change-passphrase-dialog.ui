@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksChangePassphraseDialog" parent="AdwAlertDialog">
+    <property name="heading">Change Encryption Passphrase</property>
+    <property name="body">Persistent automatic-unlock configuration may also need to be updated.</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwPasswordEntryRow" id="current_secret"><property name="title">Current passphrase</property></object></child>
+        <child><object class="AdwPasswordEntryRow" id="new_secret"><property name="title">New passphrase</property></object></child>
+        <child><object class="AdwPasswordEntryRow" id="confirmation"><property name="title">Confirm new passphrase</property></object></child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="change" appearance="suggested">Change</response>
+    </responses>
+    <property name="default-response">change</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

@@ -486,6 +486,14 @@ private void test_mount_option_normalization () {
         assert (rejected); rejected = false;
         try { MountOptionService.parse ("x-gvfs-show,x-gvfs-hide"); } catch (IOError error) { rejected = true; }
         assert (rejected);
+        MountOptionService.validate_configuration ("/mnt/archive", "btrfs", "defaults,compress=zstd");
+        rejected = false;
+        try { MountOptionService.validate_configuration ("/mnt/archive", "ext4", "compress=zstd"); }
+        catch (IOError error) { rejected = true; }
+        assert (rejected); rejected = false;
+        try { MountOptionService.validate_configuration ("/mnt/../boot", "ext4", "defaults"); }
+        catch (IOError error) { rejected = true; }
+        assert (rejected);
     } catch (Error error) { GLib.error ("Unexpected mount-option error: %s", error.message); }
 }
 

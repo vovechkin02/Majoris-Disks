@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksLockVolumeConfirmationDialog" parent="AdwAlertDialog">
+    <property name="heading">Lock Encrypted Volume?</property>
+    <property name="body">Mounted filesystems in the clear-text mapping will be safely unmounted before locking.</property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="lock" appearance="destructive">Lock</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

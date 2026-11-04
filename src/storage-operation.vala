@@ -80,6 +80,34 @@ namespace MajorisDisks {
             else if (visibility == MountVisibility.HIDE) result += "x-gvfs-hide";
             return string.joinv (",", result);
         }
+
+        public static void validate_configuration (string directory, string filesystem,
+            string options) throws Error {
+            if (!Path.is_absolute (directory) || directory == "/" || directory.contains ("//") ||
+                directory.contains ("\n") || directory.contains ("\r"))
+                throw new IOError.INVALID_ARGUMENT ("Choose an absolute, non-root mount point.");
+            foreach (var component in directory.split ("/"))
+                if (component == "." || component == "..")
+                    throw new IOError.INVALID_ARGUMENT ("The mount point cannot contain ‘.’ or ‘..’ components.");
+            string[] protected_paths = { "/boot", "/usr", "/etc", "/var", "/home" };
+            foreach (var protected_path in protected_paths)
+                if (directory == protected_path)
+                    throw new IOError.PERMISSION_DENIED ("This system-critical mount point cannot be managed here.");
+            string type = filesystem.strip ().down ();
+            if (type == "" || type.contains (",") || type.contains ("/") || type.contains (" "))
+                throw new IOError.INVALID_ARGUMENT ("The filesystem type is invalid.");
+            foreach (var option in parse (options.strip () == "" ? "defaults" : options)) {
+                string name = option.split ("=")[0];
+                if (name == "" || name.contains (" ") || name.contains ("/") || name.contains ("\\"))
+                    throw new IOError.INVALID_ARGUMENT ("The mount option ‘%s’ is invalid.".printf (option));
+                if ((name == "subvol" || name == "subvolid" || name == "compress" || name == "compress-force") &&
+                    type != "btrfs")
+                    throw new IOError.INVALID_ARGUMENT ("The option ‘%s’ is only valid for Btrfs.".printf (name));
+                if ((name == "uid" || name == "gid" || name == "umask" || name == "dmask" || name == "fmask") &&
+                    !(type == "vfat" || type == "exfat" || type == "ntfs" || type == "ntfs3" || type == "auto"))
+                    throw new IOError.INVALID_ARGUMENT ("The option ‘%s’ is not compatible with %s.".printf (name, type));
+            }
+        }
     }
 
     public enum StoragePreparationKind { MOUNT, SWAP, ENCRYPTED_MAPPING, LOGICAL_VOLUME, RAID }

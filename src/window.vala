@@ -63,6 +63,7 @@ namespace MajorisDisks {
             drive_view.label_requested.connect (edit_filesystem_label);
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
+            drive_view.passphrase_requested.connect (change_passphrase);
             drive_view.format_requested.connect ((block) => confirm_partitioning (block, false, true));
             var jobs_popover = new JobsPopover (backend);
             jobs_button.popover = jobs_popover;
@@ -144,7 +145,7 @@ namespace MajorisDisks {
             dialog.response.connect ((response) => {
                 if (response != "apply" || pending.contains (block.path)) return;
                 pending.insert (block.path, block);
-                backend.modify_partitioning.begin (block, "ownership", identity, "", dialog.recursive_change,
+                backend.modify_partitioning.begin (block, "ownership", identity, "", dialog.recursive_change, "",
                     (obj, result) => {
                         pending.remove (block.path);
                         try {
@@ -164,7 +165,7 @@ namespace MajorisDisks {
             dialog.response.connect ((response) => {
                 if (response != "apply" || pending.contains (block.path)) return;
                 pending.insert (block.path, block);
-                backend.modify_partitioning.begin (block, "label", identity, dialog.label_text, false, (obj, result) => {
+                backend.modify_partitioning.begin (block, "label", identity, dialog.label_text, false, "", (obj, result) => {
                     pending.remove (block.path);
                     try {
                         backend.modify_partitioning.end (result);
@@ -205,8 +206,10 @@ namespace MajorisDisks {
                     backend.unlock_volume.begin (block, passphrase, identity, (object, result) => {
                         passphrase = ""; pending.remove (block.path);
                         try {
-                            backend.unlock_volume.end (result);
-                            notifications.add_toast (new Adw.Toast ("Encrypted volume unlocked"));
+                            var outcome = backend.unlock_volume.end (result);
+                            if (outcome.status == StorageOperationStatus.NEEDS_ATTENTION)
+                                show_check_message ("Unlock outcome requires attention", outcome.summary);
+                            else notifications.add_toast (new Adw.Toast ("Encrypted volume unlocked"));
                         } catch (Error error) {
                             show_check_message ("Could not unlock the volume", operation_error (error));
                         }
@@ -215,24 +218,46 @@ namespace MajorisDisks {
                 dialog.present (this);
                 return;
             }
-            var confirmation = new Adw.AlertDialog ("Lock encrypted volume?",
-                "Mounted filesystems in the clear-text mapping will be safely unmounted before locking.");
-            confirmation.add_response ("cancel", "Cancel"); confirmation.add_response ("lock", "Lock");
-            confirmation.set_response_appearance ("lock", Adw.ResponseAppearance.DESTRUCTIVE);
+            var confirmation = new LockVolumeConfirmationDialog ();
             confirmation.response.connect ((response) => {
                 if (response != "lock" || pending.contains (block.path)) return;
                 pending.insert (block.path, block);
                 backend.lock_volume.begin (block, identity, (object, result) => {
                     pending.remove (block.path);
                     try {
-                        backend.lock_volume.end (result);
-                        notifications.add_toast (new Adw.Toast ("Encrypted volume locked"));
+                        var outcome = backend.lock_volume.end (result);
+                        if (outcome.status == StorageOperationStatus.NEEDS_ATTENTION)
+                            show_check_message ("Lock outcome requires attention", outcome.summary +
+                                (outcome.technical_error == "" ? "" : "\n\n" + outcome.technical_error));
+                        else notifications.add_toast (new Adw.Toast ("Encrypted volume locked"));
                     } catch (Error error) {
                         show_check_message ("Could not lock the volume", operation_error (error));
                     }
                 });
             });
             confirmation.present (this);
+        }
+        private void change_passphrase (StorageBlock block) {
+            if (pending.contains (block.path)) return;
+            string identity = backend.modification_identity (block);
+            var dialog = new ChangePassphraseDialog (block);
+            dialog.response.connect ((response) => {
+                if (response != "change" || pending.contains (block.path)) return;
+                string current_secret = dialog.current_passphrase;
+                string replacement = dialog.new_passphrase;
+                dialog.clear_secrets ();
+                pending.insert (block.path, block);
+                backend.change_passphrase.begin (block, current_secret, replacement, identity, (object, result) => {
+                    current_secret = ""; replacement = ""; pending.remove (block.path);
+                    try {
+                        backend.change_passphrase.end (result);
+                        notifications.add_toast (new Adw.Toast ("Encryption passphrase changed"));
+                    } catch (Error error) {
+                        show_check_message ("Could not change the passphrase", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
         }
         private void confirm_partitioning (StorageBlock block, bool deleting, bool volume = false) {
             string identity = backend.modification_identity (block);
@@ -265,7 +290,10 @@ namespace MajorisDisks {
                     format_label = format_dialog.volume_label;
                 }
                 pending.insert (block.path, block);
-                backend.modify_partitioning.begin (block, backend_command, identity, format_label, false, (obj, result) => {
+                string encryption_secret = volume ? ((FormatVolumeDialog) dialog).encryption_passphrase : "";
+                if (volume) ((FormatVolumeDialog) dialog).clear_secret ();
+                backend.modify_partitioning.begin (block, backend_command, identity, format_label, false, encryption_secret, (obj, result) => {
+                    encryption_secret = "";
                     pending.remove (block.path);
                     try {
                         backend.modify_partitioning.end (result);
@@ -496,6 +524,34 @@ namespace MajorisDisks {
         public void clear_secret () { secret.text = ""; }
     }
 
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lock-volume-confirmation-dialog.ui")]
+    public class LockVolumeConfirmationDialog : Adw.AlertDialog {}
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/change-passphrase-dialog.ui")]
+    public class ChangePassphraseDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.PasswordEntryRow current_secret;
+        [GtkChild] private unowned Adw.PasswordEntryRow new_secret;
+        [GtkChild] private unowned Adw.PasswordEntryRow confirmation;
+        public string current_passphrase { owned get { return current_secret.text; } }
+        public string new_passphrase { owned get { return new_secret.text; } }
+        public ChangePassphraseDialog (StorageBlock block) {
+            body = "%s · %s\n\nPersistent automatic-unlock configuration may also need to be updated."
+                .printf (block.preferred, format_size (block.size));
+            current_secret.changed.connect (validate);
+            new_secret.changed.connect (validate);
+            confirmation.changed.connect (validate);
+            validate ();
+        }
+        private void validate () {
+            bool valid = current_secret.text.length > 0 && new_secret.text.length >= 8 &&
+                new_secret.text == confirmation.text && new_secret.text != current_secret.text;
+            set_response_enabled ("change", valid);
+        }
+        public void clear_secrets () {
+            current_secret.text = ""; new_secret.text = ""; confirmation.text = "";
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/sidebar-group-heading.ui")]
     public class SidebarGroupHeading : Gtk.Box {
         [GtkChild] private unowned Gtk.Label caption;
@@ -682,11 +738,15 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ComboRow filesystem_row;
         [GtkChild] private unowned Adw.EntryRow label_row;
         [GtkChild] private unowned Adw.SwitchRow erase_row;
+        [GtkChild] private unowned Adw.SwitchRow encryption_row;
+        [GtkChild] private unowned Adw.PasswordEntryRow encryption_secret;
+        [GtkChild] private unowned Adw.PasswordEntryRow encryption_confirmation;
         private Gtk.StringList formats = new Gtk.StringList (null);
         private string[] identifiers = {};
         public string filesystem_type { owned get { return identifiers.length == 0 ? "empty" : identifiers[filesystem_row.selected]; } }
         public string volume_label { owned get { return label_row.text; } }
         public bool overwrite { get { return erase_row.active; } }
+        public string encryption_passphrase { owned get { return encryption_row.active ? encryption_secret.text : ""; } }
 
         public FormatVolumeDialog (UDisksService backend, StorageBlock block) {
             target_row.subtitle = "%s · %s · current %s".printf (block.preferred, format_size (block.size),
@@ -695,8 +755,16 @@ namespace MajorisDisks {
             add_format ("empty", "Empty (no filesystem)");
             string[] candidates = { "ext4", "btrfs", "xfs", "f2fs", "ntfs", "vfat", "exfat", "udf", "swap" };
             foreach (var candidate in candidates) probe_format.begin (backend, candidate);
+            probe_encryption.begin (backend);
             filesystem_row.notify["selected"].connect (validate);
             label_row.changed.connect (validate);
+            encryption_row.notify["active"].connect (() => {
+                encryption_secret.visible = encryption_row.active;
+                encryption_confirmation.visible = encryption_row.active;
+                validate ();
+            });
+            encryption_secret.changed.connect (validate);
+            encryption_confirmation.changed.connect (validate);
             validate ();
         }
 
@@ -713,19 +781,33 @@ namespace MajorisDisks {
             } catch (Error error) { debug ("Format capability unavailable for %s: %s", type, error.message); }
         }
 
+        private async void probe_encryption (UDisksService backend) {
+            try {
+                var capability = FilesystemCapabilityService.decode (
+                    yield backend.query_filesystem_capability ("CanFormat", "crypto_LUKS"));
+                encryption_row.sensitive = capability.supported;
+                if (!capability.supported)
+                    encryption_row.subtitle = capability.missing_utility == "" ?
+                        "Encryption is unavailable through UDisks" : "Requires " + capability.missing_utility;
+            } catch (Error error) { encryption_row.subtitle = "Encryption capability could not be detected"; }
+        }
+
         private void validate () {
             string type = filesystem_type;
             label_row.sensitive = type != "empty" && type != "swap";
             erase_row.sensitive = type != "empty";
             try {
                 FilesystemCapabilityService.validate_label (type, label_row.sensitive ? label_row.text : "");
-                set_response_enabled ("format", true);
+                bool encryption_valid = !encryption_row.active || (encryption_secret.text.length >= 8 &&
+                    encryption_secret.text == encryption_confirmation.text);
+                set_response_enabled ("format", encryption_valid);
                 label_row.remove_css_class ("error");
             } catch (Error error) {
                 set_response_enabled ("format", false);
                 label_row.add_css_class ("error");
             }
         }
+        public void clear_secret () { encryption_secret.text = ""; encryption_confirmation.text = ""; }
     }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/create-partition-dialog.ui")]

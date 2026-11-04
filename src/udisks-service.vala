@@ -359,13 +359,15 @@ namespace MajorisDisks {
             string type = block.type_id.down ();
             return type != "ntfs" && type != "vfat" && type != "exfat" && type != "udf" && type != "iso9660";
         }
-        public async void modify_partitioning (StorageBlock block, string command, string confirmed_identity, string label = "", bool recursive = false) throws Error {
+        public async void modify_partitioning (StorageBlock block, string command, string confirmed_identity,
+            string label = "", bool recursive = false, string encryption_passphrase = "") throws Error {
             bool deleting = command == "delete";
             bool rename = command == "label";
             bool ownership = command == "ownership";
             bool metadata = command == "name" || command == "bootable" || command == "type" || command == "flags";
             bool partition_operation = deleting || metadata;
             bool formatting = command.has_prefix ("format:") || command.has_prefix ("format-zero:");
+            bool encrypting = formatting && encryption_passphrase != "";
             bool disk_overwrite = command.has_suffix ("-zero") && !formatting;
             bool overwrite = command.has_prefix ("format-zero:") || disk_overwrite;
             bool volume = ownership || rename || formatting;
@@ -411,6 +413,16 @@ namespace MajorisDisks {
                             "Formatting requires " + utility + ".");
                     }
                 }
+                if (encrypting) {
+                    if (encryption_passphrase.length < 8)
+                        throw new IOError.INVALID_ARGUMENT ("The encryption passphrase must contain at least eight characters.");
+                    var encryption_capability = FilesystemCapabilityService.decode (
+                        yield query_filesystem_capability ("CanFormat", "crypto_LUKS"));
+                    if (!encryption_capability.supported)
+                        throw new IOError.NOT_SUPPORTED (encryption_capability.missing_utility == "" ?
+                            "LUKS encryption is unavailable through UDisks." :
+                            "LUKS encryption requires " + encryption_capability.missing_utility + ".");
+                }
                 foreach (var node in snapshot.dependencies.descendants (block)) {
                     var child = node as StorageBlock;
                     if (child != null) {
@@ -430,6 +442,10 @@ namespace MajorisDisks {
                     options.add ("{sv}", "label", new Variant.string (label));
                 }
                 if (formatting) options.add ("{sv}", "update-partition-type", new Variant.boolean (true));
+                if (encrypting) {
+                    options.add ("{sv}", "encrypt.passphrase", new Variant.string (encryption_passphrase));
+                    options.add ("{sv}", "encrypt.type", new Variant.string ("luks2"));
+                }
                 if (overwrite) options.add ("{sv}", "erase", new Variant.string ("zero"));
                 if (ownership) {
                     if (!supports_ownership (block))
@@ -469,6 +485,20 @@ namespace MajorisDisks {
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
                 preparation.backend_returned = true;
                 synchronize ();
+                if (encrypting) {
+                    for (int attempt = 0; attempt < 50 && (block.encrypted == null ||
+                        block.encrypted.mapping?.filesystem == null); attempt++) {
+                        yield settle_delay (lifetime); synchronize ();
+                    }
+                    if (block.encrypted == null)
+                        throw new IOError.FAILED ("UDisks completed formatting, but the resulting LUKS container could not be verified.");
+                    operation_result.completed ("LUKS2 container created");
+                    if (block.encrypted.mapping == null)
+                        throw new IOError.FAILED ("The LUKS2 container was created, but its clear-text mapping was not discovered.");
+                    if (block.encrypted.mapping.filesystem == null || block.encrypted.mapping.type_id != format)
+                        throw new IOError.FAILED ("The LUKS2 container was created and unlocked, but the requested inner filesystem was not verified.");
+                    operation_result.completed ("Encrypted filesystem verified");
+                }
                 preparation.storage_state_changed = deleting || formatting || format == "gpt" || format == "dos" || format == "empty";
                 preparation.operation_completed = true;
                 minimum_sizes.invalidate (block.path);
@@ -1162,12 +1192,33 @@ namespace MajorisDisks {
             if (!eligibility.allowed || eligibility.unknown || StorageSafetyService.assess (block, snapshot.dependencies).system_critical)
                 throw new IOError.PERMISSION_DENIED (eligibility.reason == "" ? "This system-critical mount cannot be changed here." : eligibility.reason);
             string options_text = MountOptionService.normalize (mount_options, startup);
+            if (enabled) {
+                MountOptionService.validate_configuration (directory, filesystem, options_text);
+                foreach (var candidate in snapshot.blocks.get_values ()) {
+                    foreach (var saved in candidate.mount_configurations) {
+                        bool selected_entry = original_item != null && saved.backend_item != null &&
+                            saved.backend_item.equal (original_item);
+                        if (!selected_entry && saved.directory == directory)
+                            throw new IOError.EXISTS ("Another persistent configuration already uses this mount point.");
+                        if (!selected_entry && candidate == block && saved.device == "UUID=" + block.uuid &&
+                            saved.directory == directory && saved.filesystem == filesystem.strip ())
+                            throw new IOError.EXISTS ("An equivalent persistent configuration already exists.");
+                    }
+                }
+            }
+            int32 frequency = 0; int32 pass_number = 0;
+            if (original_item != null) {
+                var old_details = original_item.get_child_value (1);
+                frequency = old_details.lookup_value ("freq", VariantType.INT32)?.get_int32 () ?? 0;
+                pass_number = old_details.lookup_value ("passno", VariantType.INT32)?.get_int32 () ?? 0;
+            }
             var details = new VariantBuilder (new VariantType ("a{sv}"));
             details.add ("{sv}", "fsname", new Variant.bytestring ("UUID=" + block.uuid));
             details.add ("{sv}", "dir", new Variant.bytestring (directory));
             details.add ("{sv}", "type", new Variant.bytestring (filesystem.strip () == "" ? "auto" : filesystem.strip ()));
             details.add ("{sv}", "opts", new Variant.bytestring (options_text));
-            details.add ("{sv}", "freq", new Variant.int32 (0)); details.add ("{sv}", "passno", new Variant.int32 (0));
+            details.add ("{sv}", "freq", new Variant.int32 (frequency));
+            details.add ("{sv}", "passno", new Variant.int32 (pass_number));
             var item = new Variant.tuple ({ new Variant.string ("fstab"), details.end () });
             var options = new VariantBuilder (new VariantType ("a{sv}"));
             var proxy = require_volume (block, "Block");
@@ -1177,6 +1228,8 @@ namespace MajorisDisks {
             try {
                 jobs.phase (job, StorageJobState.RUNNING, "Updating persistent mount configuration");
                 var existing = original_item;
+                if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
+                    throw new IOError.NOT_FOUND ("The volume changed immediately before the configuration write.");
                 if (!enabled && existing != null)
                     yield proxy.call ("RemoveConfigurationItem", new Variant.tuple ({ existing, options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
@@ -1201,7 +1254,7 @@ namespace MajorisDisks {
             } catch (Error error) { result.fail ("Mount configuration was not updated", error); jobs.finish (job, result); throw error; }
             finally { locks.release (block); }
         }
-        public async StorageBlock unlock_volume (StorageBlock block, string passphrase,
+        public async StorageOperationResult unlock_volume (StorageBlock block, string passphrase,
             string confirmed_identity) throws Error {
             if (block.encrypted == null)
                 throw new IOError.NOT_SUPPORTED ("The selected volume is not exposed as encrypted storage by UDisks.");
@@ -1232,18 +1285,23 @@ namespace MajorisDisks {
                     mapping = snapshot.blocks.lookup (cleartext_path);
                     if (mapping == null) yield settle_delay (backend_lifetime);
                 }
-                if (mapping == null || mapping.backing_path != block.path)
-                    throw new IOError.FAILED ("UDisks unlocked the volume but its clear-text mapping could not be verified.");
+                if (mapping == null || mapping.backing_path != block.path) {
+                    result.completed ("UDisks accepted the passphrase and returned " + cleartext_path);
+                    result.partial = true; result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.summary = "The encrypted volume may be unlocked, but the clear-text mapping was not published in time. Refresh before trying again.";
+                    result.resulting_path = cleartext_path; result.actual_state = "unlock outcome requires reconciliation";
+                    jobs.finish (job, result); return result;
+                }
                 result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
                 result.summary = "Encrypted volume unlocked"; result.resulting_path = mapping.path;
                 result.actual_state = mapping.preferred; jobs.finish (job, result);
-                return mapping;
+                return result;
             } catch (Error error) {
                 result.fail ("The encrypted volume could not be unlocked", error); jobs.finish (job, result); throw error;
             } finally { locks.release (block); }
         }
 
-        public async void lock_volume (StorageBlock block, string confirmed_identity) throws Error {
+        public async StorageOperationResult lock_volume (StorageBlock block, string confirmed_identity) throws Error {
             var mapping = block.encrypted?.mapping;
             if (block.encrypted == null || mapping == null)
                 throw new IOError.NOT_SUPPORTED ("The encrypted volume is not unlocked.");
@@ -1270,11 +1328,33 @@ namespace MajorisDisks {
                     synchronize (); locked = block.encrypted?.mapping == null;
                     if (!locked) yield settle_delay (backend_lifetime);
                 }
-                if (!locked) throw new IOError.FAILED ("UDisks did not confirm that the encrypted mapping was removed.");
+                if (!locked) {
+                    result.completed ("UDisks accepted the lock request"); result.partial = true;
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.summary = "The lock request completed, but the clear-text mapping is still visible. Its previous mount state will be restored.";
+                    result.actual_state = "mapping still visible";
+                    if (preparation != null && !preparation.fully_restored ()) {
+                        result.restoration_attempted = true;
+                        try { yield restore_preparation (preparation, backend_lifetime); result.restoration_succeeded = true; }
+                        catch (Error restore_error) {
+                            result.restoration_succeeded = false; result.technical_error = restore_error.message;
+                            result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                        }
+                    }
+                    jobs.finish (job, result); return result;
+                }
                 result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
                 result.summary = "Encrypted volume locked"; result.actual_state = "locked"; jobs.finish (job, result);
+                return result;
             } catch (Error error) {
                 synchronize ();
+                if (block.encrypted?.mapping == null) {
+                    result.completed ("The clear-text mapping was removed"); result.partial = true;
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.summary = "The volume is locked, although UDisks reported an error while completing the request.";
+                    result.actual_state = "locked"; result.technical_error = error.message;
+                    jobs.finish (job, result); return result;
+                }
                 if (preparation != null && block.encrypted?.mapping == mapping && !preparation.fully_restored ()) {
                     try { yield restore_preparation (preparation, backend_lifetime); }
                     catch (Error restore_error) {
@@ -1283,6 +1363,38 @@ namespace MajorisDisks {
                     }
                 }
                 result.fail ("The encrypted volume could not be locked", error); jobs.finish (job, result); throw error;
+            } finally { locks.release (block); }
+        }
+        public async void change_passphrase (StorageBlock block, string current_passphrase,
+            string new_passphrase, string confirmed_identity) throws Error {
+            if (block.encrypted == null || block.read_only || block.system_hint)
+                throw new IOError.NOT_SUPPORTED ("The encryption passphrase cannot be changed for this volume.");
+            if (current_passphrase == "" || new_passphrase.length < 8 || current_passphrase == new_passphrase)
+                throw new IOError.INVALID_ARGUMENT ("Provide the current passphrase and a distinct new passphrase of at least eight characters.");
+            if (modification_identity (block) != confirmed_identity)
+                throw new IOError.NOT_FOUND ("The encrypted volume changed before its passphrase could be updated.");
+            var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+            if (safety.system_critical || safety.unknown_dependencies)
+                throw new IOError.PERMISSION_DENIED ("The passphrase of system-critical or unresolved storage cannot be changed here.");
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Change encryption passphrase", block, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            try {
+                jobs.phase (job, StorageJobState.RUNNING, "Authorizing passphrase change");
+                if (modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The encrypted volume changed immediately before the passphrase request.");
+                var options = new VariantBuilder (new VariantType ("a{sv}"));
+                yield require_volume (block, "Encrypted").call ("ChangePassphrase",
+                    new Variant ("(ss@a{sv})", current_passphrase, new_passphrase, options.end ()),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                synchronize ();
+                if (snapshot.blocks.lookup (block.path) != block || modification_identity (block) != confirmed_identity)
+                    throw new IOError.FAILED ("The passphrase request completed, but the encrypted device identity changed.");
+                result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
+                result.summary = "Encryption passphrase changed"; result.actual_state = "encrypted volume remains available";
+                jobs.finish (job, result);
+            } catch (Error error) {
+                result.fail ("The encryption passphrase was not changed", error); jobs.finish (job, result); throw error;
             } finally { locks.release (block); }
         }
         public async void volume_action (StorageBlock block, string method) throws Error {
