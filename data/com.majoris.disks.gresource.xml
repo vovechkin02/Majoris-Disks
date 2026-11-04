@@ -23,5 +23,6 @@
     <file>ui/job-row.ui</file>
     <file>ui/jobs-popover.ui</file>
     <file>ui/active-jobs-dialog.ui</file>
+    <file>ui/mount-options-dialog.ui</file>
   </gresource>
 </gresources>

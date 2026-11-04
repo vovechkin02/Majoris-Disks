@@ -161,10 +161,25 @@ namespace MajorisDisks {
                 block.loop = loop;
             } else block.loop = null;
             var config = property (object_proxy, "Block", "Configuration");
+            block.mount_configuration = null;
+            block.mount_configurations = {};
             if (config != null) {
                 for (size_t i = 0; i < config.n_children (); i++) {
                     var entry = config.get_child_value (i);
                     if (entry.get_child_value (0).get_string () != "fstab") continue;
+                    var details = entry.get_child_value (1);
+                    var mount_config = new StorageMountConfiguration ();
+                    mount_config.device = details.lookup_value ("fsname", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                    mount_config.directory = details.lookup_value ("dir", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                    mount_config.filesystem = details.lookup_value ("type", VariantType.BYTESTRING)?.get_bytestring () ?? "auto";
+                    mount_config.options = details.lookup_value ("opts", VariantType.BYTESTRING)?.get_bytestring () ?? "defaults";
+                    mount_config.backend_item = entry;
+                    var configurations = new StorageMountConfiguration[block.mount_configurations.length + 1];
+                    for (int j = 0; j < block.mount_configurations.length; j++)
+                        configurations[j] = block.mount_configurations[j];
+                    configurations[configurations.length - 1] = mount_config;
+                    block.mount_configurations = configurations;
+                    if (block.mount_configuration == null) block.mount_configuration = mount_config;
                     var opts = entry.get_child_value (1).lookup_value ("opts", VariantType.BYTESTRING);
                     if (opts == null) continue;
                     foreach (var option in opts.get_bytestring ().split (","))
@@ -610,10 +625,17 @@ namespace MajorisDisks {
                         foreach (var mount in block.filesystem.mounts) state += mount;
                         var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, block.path, state, "unmount");
                         journal.add (entry);
-                        try { entry.prepared = yield prepare_unmounted (block, token); }
+                        entry.action_dispatched = true;
+                        try {
+                            entry.prepared = yield prepare_unmounted (block, token);
+                            entry.backend_confirmed = true; entry.expected_state_observed = entry.prepared;
+                            entry.actual_state = entry.prepared ? "unmounted" : "unchanged";
+                        }
                         catch (Error error) {
                             synchronize ();
                             entry.prepared = block.filesystem != null && !block.filesystem.mounted;
+                            entry.expected_state_observed = entry.prepared;
+                            entry.actual_state = entry.prepared ? "unmounted" : "mounted or unavailable";
                             throw error;
                         }
                     }
@@ -621,6 +643,7 @@ namespace MajorisDisks {
                         var entry = new StoragePreparationEntry (StoragePreparationKind.SWAP, block.path,
                             { block.uuid, block.type_id }, "deactivate swap");
                         journal.add (entry);
+                        entry.action_dispatched = true;
                         var swap = require_volume (block, "Swapspace");
                         var options = new VariantBuilder (new VariantType ("a{sv}"));
                         yield swap.call ("Stop", new Variant.tuple ({ options.end () }),
@@ -628,8 +651,14 @@ namespace MajorisDisks {
                         for (int attempt = 0; attempt < 50 && block.swap_active; attempt++) {
                             synchronize (); if (block.swap_active) yield settle_delay (token);
                         }
-                        if (block.swap_active) throw new IOError.TIMED_OUT ("Swap remained active after UDisks returned.");
-                        entry.prepared = true;
+                        entry.backend_confirmed = true;
+                        if (block.swap_active) {
+                            synchronize ();
+                            entry.prepared = !block.swap_active;
+                            entry.actual_state = entry.prepared ? "inactive" : "active or unavailable";
+                            throw new IOError.TIMED_OUT ("Swap remained active after UDisks returned.");
+                        }
+                        entry.prepared = true; entry.expected_state_observed = true; entry.actual_state = "inactive";
                     }
                 }
                 return journal;
@@ -671,6 +700,7 @@ namespace MajorisDisks {
                         if (!block.swap_active) throw new IOError.FAILED ("Swap did not become active.");
                     }
                     entry.restored = true;
+                    entry.actual_state = entry.kind == StoragePreparationKind.MOUNT ? "mounted" : "active";
                 } catch (Error error) { entry.error = error.message; failures += error.message; }
             }
             if (failures.length != 0) throw new IOError.FAILED (string.joinv ("; ", failures));
@@ -1116,6 +1146,59 @@ namespace MajorisDisks {
             } finally {
                 locks.release (block);
             }
+        }
+        public async void configure_mount (StorageBlock block, bool enabled, bool startup,
+            string directory, string filesystem, string mount_options, Variant? original_item,
+            string confirmed_identity, string confirmed_uuid) throws Error {
+            if (block.filesystem == null || block.uuid == "" || block.read_only || block.system_hint)
+                throw new IOError.NOT_SUPPORTED ("Persistent mount configuration is unavailable for this volume.");
+            if (enabled && (!Path.is_absolute (directory) || directory.contains ("\n") || directory.contains ("\0") ||
+                filesystem.contains ("\n") || mount_options.contains ("\n") || mount_options.contains ("\0")))
+                throw new IOError.INVALID_ARGUMENT ("The mount path or options are invalid.");
+            if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
+                throw new IOError.NOT_FOUND ("The volume changed after the mount configuration dialog was opened.");
+            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.MOUNT, block, snapshot.dependencies);
+            if (!eligibility.allowed || eligibility.unknown || StorageSafetyService.assess (block, snapshot.dependencies).system_critical)
+                throw new IOError.PERMISSION_DENIED (eligibility.reason == "" ? "This system-critical mount cannot be changed here." : eligibility.reason);
+            string options_text = MountOptionService.normalize (mount_options, startup);
+            var details = new VariantBuilder (new VariantType ("a{sv}"));
+            details.add ("{sv}", "fsname", new Variant.bytestring ("UUID=" + block.uuid));
+            details.add ("{sv}", "dir", new Variant.bytestring (directory));
+            details.add ("{sv}", "type", new Variant.bytestring (filesystem.strip () == "" ? "auto" : filesystem.strip ()));
+            details.add ("{sv}", "opts", new Variant.bytestring (options_text));
+            details.add ("{sv}", "freq", new Variant.int32 (0)); details.add ("{sv}", "passno", new Variant.int32 (0));
+            var item = new Variant.tuple ({ new Variant.string ("fstab"), details.end () });
+            var options = new VariantBuilder (new VariantType ("a{sv}"));
+            var proxy = require_volume (block, "Block");
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin (enabled ? "Configure mount" : "Restore mount defaults", block, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            try {
+                jobs.phase (job, StorageJobState.RUNNING, "Updating persistent mount configuration");
+                var existing = original_item;
+                if (!enabled && existing != null)
+                    yield proxy.call ("RemoveConfigurationItem", new Variant.tuple ({ existing, options.end () }),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                else if (enabled && existing != null)
+                    yield proxy.call ("UpdateConfigurationItem", new Variant.tuple ({ existing, item, options.end () }),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                else if (enabled)
+                    yield proxy.call ("AddConfigurationItem", new Variant.tuple ({ item, options.end () }),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                bool verified = false;
+                for (int attempt = 0; attempt < 50 && !verified; attempt++) {
+                    synchronize (); verified = !enabled;
+                    foreach (var saved in block.mount_configurations) {
+                        if (!enabled && saved.backend_item != null && existing != null && saved.backend_item.equal (existing)) verified = false;
+                        if (enabled && saved.directory == directory && saved.filesystem == (filesystem.strip () == "" ? "auto" : filesystem.strip ()) &&
+                            saved.options == options_text && saved.device == "UUID=" + block.uuid) verified = true;
+                    }
+                    if (!verified) yield settle_delay (backend_lifetime);
+                }
+                if (!verified) throw new IOError.FAILED ("UDisks did not publish the requested persistent mount configuration.");
+                result.successful = true; result.summary = "Mount configuration updated"; jobs.finish (job, result);
+            } catch (Error error) { result.fail ("Mount configuration was not updated", error); jobs.finish (job, result); throw error; }
+            finally { locks.release (block); }
         }
         public async void volume_action (StorageBlock block, string method) throws Error {
             if (!available ()) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");

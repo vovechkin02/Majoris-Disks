@@ -1,4 +1,19 @@
 namespace MajorisDisks {
+    public class MountOptionService {
+        public static string normalize (string input, bool startup) {
+            string[] result = {};
+            foreach (var raw in input.split (",")) {
+                string option = raw.strip (); bool duplicate = false;
+                foreach (var existing in result) duplicate |= existing == option;
+                if (option == "" || option == "noauto" || duplicate) continue;
+                result += option;
+            }
+            if (result.length == 0) result += "defaults";
+            if (!startup) result += "noauto";
+            return string.joinv (",", result);
+        }
+    }
+
     public enum StoragePreparationKind { MOUNT, SWAP, ENCRYPTED_MAPPING, LOGICAL_VOLUME, RAID }
 
     public class StoragePreparationEntry : Object {
@@ -7,6 +22,11 @@ namespace MajorisDisks {
         public string[] state { get; construct; }
         public string operation_type { get; construct; }
         public bool prepared { get; set; }
+        public bool action_dispatched { get; set; }
+        public bool backend_confirmed { get; set; }
+        public bool expected_state_observed { get; set; }
+        public string actual_state { get; set; default = "unknown"; }
+        public bool destructive_change { get; set; }
         public bool restoration_allowed { get; set; default = true; }
         public bool restored { get; set; }
         public string error { get; set; default = ""; }
@@ -244,6 +264,11 @@ namespace MajorisDisks {
         public ListStore jobs { get; private set; default = new ListStore (typeof (StorageJob)); }
         private uint64 serial;
         public signal void changed ();
+        public static bool terminal (StorageJobState state) {
+            return state == StorageJobState.COMPLETED || state == StorageJobState.FAILED ||
+                state == StorageJobState.CANCELLED || state == StorageJobState.PARTIALLY_COMPLETED ||
+                state == StorageJobState.NEEDS_ATTENTION;
+        }
         public uint active_count () {
             uint count = 0;
             for (uint i = 0; i < jobs.get_n_items (); i++) {
@@ -298,6 +323,7 @@ namespace MajorisDisks {
                 match = new StorageJob ("udisks:" + path, operation, objects.length == 0 ? "Storage device" : objects[0], objects);
                 jobs.append (match);
             }
+            if (terminal (match.state)) return;
             match.backend_path = path;
             match.state = StorageJobState.RUNNING;
             match.phase = operation;
@@ -311,6 +337,7 @@ namespace MajorisDisks {
             for (uint i = 0; i < jobs.get_n_items (); i++) {
                 var job = jobs.get_item (i) as StorageJob;
                 if (job.backend_path != path) continue;
+                if (terminal (job.state)) return;
                 job.state = successful ? StorageJobState.COMPLETED : StorageJobState.FAILED;
                 job.phase = message == "" ? (successful ? "Completed" : "Failed") : message;
                 job.error_message = successful ? "" : message;

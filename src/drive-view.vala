@@ -17,6 +17,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button delete_partition;
         [GtkChild] private unowned Gtk.Button format_volume;
         [GtkChild] private unowned Gtk.Button edit_label;
+        [GtkChild] private unowned Gtk.Button mount_options;
         [GtkChild] private unowned Gtk.Button take_ownership;
         [GtkChild] private unowned Gtk.Button edit_partition;
         [GtkChild] private unowned Gtk.Button create_partition;
@@ -24,6 +25,7 @@ namespace MajorisDisks {
         public signal void metadata_requested (StorageBlock block);
         public signal void ownership_requested (StorageBlock block);
         public signal void label_requested (StorageBlock block);
+        public signal void mount_options_requested (StorageBlock block);
         public signal void format_requested (StorageBlock block);
         public signal void partitioning_requested (StorageBlock block, bool deleting);
         public signal void create_requested (StorageBlock disk, StorageFreeSpace gap);
@@ -92,6 +94,7 @@ namespace MajorisDisks {
             edit_label.clicked.connect (() => {
                 if (selected_block != null) label_requested (selected_block);
             });
+            mount_options.clicked.connect (() => { if (target != null) mount_options_requested (target); });
             format_volume.clicked.connect (() => {
                 if (selected_block != null) format_requested (selected_block);
             });
@@ -184,6 +187,7 @@ namespace MajorisDisks {
             delete_partition.visible = false;
             format_volume.visible = false;
             edit_label.visible = false;
+            mount_options.visible = false;
             take_ownership.visible = false;
             edit_partition.visible = false;
             create_partition.visible = false;
@@ -243,6 +247,7 @@ namespace MajorisDisks {
             if (block.logical_volume != null) add_volume_field ("Logical volume", block.logical_volume.name);
             if (block.volume_group != null) add_volume_field ("LVM volume group", block.volume_group.name);
             target = block.encrypted?.mapping ?? block;
+            mount_options.visible = target.filesystem != null && target.uuid != "" && !target.read_only && !target.system_hint;
             take_ownership.visible = UDisksService.supports_ownership (target) &&
                 !StorageSafetyService.assess (target, backend?.snapshot.dependencies).system_critical;
             if (block.encrypted != null) add_volume_field ("Encryption", target == block ? "Locked" : "Unlocked");

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface><template class="MajorisDisksMountOptionsDialog" parent="AdwAlertDialog">
+  <property name="heading">Mount Options</property><property name="extra-child"><object class="AdwPreferencesGroup">
+    <child><object class="AdwComboRow" id="entry"><property name="title">Configuration entry</property></object></child>
+    <child><object class="AdwSwitchRow" id="custom"><property name="title">Use persistent mount configuration</property></object></child>
+    <child><object class="AdwSwitchRow" id="startup"><property name="title">Mount at system startup</property></object></child>
+    <child><object class="AdwEntryRow" id="directory"><property name="title">Mount point</property></object></child>
+    <child><object class="AdwEntryRow" id="filesystem"><property name="title">Filesystem type</property></object></child>
+    <child><object class="AdwEntryRow" id="options"><property name="title">Mount options</property></object></child>
+    <child><object class="AdwEntryRow" id="display_name"><property name="title">Display name</property></object></child>
+    <child><object class="AdwSwitchRow" id="show_files"><property name="title">Show in Files</property></object></child>
+    <child><object class="AdwActionRow" id="identifier"><property name="title">Stable device identifier</property></object></child>
+  </object></property>
+  <responses><response id="cancel">Cancel</response><response id="apply" appearance="suggested">Apply</response></responses>
+  <property name="default-response">cancel</property><property name="close-response">cancel</property>
+</template></interface>

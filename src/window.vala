@@ -61,6 +61,7 @@ namespace MajorisDisks {
             drive_view.metadata_requested.connect (edit_partition_metadata);
             drive_view.ownership_requested.connect (confirm_ownership);
             drive_view.label_requested.connect (edit_filesystem_label);
+            drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.format_requested.connect ((block) => confirm_partitioning (block, false, true));
             var jobs_popover = new JobsPopover (backend);
             jobs_button.popover = jobs_popover;
@@ -172,6 +173,21 @@ namespace MajorisDisks {
                         show_check_message ("Could not update the filesystem label", operation_error (error));
                     }
                 });
+            });
+            dialog.present (this);
+        }
+        private void edit_mount_options (StorageBlock block) {
+            var dialog = new MountOptionsDialog (block, backend.modification_identity (block));
+            dialog.response.connect ((response) => {
+                if (response != "apply" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.configure_mount.begin (block, dialog.enabled, dialog.startup_mount,
+                    dialog.mount_point, dialog.filesystem_type, dialog.mount_options, dialog.original_item,
+                    dialog.confirmed_identity, dialog.confirmed_uuid, (object, result) => {
+                        pending.remove (block.path);
+                        try { backend.configure_mount.end (result); notifications.add_toast (new Adw.Toast ("Mount configuration updated")); }
+                        catch (Error error) { show_check_message ("Could not update mount options", operation_error (error)); }
+                    });
             });
             dialog.present (this);
         }
@@ -359,6 +375,73 @@ namespace MajorisDisks {
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/active-jobs-dialog.ui")]
     public class ActiveJobsDialog : Adw.AlertDialog {}
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/mount-options-dialog.ui")]
+    public class MountOptionsDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow entry;
+        [GtkChild] private unowned Adw.SwitchRow custom;
+        [GtkChild] private unowned Adw.SwitchRow startup;
+        [GtkChild] private unowned Adw.EntryRow directory;
+        [GtkChild] private unowned Adw.EntryRow filesystem;
+        [GtkChild] private unowned Adw.EntryRow options;
+        [GtkChild] private unowned Adw.EntryRow display_name;
+        [GtkChild] private unowned Adw.SwitchRow show_files;
+        [GtkChild] private unowned Adw.ActionRow identifier;
+        public bool enabled { get { return custom.active; } }
+        public bool startup_mount { get { return startup.active; } }
+        public string mount_point { owned get { return directory.text; } }
+        public string filesystem_type { owned get { return filesystem.text; } }
+        private StorageBlock block;
+        public string confirmed_identity { get; private set; }
+        public string confirmed_uuid { get; private set; }
+        private Gtk.StringList entries = new Gtk.StringList (null);
+        public Variant? original_item { owned get {
+            return entry.selected < block.mount_configurations.length ? block.mount_configurations[entry.selected].backend_item : null;
+        } }
+        public string mount_options { owned get {
+            string[] kept = {};
+            foreach (var token in options.text.split (","))
+                if (!token.has_prefix ("x-gvfs-name=") && token != "x-gvfs-show" && token != "x-gvfs-hide") kept += token;
+            string value = string.joinv (",", kept);
+            if (display_name.text.strip () != "") value += ",x-gvfs-name=" + display_name.text.strip ();
+            if (show_files.active) value += ",x-gvfs-show";
+            else value += ",x-gvfs-hide";
+            return value;
+        } }
+        public MountOptionsDialog (StorageBlock block, string identity) {
+            this.block = block; confirmed_identity = identity;
+            confirmed_uuid = block.uuid; entry.model = entries;
+            foreach (var item in block.mount_configurations) entries.append (item.directory + " · " + item.device);
+            entries.append ("New configuration");
+            entry.selected = 0;
+            entry.notify["selected"].connect (load_selected);
+            load_selected ();
+            custom.notify["active"].connect (validate); directory.changed.connect (validate);
+            filesystem.changed.connect (validate); options.changed.connect (validate); validate ();
+        }
+        private void load_selected () {
+            var config = entry.selected < block.mount_configurations.length ? block.mount_configurations[entry.selected] : null;
+            custom.active = config != null; startup.active = config == null || !("," + config.options + ",").contains (",noauto,");
+            directory.text = config?.directory ?? "/mnt/" + (block.label == "" ? block.uuid : block.label);
+            filesystem.text = config?.filesystem ?? block.type_id; options.text = config?.options ?? "defaults";
+            display_name.text = option_value (options.text, "x-gvfs-name=");
+            show_files.active = ("," + options.text + ",").contains (",x-gvfs-show,");
+            identifier.subtitle = "UUID=" + block.uuid;
+            validate ();
+        }
+        private static string option_value (string options, string prefix) {
+            foreach (var option in options.split (",")) if (option.has_prefix (prefix)) return option.substring (prefix.length);
+            return "";
+        }
+        private void validate () {
+            bool fields = custom.active;
+            startup.sensitive = fields; directory.sensitive = fields; filesystem.sensitive = fields; options.sensitive = fields;
+            display_name.sensitive = fields; show_files.sensitive = fields;
+            bool valid = !fields || (Path.is_absolute (directory.text) && !directory.text.contains ("\n") &&
+                filesystem.text.strip () != "" && !options.text.contains ("\n"));
+            set_response_enabled ("apply", valid);
+        }
+    }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/sidebar-group-heading.ui")]
     public class SidebarGroupHeading : Gtk.Box {

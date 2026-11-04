@@ -455,6 +455,24 @@ private void test_job_retention () {
     assert (manager.jobs.get_n_items () == 50 && manager.active_count () == 0);
 }
 
+private void test_job_terminal_precedence () {
+    var manager = new StorageJobManager ();
+    manager.observe ("/job/terminal", "format", { "/block" }, 0.5, true, true, 1);
+    manager.backend_completed ("/job/terminal", true, "Completed");
+    var job = manager.jobs.get_item (0) as StorageJob;
+    assert (job.state == StorageJobState.COMPLETED);
+    manager.observe ("/job/terminal", "format", { "/block" }, 0.75, true, true, 1);
+    assert (job.state == StorageJobState.COMPLETED && job.phase == "Completed");
+    manager.backend_removed ("/job/terminal");
+    assert (job.state == StorageJobState.COMPLETED);
+}
+
+private void test_mount_option_normalization () {
+    assert (MountOptionService.normalize ("defaults,noauto,rw,noauto,rw", true) == "defaults,rw");
+    assert (MountOptionService.normalize ("rw,noauto,rw", false) == "rw,noauto");
+    assert (MountOptionService.normalize ("", false) == "defaults,noauto");
+}
+
 private void test_job_correlation () {
     var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
     var block = new StorageBlock ("/target"); block.preferred = "/dev/test";
@@ -523,6 +541,8 @@ public static int main (string[] args) {
     Test.add_func ("/operations/create-active-dependency", test_create_partition_active_dependency);
     Test.add_func ("/operations/terminal-states", test_operation_terminal_states);
     Test.add_func ("/operations/job-retention", test_job_retention);
+    Test.add_func ("/operations/job-terminal-precedence", test_job_terminal_precedence);
+    Test.add_func ("/operations/mount-option-normalization", test_mount_option_normalization);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     return Test.run ();
 }

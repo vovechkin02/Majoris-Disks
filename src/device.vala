@@ -68,10 +68,17 @@ namespace MajorisDisks {
         public StorageFilesystem? filesystem;
         public StorageEncryptedVolume? encrypted;
         public StorageLoopDevice? loop;
+        public StorageMountConfiguration? mount_configuration;
+        public StorageMountConfiguration[] mount_configurations = {};
 
         public StorageBlock (string path) {
             base (path);
         }
+    }
+
+    public class StorageMountConfiguration : Object {
+        public string device = ""; public string directory = ""; public string filesystem = "auto";
+        public string options = "defaults"; public Variant? backend_item;
     }
 
     public class StoragePartitionTable : Object {
