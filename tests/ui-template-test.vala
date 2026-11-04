@@ -19,6 +19,7 @@ public static int main (string[] args) {
     app.register (null);
     var partition = block.partition;
     var job = backend.jobs.begin ("Test", block, backend.snapshot.dependencies);
+    var health_report = new StorageHealthReport ();
     Object[] instances = {
         new PartitionMap (), new PartitionSegment (), new DriveView (), new DisksWindow (app),
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
@@ -29,7 +30,8 @@ public static int main (string[] args) {
         new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block),
         new JobRow (backend, job), new JobsPopover (backend), new ActiveJobsDialog (),
         new MountOptionsDialog (block, "identity"), new UnlockVolumeDialog (block),
-        new LockVolumeConfirmationDialog (), new ChangePassphraseDialog (block)
+        new LockVolumeConfirmationDialog (), new ChangePassphraseDialog (block),
+        new EncryptionOptionsDialog (block, null, "identity"), new SmartDialog (drive, health_report)
     };
     string[] resources = {
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
@@ -39,7 +41,8 @@ public static int main (string[] args) {
         "delete-confirmation-dialog.ui", "format-disk-dialog.ui", "format-volume-dialog.ui",
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
         "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui",
-        "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui"
+        "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui", "encryption-options-dialog.ui",
+        "smart-dialog.ui"
     };
     foreach (var name in resources) {
         try { resources_lookup_data ("/com/majoris/disks/ui/" + name, ResourceLookupFlags.NONE); }

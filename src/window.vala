@@ -64,6 +64,8 @@ namespace MajorisDisks {
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
+            drive_view.encryption_options_requested.connect (edit_encryption_options);
+            drive_view.health_requested.connect (show_health);
             drive_view.format_requested.connect ((block) => confirm_partitioning (block, false, true));
             var jobs_popover = new JobsPopover (backend);
             jobs_button.popover = jobs_popover;
@@ -203,7 +205,8 @@ namespace MajorisDisks {
                     string passphrase = dialog.passphrase;
                     dialog.clear_secret ();
                     pending.insert (block.path, block);
-                    backend.unlock_volume.begin (block, passphrase, identity, (object, result) => {
+                    backend.unlock_volume.begin (block, passphrase, identity, dialog.pim_value,
+                        dialog.hidden, dialog.system, dialog.keyfiles, (object, result) => {
                         passphrase = ""; pending.remove (block.path);
                         try {
                             var outcome = backend.unlock_volume.end (result);
@@ -258,6 +261,42 @@ namespace MajorisDisks {
                 });
             });
             dialog.present (this);
+        }
+        private void edit_encryption_options (StorageBlock block) {
+            if (pending.contains (block.path)) return;
+            string identity = backend.modification_identity (block);
+            backend.secret_encryption_configuration.begin (block, (object, result) => {
+                StorageEncryptionConfiguration? configuration;
+                try { configuration = backend.secret_encryption_configuration.end (result); }
+                catch (Error error) {
+                    show_check_message ("Could not read encryption options", operation_error (error)); return;
+                }
+                var dialog = new EncryptionOptionsDialog (block, configuration, identity);
+                dialog.response.connect ((response) => {
+                    if (response != "apply" || pending.contains (block.path)) return;
+                    string passphrase = dialog.new_passphrase;
+                    dialog.clear_secret ();
+                    pending.insert (block.path, block);
+                    backend.configure_encryption.begin (block, dialog.enabled, dialog.unlock_at_startup,
+                        dialog.mapping, dialog.crypttab_options, passphrase, dialog.original_item,
+                        dialog.confirmed_identity, dialog.confirmed_uuid, (source, completed) => {
+                            passphrase = ""; pending.remove (block.path);
+                            try {
+                                backend.configure_encryption.end (completed);
+                                notifications.add_toast (new Adw.Toast ("Encryption options updated"));
+                            } catch (Error error) {
+                                show_check_message ("Could not update encryption options", operation_error (error));
+                            }
+                        });
+                });
+                dialog.present (this);
+            });
+        }
+        private void show_health (StorageDrive drive) {
+            backend.query_health.begin (drive, true, (object, result) => {
+                try { new SmartDialog (drive, backend.query_health.end (result)).present (this); }
+                catch (Error error) { show_check_message ("Could not read drive health", operation_error (error)); }
+            });
         }
         private void confirm_partitioning (StorageBlock block, bool deleting, bool volume = false) {
             string identity = backend.modification_identity (block);
@@ -515,13 +554,48 @@ namespace MajorisDisks {
     [GtkTemplate (ui = "/com/majoris/disks/ui/unlock-volume-dialog.ui")]
     public class UnlockVolumeDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.PasswordEntryRow secret;
+        [GtkChild] private unowned Adw.EntryRow pim;
+        [GtkChild] private unowned Adw.SwitchRow hidden_volume;
+        [GtkChild] private unowned Adw.SwitchRow system_volume;
+        [GtkChild] private unowned Adw.ActionRow keyfile_row;
+        [GtkChild] private unowned Gtk.Button choose_keyfile;
+        private string[] selected_keyfiles = {};
         public string passphrase { owned get { return secret.text; } }
+        public uint32 pim_value { get {
+            if (pim.text.strip () == "") return 0;
+            try { return (uint32) uint64.parse (pim.text); } catch (Error error) { return 0; }
+        } }
+        public bool hidden { get { return hidden_volume.active; } }
+        public bool system { get { return system_volume.active; } }
+        public string[] keyfiles { owned get { return selected_keyfiles; } }
         public UnlockVolumeDialog (StorageBlock block) {
             body = "%s · %s".printf (block.preferred, format_size (block.size));
-            secret.changed.connect (() => set_response_enabled ("unlock", secret.text.length > 0));
-            set_response_enabled ("unlock", false);
+            bool veracrypt = block.type_id == "crypto_TCRYPT" || block.type_id == "crypto_unknown";
+            pim.visible = veracrypt; hidden_volume.visible = veracrypt; system_volume.visible = veracrypt;
+            keyfile_row.visible = veracrypt;
+            secret.changed.connect (validate); pim.changed.connect (validate);
+            choose_keyfile.clicked.connect (select_keyfile);
+            validate ();
         }
-        public void clear_secret () { secret.text = ""; }
+        private void validate () {
+            bool pim_valid = true;
+            if (pim.visible && pim.text.strip () != "") {
+                try { uint64 value = uint64.parse (pim.text); pim_valid = value > 0 && value <= uint32.MAX; }
+                catch (Error error) { pim_valid = false; }
+            }
+            set_response_enabled ("unlock", pim_valid && (secret.text.length > 0 || selected_keyfiles.length > 0));
+        }
+        private void select_keyfile () {
+            var chooser = new Gtk.FileDialog (); chooser.title = "Select a VeraCrypt keyfile";
+            chooser.open.begin (null, null, (object, result) => {
+                try {
+                    var file = chooser.open.end (result); string? path = file.get_path ();
+                    if (path == null || path == "") return;
+                    selected_keyfiles = { path }; keyfile_row.subtitle = file.get_basename (); validate ();
+                } catch (Error error) {}
+            });
+        }
+        public void clear_secret () { secret.text = ""; selected_keyfiles = {}; }
     }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/lock-volume-confirmation-dialog.ui")]
@@ -549,6 +623,93 @@ namespace MajorisDisks {
         }
         public void clear_secrets () {
             current_secret.text = ""; new_secret.text = ""; confirmation.text = "";
+        }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/encryption-options-dialog.ui")]
+    public class EncryptionOptionsDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.SwitchRow custom;
+        [GtkChild] private unowned Adw.SwitchRow startup;
+        [GtkChild] private unowned Adw.EntryRow mapping_name;
+        [GtkChild] private unowned Adw.EntryRow options;
+        [GtkChild] private unowned Adw.PasswordEntryRow secret;
+        [GtkChild] private unowned Adw.ActionRow keyfile;
+        [GtkChild] private unowned Adw.ActionRow identifier;
+        public bool enabled { get { return custom.active; } }
+        public bool unlock_at_startup { get { return startup.active; } }
+        public string mapping { owned get { return mapping_name.text.strip (); } }
+        public string crypttab_options { owned get { return options.text; } }
+        public string new_passphrase { owned get { return secret.text; } }
+        public string confirmed_identity { get; private set; }
+        public string confirmed_uuid { get; private set; }
+        public Variant? original_item { get; private set; }
+        public EncryptionOptionsDialog (StorageBlock block, StorageEncryptionConfiguration? configuration,
+            string identity) {
+            confirmed_identity = identity; confirmed_uuid = block.uuid;
+            original_item = configuration?.backend_item;
+            custom.active = configuration != null;
+            mapping_name.text = configuration?.name ?? "luks-" + block.uuid;
+            options.text = configuration?.options ?? (block.physical_drive?.removable == true ? "nofail,noauto" : "nofail");
+            startup.active = !("," + options.text + ",").contains (",noauto,");
+            keyfile.subtitle = configuration == null || configuration.passphrase_path == "" ? "None" :
+                configuration.passphrase_path;
+            identifier.subtitle = "UUID=" + block.uuid;
+            custom.notify["active"].connect (validate); startup.notify["active"].connect (validate);
+            mapping_name.changed.connect (validate); options.changed.connect (validate); secret.changed.connect (validate);
+            validate ();
+        }
+        private void validate () {
+            bool fields = custom.active;
+            startup.sensitive = fields; mapping_name.sensitive = fields; options.sensitive = fields;
+            secret.sensitive = fields;
+            bool valid = !fields || (mapping_name.text.strip () != "" && !mapping_name.text.contains ("/") &&
+                !mapping_name.text.contains (",") && !mapping_name.text.contains (" "));
+            if (valid && fields) {
+                try { MountOptionService.normalize (options.text, startup.active); }
+                catch (Error error) { valid = false; }
+            }
+            set_response_enabled ("apply", valid);
+        }
+        public void clear_secret () { secret.text = ""; }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/smart-dialog.ui")]
+    public class SmartDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.PreferencesGroup summary_group;
+        [GtkChild] private unowned Gtk.ListBox attributes;
+        public SmartDialog (StorageDrive drive, StorageHealthReport report) {
+            heading = report.nvme ? "NVMe Health" : "SMART Data";
+            body = drive.name + (drive.serial == "" ? "" : " · " + drive.serial);
+            add_summary ("Overall assessment", report.overall);
+            add_summary ("Temperature", report.temperature);
+            add_summary ("Power-on time", report.power_on_hours == 0 ? "Unknown" :
+                report.power_on_hours.to_string () + " hours");
+            string updated = "Never";
+            if (report.updated != 0) {
+                var date = new DateTime.from_unix_local ((int64) report.updated);
+                updated = date.format ("%c");
+            }
+            add_summary ("Last updated", updated);
+            add_summary ("Self-test", report.selftest + (report.selftest_remaining >= 0 ?
+                " · " + report.selftest_remaining.to_string () + "% remaining" : ""));
+            if (report.warnings.length != 0) add_summary ("Critical warnings", string.joinv (", ", report.warnings));
+            if (report.nvme) {
+                add_attribute ("Media/data integrity errors", report.media_errors.to_string ());
+                add_attribute ("Unsafe shutdowns", report.unsafe_shutdowns.to_string ());
+                add_attribute ("Error log entries", report.error_log_entries.to_string ());
+            } else foreach (var item in report.attributes) {
+                string values = "Raw: %s · Normalised: %s · Worst: %s · Threshold: %s · %s\n%s".printf (
+                    item.raw, item.normalized < 0 ? "Unknown" : item.normalized.to_string (),
+                    item.worst < 0 ? "Unknown" : item.worst.to_string (),
+                    item.threshold < 0 ? "Unknown" : item.threshold.to_string (), item.assessment, item.description);
+                add_attribute ("%u · %s".printf (item.id, item.name), values);
+            }
+        }
+        private void add_summary (string title, string value) {
+            summary_group.add (new InformationRow (title, value, false));
+        }
+        private void add_attribute (string title, string value) {
+            attributes.append (new InformationRow (title, value, false));
         }
     }
 
@@ -743,6 +904,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.PasswordEntryRow encryption_confirmation;
         private Gtk.StringList formats = new Gtk.StringList (null);
         private string[] identifiers = {};
+        private bool encryption_supported;
         public string filesystem_type { owned get { return identifiers.length == 0 ? "empty" : identifiers[filesystem_row.selected]; } }
         public string volume_label { owned get { return label_row.text; } }
         public bool overwrite { get { return erase_row.active; } }
@@ -785,7 +947,7 @@ namespace MajorisDisks {
             try {
                 var capability = FilesystemCapabilityService.decode (
                     yield backend.query_filesystem_capability ("CanFormat", "crypto_LUKS"));
-                encryption_row.sensitive = capability.supported;
+                encryption_supported = capability.supported; encryption_row.sensitive = capability.supported;
                 if (!capability.supported)
                     encryption_row.subtitle = capability.missing_utility == "" ?
                         "Encryption is unavailable through UDisks" : "Requires " + capability.missing_utility;
@@ -794,6 +956,10 @@ namespace MajorisDisks {
 
         private void validate () {
             string type = filesystem_type;
+            if (type == "empty" || type == "swap") {
+                encryption_row.active = false;
+                encryption_row.sensitive = false;
+            } else encryption_row.sensitive = encryption_supported;
             label_row.sensitive = type != "empty" && type != "swap";
             erase_row.sensitive = type != "empty";
             try {

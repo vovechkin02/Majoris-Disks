@@ -4,6 +4,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow summary;
         [GtkChild] private unowned Gtk.Image drive_icon;
         [GtkChild] private unowned Gtk.Button information;
+        [GtkChild] private unowned Gtk.Button health;
         [GtkChild] private unowned PartitionMap map;
         [GtkChild] private unowned Gtk.ListBox volumes;
         [GtkChild] private unowned Adw.PreferencesGroup properties;
@@ -21,6 +22,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button unlock_volume;
         [GtkChild] private unowned Gtk.Button lock_volume;
         [GtkChild] private unowned Gtk.Button change_passphrase;
+        [GtkChild] private unowned Gtk.Button encryption_options;
         [GtkChild] private unowned Gtk.Button take_ownership;
         [GtkChild] private unowned Gtk.Button edit_partition;
         [GtkChild] private unowned Gtk.Button create_partition;
@@ -31,6 +33,7 @@ namespace MajorisDisks {
         public signal void mount_options_requested (StorageBlock block);
         public signal void encryption_requested (StorageBlock block, bool unlock);
         public signal void passphrase_requested (StorageBlock block);
+        public signal void encryption_options_requested (StorageBlock block);
         public signal void format_requested (StorageBlock block);
         public signal void partitioning_requested (StorageBlock block, bool deleting);
         public signal void create_requested (StorageBlock disk, StorageFreeSpace gap);
@@ -46,6 +49,7 @@ namespace MajorisDisks {
         private bool updating;
         private FilesystemUsageService usage_service = new FilesystemUsageService ();
         public signal void action_requested (StorageBlock block, string method);
+        public signal void health_requested (StorageDrive drive);
         public signal void open_failed ();
         public void invalidate_usage (StorageBlock block) { usage_service.invalidate (block.path); if (target == block) usage.label = usage_service.show (block); }
 
@@ -58,6 +62,7 @@ namespace MajorisDisks {
             information.clicked.connect (() => {
                 if (current != null) new DriveInformationDialog (current).present (this);
             });
+            health.clicked.connect (() => { if (current != null) health_requested (current); });
             map.region_selected.connect ((identity) => {
                 for (int i = 0; ; i++) {
                     var row = volumes.get_row_at_index (i) as VolumeRow;
@@ -103,6 +108,7 @@ namespace MajorisDisks {
             unlock_volume.clicked.connect (() => { if (selected_block != null) encryption_requested (selected_block, true); });
             lock_volume.clicked.connect (() => { if (selected_block != null) encryption_requested (selected_block, false); });
             change_passphrase.clicked.connect (() => { if (selected_block != null) passphrase_requested (selected_block); });
+            encryption_options.clicked.connect (() => { if (selected_block != null) encryption_options_requested (selected_block); });
             format_volume.clicked.connect (() => {
                 if (selected_block != null) format_requested (selected_block);
             });
@@ -139,6 +145,7 @@ namespace MajorisDisks {
             var disk = drive.medium;
             initialize_disk.visible = disk != null && disk.available && !disk.read_only && !disk.system_hint;
             summary.title = drive.name;
+            health.visible = drive.smart || drive.nvme_state != "";
             drive_icon.icon_name = drive.icon;
             summary.subtitle = drive.available ? format_size (drive.size) : "No media available";
             if (disk != null) summary.subtitle += " · " + disk.preferred;
@@ -262,6 +269,7 @@ namespace MajorisDisks {
             unlock_volume.visible = block.encrypted != null && block.encrypted.mapping == null && block.available;
             lock_volume.visible = block.encrypted?.mapping != null && block.available && !block.system_hint;
             change_passphrase.visible = block.encrypted != null && block.available && !block.read_only && !block.system_hint;
+            encryption_options.visible = change_passphrase.visible && block.uuid != "";
             if (target != block) add_volume_field ("Mapped device", target.preferred, true);
             var fs = target.filesystem;
             if (fs != null) {

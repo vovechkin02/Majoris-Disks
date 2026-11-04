@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksSmartDialog" parent="AdwAlertDialog">
+    <property name="heading">Drive Health</property>
+    <property name="extra-child">
+      <object class="GtkBox"><property name="orientation">vertical</property>
+        <child><object class="AdwPreferencesGroup" id="summary_group"><property name="title">Health summary</property></object></child>
+        <child><object class="AdwPreferencesGroup"><property name="title">Detailed attributes</property>
+          <child><object class="GtkListBox" id="attributes"><property name="selection-mode">none</property><style><class name="boxed-list"/></style></object></child>
+        </object></child>
+      </object>
+    </property>
+    <responses><response id="close">Close</response></responses>
+    <property name="close-response">close</property>
+  </template>
+</interface>

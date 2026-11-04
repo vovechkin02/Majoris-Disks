@@ -28,6 +28,19 @@ namespace MajorisDisks {
         public bool optical;
         public string media = "";
         public string nvme_state = "";
+        public bool smart_enabled;
+        public uint64 smart_updated;
+        public bool smart_failing;
+        public double smart_temperature;
+        public uint64 smart_power_on_seconds;
+        public int smart_attributes_failing = -1;
+        public int smart_attributes_failed_past = -1;
+        public int64 smart_bad_sectors = -1;
+        public string smart_selftest_status = "";
+        public int smart_selftest_remaining = -1;
+        public string[] nvme_warnings = {};
+        public uint64 nvme_power_on_hours;
+        public uint16 nvme_temperature;
 
         public StorageBlock[] blocks = {};
         public StorageBlock? medium;
@@ -35,6 +48,32 @@ namespace MajorisDisks {
         public StorageDrive (string path) {
             base (path);
         }
+    }
+
+    public class StorageHealthAttribute : Object {
+        public uint id;
+        public string name = "";
+        public string raw = "";
+        public int normalized = -1;
+        public int worst = -1;
+        public int threshold = -1;
+        public string assessment = "Unknown";
+        public string description = "";
+    }
+
+    public class StorageHealthReport : Object {
+        public bool nvme;
+        public string overall = "Unknown";
+        public string temperature = "Unknown";
+        public uint64 updated;
+        public uint64 power_on_hours;
+        public string selftest = "Unknown";
+        public int selftest_remaining = -1;
+        public string[] warnings = {};
+        public uint64 media_errors;
+        public uint64 unsafe_shutdowns;
+        public uint64 error_log_entries;
+        public StorageHealthAttribute[] attributes = {};
     }
 
     public class StorageBlock : StorageDevice {
@@ -70,6 +109,7 @@ namespace MajorisDisks {
         public StorageLoopDevice? loop;
         public StorageMountConfiguration? mount_configuration;
         public StorageMountConfiguration[] mount_configurations = {};
+        public StorageEncryptionConfiguration? encryption_configuration;
 
         public StorageBlock (string path) {
             base (path);
@@ -79,6 +119,14 @@ namespace MajorisDisks {
     public class StorageMountConfiguration : Object {
         public string device = ""; public string directory = ""; public string filesystem = "auto";
         public string options = "defaults"; public Variant? backend_item;
+    }
+
+    public class StorageEncryptionConfiguration : Object {
+        public string device = "";
+        public string name = "";
+        public string options = "";
+        public string passphrase_path = "";
+        public Variant? backend_item;
     }
 
     public class StoragePartitionTable : Object {

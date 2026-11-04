@@ -85,6 +85,22 @@ namespace MajorisDisks {
             drive.ejectable = property (object_proxy, "Drive", "Ejectable")?.get_boolean () ?? false;
             drive.available = property (object_proxy, "Drive", "MediaAvailable")?.get_boolean () ?? false;
             drive.smart = property (object_proxy, "Drive.Ata", "SmartSupported")?.get_boolean () ?? false;
+            drive.smart_enabled = property (object_proxy, "Drive.Ata", "SmartEnabled")?.get_boolean () ?? false;
+            drive.smart_updated = property (object_proxy, "Drive.Ata", "SmartUpdated")?.get_uint64 () ??
+                property (object_proxy, "NVMe.Controller", "SmartUpdated")?.get_uint64 () ?? 0;
+            drive.smart_failing = property (object_proxy, "Drive.Ata", "SmartFailing")?.get_boolean () ?? false;
+            drive.smart_temperature = property (object_proxy, "Drive.Ata", "SmartTemperature")?.get_double () ?? 0.0;
+            drive.smart_power_on_seconds = property (object_proxy, "Drive.Ata", "SmartPowerOnSeconds")?.get_uint64 () ?? 0;
+            drive.smart_attributes_failing = property (object_proxy, "Drive.Ata", "SmartNumAttributesFailing")?.get_int32 () ?? -1;
+            drive.smart_attributes_failed_past = property (object_proxy, "Drive.Ata", "SmartNumAttributesFailedInThePast")?.get_int32 () ?? -1;
+            drive.smart_bad_sectors = property (object_proxy, "Drive.Ata", "SmartNumBadSectors")?.get_int64 () ?? -1;
+            drive.smart_selftest_status = property (object_proxy, "Drive.Ata", "SmartSelftestStatus")?.get_string () ??
+                property (object_proxy, "NVMe.Controller", "SmartSelftestStatus")?.get_string () ?? "";
+            drive.smart_selftest_remaining = property (object_proxy, "Drive.Ata", "SmartSelftestPercentRemaining")?.get_int32 () ??
+                property (object_proxy, "NVMe.Controller", "SmartSelftestPercentRemaining")?.get_int32 () ?? -1;
+            drive.nvme_warnings = property (object_proxy, "NVMe.Controller", "SmartCriticalWarning")?.dup_strv () ?? new string[0];
+            drive.nvme_power_on_hours = property (object_proxy, "NVMe.Controller", "SmartPowerOnHours")?.get_uint64 () ?? 0;
+            drive.nvme_temperature = property (object_proxy, "NVMe.Controller", "SmartTemperature")?.get_uint16 () ?? 0;
             bool optical = property (object_proxy, "Drive", "Optical")?.get_boolean () ?? false;
             var media = property (object_proxy, "Drive", "MediaCompatibility");
             if (media != null) {
@@ -163,10 +179,23 @@ namespace MajorisDisks {
             var config = property (object_proxy, "Block", "Configuration");
             block.mount_configuration = null;
             block.mount_configurations = {};
+            block.encryption_configuration = null;
             if (config != null) {
                 for (size_t i = 0; i < config.n_children (); i++) {
                     var entry = config.get_child_value (i);
-                    if (entry.get_child_value (0).get_string () != "fstab") continue;
+                    string configuration_type = entry.get_child_value (0).get_string ();
+                    if (configuration_type == "crypttab") {
+                        var crypt_details = entry.get_child_value (1);
+                        var encryption_config = new StorageEncryptionConfiguration ();
+                        encryption_config.device = crypt_details.lookup_value ("device", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                        encryption_config.name = crypt_details.lookup_value ("name", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                        encryption_config.options = crypt_details.lookup_value ("options", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                        encryption_config.passphrase_path = crypt_details.lookup_value ("passphrase-path", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                        encryption_config.backend_item = entry;
+                        if (block.encryption_configuration == null) block.encryption_configuration = encryption_config;
+                        continue;
+                    }
+                    if (configuration_type != "fstab") continue;
                     var details = entry.get_child_value (1);
                     var mount_config = new StorageMountConfiguration ();
                     mount_config.device = details.lookup_value ("fsname", VariantType.BYTESTRING)?.get_bytestring () ?? "";
@@ -308,6 +337,85 @@ namespace MajorisDisks {
             if (proxy == null)
                 throw new IOError.NOT_SUPPORTED ("UDisks does not expose the required interface for this volume.");
             return proxy;
+        }
+
+        private DBusProxy require_drive (StorageDrive drive, string iface) throws Error {
+            if (!available ()) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
+            if (snapshot.drives.lookup (drive.path) != drive || !drive.available)
+                throw new IOError.NOT_FOUND ("The drive is no longer available.");
+            var proxy = manager?.get_interface (drive.path, PREFIX + iface) as DBusProxy;
+            if (proxy == null) throw new IOError.NOT_SUPPORTED ("UDisks does not expose this health interface.");
+            return proxy;
+        }
+
+        private static string smart_pretty (int64 value, int unit) {
+            switch (unit) {
+                case 1: return value.to_string ();
+                case 2: return "%.3f s".printf ((double) value / 1000.0);
+                case 3: return value.to_string () + " sectors";
+                case 4: return "%.1f °C".printf ((double) value / 1000.0 - 273.15);
+                default: return "Unknown";
+            }
+        }
+
+        public async StorageHealthReport query_health (StorageDrive drive, bool refresh_data = true) throws Error {
+            bool nvme = drive.nvme_state != "";
+            var proxy = require_drive (drive, nvme ? "NVMe.Controller" : "Drive.Ata");
+            if (!nvme && !drive.smart) throw new IOError.NOT_SUPPORTED ("This drive does not report ATA SMART data.");
+            if (refresh_data) {
+                var update_options = new VariantBuilder (new VariantType ("a{sv}"));
+                if (!nvme) update_options.add ("{sv}", "nowakeup", new Variant.boolean (true));
+                try { yield proxy.call ("SmartUpdate", new Variant.tuple ({ update_options.end () }),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime); }
+                catch (Error error) {
+                    string? remote = DBusError.get_remote_error (error);
+                    if (remote == null || !remote.has_suffix (".WouldWakeup")) throw error;
+                }
+                synchronize ();
+            }
+            var report = new StorageHealthReport (); report.nvme = nvme;
+            report.updated = drive.smart_updated;
+            report.selftest = drive.smart_selftest_status == "" ? "Unknown" : drive.smart_selftest_status;
+            report.selftest_remaining = drive.smart_selftest_remaining;
+            if (nvme) {
+                report.warnings = drive.nvme_warnings; report.power_on_hours = drive.nvme_power_on_hours;
+                report.temperature = drive.nvme_temperature == 0 ? "Unknown" :
+                    "%.1f °C".printf ((double) drive.nvme_temperature - 273.15);
+                report.overall = report.warnings.length == 0 ? "Healthy" : "Warning";
+                var options = new VariantBuilder (new VariantType ("a{sv}"));
+                var reply = yield proxy.call ("SmartGetAttributes", new Variant.tuple ({ options.end () }),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                var attributes = reply.get_child_value (0);
+                report.media_errors = attributes.lookup_value ("media_errors", VariantType.UINT64)?.get_uint64 () ?? 0;
+                report.unsafe_shutdowns = attributes.lookup_value ("unsafe_shutdowns", VariantType.UINT64)?.get_uint64 () ?? 0;
+                report.error_log_entries = attributes.lookup_value ("num_err_log_entries", VariantType.UINT64)?.get_uint64 () ?? 0;
+                return report;
+            }
+            report.power_on_hours = drive.smart_power_on_seconds / 3600;
+            report.temperature = drive.smart_temperature <= 0 ? "Unknown" :
+                "%.1f °C".printf (drive.smart_temperature - 273.15);
+            report.overall = drive.smart_failing ? "FAILING" : drive.smart_attributes_failing > 0 ? "Warning" : "Healthy";
+            var get_options = new VariantBuilder (new VariantType ("a{sv}"));
+            get_options.add ("{sv}", "nowakeup", new Variant.boolean (true));
+            var attribute_reply = yield proxy.call ("SmartGetAttributes", new Variant.tuple ({ get_options.end () }),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+            var attribute_array = attribute_reply.get_child_value (0);
+            StorageHealthAttribute[] parsed_attributes = {};
+            for (size_t i = 0; i < attribute_array.n_children (); i++) {
+                var tuple = attribute_array.get_child_value (i); var item = new StorageHealthAttribute ();
+                item.id = tuple.get_child_value (0).get_byte (); item.name = tuple.get_child_value (1).get_string ();
+                uint16 flags = tuple.get_child_value (2).get_uint16 ();
+                item.normalized = tuple.get_child_value (3).get_int32 (); item.worst = tuple.get_child_value (4).get_int32 ();
+                item.threshold = tuple.get_child_value (5).get_int32 ();
+                item.raw = smart_pretty (tuple.get_child_value (6).get_int64 (), tuple.get_child_value (7).get_int32 ());
+                item.assessment = item.normalized < 0 || item.threshold < 0 ? "Unknown" :
+                    item.normalized <= item.threshold ? "Failing" : "OK";
+                item.description = ((flags & 1) != 0 ? "Pre-failure" : "Old-age") +
+                    ((flags & 2) != 0 ? ", updated online" : ", updated offline");
+                parsed_attributes += item;
+            }
+            report.attributes = parsed_attributes;
+            return report;
         }
 
         public string modification_identity (StorageBlock block) {
@@ -1255,12 +1363,17 @@ namespace MajorisDisks {
             finally { locks.release (block); }
         }
         public async StorageOperationResult unlock_volume (StorageBlock block, string passphrase,
-            string confirmed_identity) throws Error {
+            string confirmed_identity, uint32 pim = 0, bool hidden = false, bool system = false,
+            string[] keyfiles = {}) throws Error {
             if (block.encrypted == null)
                 throw new IOError.NOT_SUPPORTED ("The selected volume is not exposed as encrypted storage by UDisks.");
             if (block.encrypted.mapping != null)
                 throw new IOError.EXISTS ("The encrypted volume is already unlocked.");
-            if (passphrase == "") throw new IOError.INVALID_ARGUMENT ("Enter the encryption passphrase.");
+            bool veracrypt = block.type_id == "crypto_TCRYPT" || block.type_id == "crypto_unknown";
+            if (passphrase == "" && keyfiles.length == 0)
+                throw new IOError.INVALID_ARGUMENT ("Enter a passphrase or select a supported keyfile.");
+            if (!veracrypt && (pim != 0 || hidden || system || keyfiles.length != 0))
+                throw new IOError.NOT_SUPPORTED ("VeraCrypt options are not supported for this encrypted volume.");
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The encrypted volume changed before it could be unlocked.");
             var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.MOUNT,
@@ -1275,6 +1388,13 @@ namespace MajorisDisks {
                 if (modification_identity (block) != confirmed_identity || block.encrypted?.mapping != null)
                     throw new IOError.NOT_FOUND ("The encrypted volume changed before the unlock request was sent.");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
+                if (pim != 0) options.add ("{sv}", "pim", new Variant.uint32 (pim));
+                if (hidden) {
+                    options.add ("{sv}", "hidden", new Variant.boolean (true));
+                    options.add ("{sv}", "read-only", new Variant.boolean (true));
+                }
+                if (system) options.add ("{sv}", "system", new Variant.boolean (true));
+                if (keyfiles.length != 0) options.add ("{sv}", "keyfiles", new Variant.strv (keyfiles));
                 var reply = yield require_volume (block, "Encrypted").call ("Unlock",
                     new Variant ("(s@a{sv})", passphrase, options.end ()),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
@@ -1395,6 +1515,105 @@ namespace MajorisDisks {
                 jobs.finish (job, result);
             } catch (Error error) {
                 result.fail ("The encryption passphrase was not changed", error); jobs.finish (job, result); throw error;
+            } finally { locks.release (block); }
+        }
+        private static StorageEncryptionConfiguration? encryption_configuration_from (Variant configuration) {
+            for (size_t i = 0; i < configuration.n_children (); i++) {
+                var entry = configuration.get_child_value (i);
+                if (entry.get_child_value (0).get_string () != "crypttab") continue;
+                var details = entry.get_child_value (1);
+                var result = new StorageEncryptionConfiguration ();
+                result.device = details.lookup_value ("device", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                result.name = details.lookup_value ("name", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                result.options = details.lookup_value ("options", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                result.passphrase_path = details.lookup_value ("passphrase-path", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                result.backend_item = entry;
+                return result;
+            }
+            return null;
+        }
+
+        public async StorageEncryptionConfiguration? secret_encryption_configuration (StorageBlock block) throws Error {
+            if (block.encrypted == null || block.uuid == "")
+                throw new IOError.NOT_SUPPORTED ("Persistent encryption configuration is unavailable.");
+            if (block.encryption_configuration == null || block.encryption_configuration.passphrase_path == "" ||
+                block.encryption_configuration.passphrase_path.has_prefix ("/dev/"))
+                return block.encryption_configuration;
+            var options = new VariantBuilder (new VariantType ("a{sv}"));
+            var reply = yield require_volume (block, "Block").call ("GetSecretConfiguration",
+                new Variant.tuple ({ options.end () }), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
+                int.MAX, backend_lifetime);
+            return encryption_configuration_from (reply.get_child_value (0));
+        }
+
+        public async void configure_encryption (StorageBlock block, bool enabled, bool startup,
+            string mapping_name, string crypt_options, string new_passphrase, Variant? original_item,
+            string confirmed_identity, string confirmed_uuid) throws Error {
+            if (block.encrypted == null || block.uuid == "" || block.read_only || block.system_hint)
+                throw new IOError.NOT_SUPPORTED ("Persistent encryption configuration is unavailable for this volume.");
+            if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
+                throw new IOError.NOT_FOUND ("The encrypted volume changed after the dialog was opened.");
+            string name = mapping_name.strip ();
+            if (enabled && (name == "" || name.contains ("/") || name.contains (",") ||
+                name.contains (" ") || name.contains ("\n") || name.contains ("\r")))
+                throw new IOError.INVALID_ARGUMENT ("The mapping name is invalid.");
+            string normalized = MountOptionService.normalize (crypt_options, startup);
+            foreach (var option in MountOptionService.parse (normalized))
+                if (option.has_prefix ("x-gvfs-") || option.has_prefix ("subvol") || option.has_prefix ("compress"))
+                    throw new IOError.INVALID_ARGUMENT ("The option ‘%s’ is not valid in crypttab.".printf (option));
+            foreach (var candidate in snapshot.blocks.get_values ()) {
+                var saved = candidate.encryption_configuration;
+                if (!enabled || saved == null) continue;
+                bool selected = original_item != null && saved.backend_item != null && saved.backend_item.equal (original_item);
+                if (!selected && saved.name == name)
+                    throw new IOError.EXISTS ("Another encrypted volume already uses this mapping name.");
+            }
+            var details = new VariantBuilder (new VariantType ("a{sv}"));
+            details.add ("{sv}", "device", new Variant.bytestring ("UUID=" + block.uuid));
+            details.add ("{sv}", "name", new Variant.bytestring (name));
+            details.add ("{sv}", "options", new Variant.bytestring (normalized));
+            string old_path = ""; string old_secret = "";
+            if (original_item != null) {
+                var old_details = original_item.get_child_value (1);
+                old_path = old_details.lookup_value ("passphrase-path", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                old_secret = old_details.lookup_value ("passphrase-contents", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+            }
+            string secret_value = new_passphrase == "" ? old_secret : new_passphrase;
+            string secret_path = secret_value == "" ? "" : old_path == "" ? "/etc/luks-keys/" + name : old_path;
+            details.add ("{sv}", "passphrase-path", new Variant.bytestring (secret_path));
+            details.add ("{sv}", "passphrase-contents", new Variant.bytestring (secret_value));
+            var item = new Variant.tuple ({ new Variant.string ("crypttab"), details.end () });
+            var call_options = new VariantBuilder (new VariantType ("a{sv}"));
+            var proxy = require_volume (block, "Block");
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin (enabled ? "Configure automatic unlocking" : "Remove automatic unlocking", block,
+                snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            try {
+                jobs.phase (job, StorageJobState.RUNNING, "Updating protected encryption configuration");
+                if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
+                    throw new IOError.NOT_FOUND ("The encrypted volume changed immediately before the configuration write.");
+                if (!enabled && original_item != null)
+                    yield proxy.call ("RemoveConfigurationItem", new Variant.tuple ({ original_item, call_options.end () }),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                else if (enabled && original_item != null)
+                    yield proxy.call ("UpdateConfigurationItem", new Variant.tuple ({ original_item, item, call_options.end () }),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                else if (enabled)
+                    yield proxy.call ("AddConfigurationItem", new Variant.tuple ({ item, call_options.end () }),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                bool verified = false;
+                for (int attempt = 0; attempt < 50 && !verified; attempt++) {
+                    synchronize (); var saved = block.encryption_configuration;
+                    verified = !enabled ? saved == null : saved != null && saved.device == "UUID=" + block.uuid &&
+                        saved.name == name && saved.options == normalized && saved.passphrase_path == secret_path;
+                    if (!verified) yield settle_delay (backend_lifetime);
+                }
+                if (!verified) throw new IOError.FAILED ("UDisks did not publish the requested crypttab configuration.");
+                result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
+                result.summary = "Encryption configuration updated"; jobs.finish (job, result);
+            } catch (Error error) {
+                result.fail ("Encryption configuration was not updated", error); jobs.finish (job, result); throw error;
             } finally { locks.release (block); }
         }
         public async void volume_action (StorageBlock block, string method) throws Error {

@@ -5,6 +5,10 @@
     <property name="extra-child">
       <object class="AdwPreferencesGroup">
         <child><object class="AdwPasswordEntryRow" id="secret"><property name="title">Passphrase</property><property name="show-apply-button">false</property></object></child>
+        <child><object class="AdwEntryRow" id="pim"><property name="title">VeraCrypt PIM (optional)</property><property name="visible">false</property><property name="input-purpose">digits</property></object></child>
+        <child><object class="AdwSwitchRow" id="hidden_volume"><property name="title">Hidden volume</property><property name="subtitle">Hidden volumes are opened read-only for protection</property><property name="visible">false</property></object></child>
+        <child><object class="AdwSwitchRow" id="system_volume"><property name="title">VeraCrypt system volume</property><property name="visible">false</property></object></child>
+        <child><object class="AdwActionRow" id="keyfile_row"><property name="title">VeraCrypt keyfile</property><property name="subtitle">None selected</property><property name="visible">false</property><child type="suffix"><object class="GtkButton" id="choose_keyfile"><property name="label">Choose…</property><property name="valign">center</property></object></child></object></child>
       </object>
     </property>
     <responses>

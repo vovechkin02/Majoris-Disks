@@ -27,5 +27,7 @@
     <file>ui/unlock-volume-dialog.ui</file>
     <file>ui/lock-volume-confirmation-dialog.ui</file>
     <file>ui/change-passphrase-dialog.ui</file>
+    <file>ui/encryption-options-dialog.ui</file>
+    <file>ui/smart-dialog.ui</file>
   </gresource>
 </gresources>
