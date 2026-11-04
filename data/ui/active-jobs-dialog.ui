@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksActiveJobsDialog" parent="AdwAlertDialog">
+    <property name="heading">Storage operations are still active</property>
+    <property name="body">Closing Disks interrupts application-managed multi-step workflows. Operations already running entirely in UDisks may continue without this window.</property>
+    <responses>
+      <response id="stay" appearance="suggested">Keep Disks Open</response>
+      <response id="close" appearance="destructive">Close Anyway</response>
+    </responses>
+    <property name="default-response">stay</property><property name="close-response">stay</property>
+  </template>
+</interface>

@@ -2,4 +2,5 @@
 <interface><template class="MajorisDisksJobsPopover" parent="GtkPopover"><property name="child"><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">6</property>
   <child><object class="GtkLabel"><property name="label">Storage Jobs</property><property name="xalign">0</property><style><class name="heading"/></style></object></child>
   <child><object class="GtkListBox" id="rows"><property name="selection-mode">none</property><style><class name="boxed-list"/></style></object></child>
+  <child><object class="GtkLabel" id="empty"><property name="label">No storage jobs yet</property><property name="xalign">0</property></object></child>
 </object></property></template></interface>

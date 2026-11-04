@@ -20,6 +20,13 @@ namespace MajorisDisks {
         private GenericArray<StoragePreparationEntry> records = new GenericArray<StoragePreparationEntry> ();
         public bool operation_started;
         public bool operation_completed;
+        public bool backend_invoked;
+        public bool backend_returned;
+        public bool storage_state_changed;
+        public bool identity_changed;
+        public bool original_state_valid = true;
+        public bool restoration_attempted;
+        public bool restoration_succeeded;
 
         public void add (StoragePreparationEntry entry) { records.add (entry); }
         public StoragePreparationEntry[] entries () {
@@ -233,9 +240,20 @@ namespace MajorisDisks {
     }
 
     public class StorageJobManager : Object {
+        private const uint RETENTION_LIMIT = 50;
         public ListStore jobs { get; private set; default = new ListStore (typeof (StorageJob)); }
         private uint64 serial;
         public signal void changed ();
+        public uint active_count () {
+            uint count = 0;
+            for (uint i = 0; i < jobs.get_n_items (); i++) {
+                var state = ((StorageJob) jobs.get_item (i)).state;
+                if (state == StorageJobState.PENDING || state == StorageJobState.PREPARING ||
+                    state == StorageJobState.RUNNING || state == StorageJobState.CANCELLING ||
+                    state == StorageJobState.FINALIZING) count++;
+            }
+            return count;
+        }
 
         public StorageJob begin (string operation, StorageBlock target, StorageDependencyService graph) {
             string[] affected = {};
@@ -262,6 +280,7 @@ namespace MajorisDisks {
                 result.status == StorageOperationStatus.NEEDS_ATTENTION ? StorageJobState.NEEDS_ATTENTION :
                 result.status == StorageOperationStatus.PARTIAL ? StorageJobState.PARTIALLY_COMPLETED : StorageJobState.FAILED;
             job.phase = result.summary;
+            prune ();
             changed ();
         }
 
@@ -286,6 +305,36 @@ namespace MajorisDisks {
             match.progress_valid = valid;
             match.cancelable = cancelable;
             changed ();
+        }
+
+        public void backend_completed (string path, bool successful, string message) {
+            for (uint i = 0; i < jobs.get_n_items (); i++) {
+                var job = jobs.get_item (i) as StorageJob;
+                if (job.backend_path != path) continue;
+                job.state = successful ? StorageJobState.COMPLETED : StorageJobState.FAILED;
+                job.phase = message == "" ? (successful ? "Completed" : "Failed") : message;
+                job.error_message = successful ? "" : message;
+                job.progress = successful ? 1.0 : job.progress;
+                job.progress_valid = successful;
+                prune (); changed (); return;
+            }
+        }
+
+        private void prune () {
+            while (jobs.get_n_items () > RETENTION_LIMIT) {
+                int candidate = -1;
+                for (uint i = 0; i < jobs.get_n_items (); i++) {
+                    var state = ((StorageJob) jobs.get_item (i)).state;
+                    bool terminal = state == StorageJobState.COMPLETED || state == StorageJobState.CANCELLED ||
+                        state == StorageJobState.FAILED || state == StorageJobState.PARTIALLY_COMPLETED ||
+                        state == StorageJobState.NEEDS_ATTENTION;
+                    if (!terminal) continue;
+                    if (candidate < 0) candidate = (int) i;
+                    if (state == StorageJobState.COMPLETED) { candidate = (int) i; break; }
+                }
+                if (candidate < 0) return;
+                jobs.remove ((uint) candidate);
+            }
         }
 
         public void backend_removed (string path) {

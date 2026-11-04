@@ -12,6 +12,7 @@ namespace MajorisDisks {
         private UDisksService backend = new UDisksService ();
         private string selected = "";
         private bool updating;
+        private bool close_confirmed;
         private HashTable<string, StorageBlock> pending = new HashTable<string, StorageBlock> (str_hash, str_equal);
 
         static construct {
@@ -96,6 +97,15 @@ namespace MajorisDisks {
             });
             drive_view.open_failed.connect (() => notifications.add_toast (new Adw.Toast ("Could not open the mount point")));
             refresh_button.clicked.connect (refresh);
+            close_request.connect (() => {
+                if (close_confirmed || backend.jobs.active_count () == 0) return false;
+                var warning = new ActiveJobsDialog ();
+                warning.response.connect ((response) => {
+                    if (response == "close") { close_confirmed = true; close (); }
+                });
+                warning.present (this);
+                return true;
+            });
             refresh ();
         }
 
@@ -346,6 +356,9 @@ namespace MajorisDisks {
             states.visible_child = drive_view;
         }
     }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/active-jobs-dialog.ui")]
+    public class ActiveJobsDialog : Adw.AlertDialog {}
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/sidebar-group-heading.ui")]
     public class SidebarGroupHeading : Gtk.Box {
@@ -806,10 +819,12 @@ namespace MajorisDisks {
     [GtkTemplate (ui = "/com/majoris/disks/ui/jobs-popover.ui")]
     public class JobsPopover : Gtk.Popover {
         [GtkChild] private unowned Gtk.ListBox rows;
+        [GtkChild] private unowned Gtk.Label empty;
         private UDisksService backend;
         public JobsPopover (UDisksService backend) { this.backend = backend; }
         public void update () {
             uint count = backend.jobs.jobs.get_n_items ();
+            empty.visible = count == 0; rows.visible = count != 0;
             for (uint i = 0; i < count; i++) {
                 var job = backend.jobs.jobs.get_item (i) as StorageJob;
                 var row = rows.get_row_at_index ((int) i) as JobRow;

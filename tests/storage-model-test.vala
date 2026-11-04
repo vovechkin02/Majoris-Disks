@@ -397,6 +397,10 @@ private void test_minimum_size_parsers () {
     } catch (Error error) { assert_not_reached (); }
     try { FilesystemMinimumSizeService.parse_first_number ("not available"); assert_not_reached (); }
     catch (Error error) { assert (error is IOError.INVALID_DATA); }
+    assert (FilesystemMinimumSizeService.btrfs_single_device (
+        "devid    1 size 1 path /dev/test1", "/dev/test1"));
+    assert (!FilesystemMinimumSizeService.btrfs_single_device (
+        "devid 1 path /dev/test1\ndevid 2 path /dev/test2", "/dev/test1"));
 }
 
 private void test_preparation_journal () {
@@ -438,6 +442,17 @@ private void test_operation_terminal_states () {
     var uncertain = manager.begin ("Test", block, graph); var outcome = new StorageOperationResult ();
     outcome.status = StorageOperationStatus.NEEDS_ATTENTION; outcome.summary = "Unknown";
     manager.finish (uncertain, outcome); assert (uncertain.state == StorageJobState.NEEDS_ATTENTION);
+}
+
+private void test_job_retention () {
+    var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
+    var block = new StorageBlock ("/retained"); block.preferred = "/dev/retained";
+    for (int i = 0; i < 60; i++) {
+        var job = manager.begin ("Completed", block, graph);
+        var result = new StorageOperationResult (); result.successful = true; result.summary = "Completed";
+        manager.finish (job, result);
+    }
+    assert (manager.jobs.get_n_items () == 50 && manager.active_count () == 0);
 }
 
 private void test_job_correlation () {
@@ -507,6 +522,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);
     Test.add_func ("/operations/create-active-dependency", test_create_partition_active_dependency);
     Test.add_func ("/operations/terminal-states", test_operation_terminal_states);
+    Test.add_func ("/operations/job-retention", test_job_retention);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     return Test.run ();
 }

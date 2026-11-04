@@ -194,6 +194,9 @@ namespace MajorisDisks {
                 eligibility.blocked = true; eligibility.reason = "The selected device is read-only.";
             } else if (assessment.system_critical && destructive && operation != StorageOperationKind.CREATE_PARTITION) {
                 eligibility.blocked = true; eligibility.reason = "The operation could affect the running system.";
+            } else if (assessment.system_critical && (operation == StorageOperationKind.EDIT_PARTITION ||
+                operation == StorageOperationKind.EDIT_FILESYSTEM_LABEL || operation == StorageOperationKind.TAKE_OWNERSHIP)) {
+                eligibility.blocked = true; eligibility.reason = "Metadata changes are blocked on storage used by the running system.";
             } else if (assessment.active_dependents && destructive) {
                 eligibility.requires_preparation = true;
                 eligibility.preparation = { "Deactivate dependent mounts, swap, mappings, RAID, and logical volumes" };

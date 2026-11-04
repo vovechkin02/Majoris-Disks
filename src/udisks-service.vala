@@ -8,6 +8,7 @@ namespace MajorisDisks {
         private FilesystemMinimumSizeService minimum_sizes = new FilesystemMinimumSizeService ();
         public StorageJobManager jobs { get; private set; default = new StorageJobManager (); }
         private HashTable<string, string> observed_jobs = new HashTable<string, string> (str_hash, str_equal);
+        private HashTable<string, string> connected_jobs = new HashTable<string, string> (str_hash, str_equal);
         private string? owner;
         private Cancellable backend_lifetime = new Cancellable ();
         public StorageSnapshot snapshot = new StorageSnapshot ();
@@ -268,9 +269,19 @@ namespace MajorisDisks {
                 bool valid = proxy.get_cached_property ("ProgressValid")?.get_boolean () ?? false;
                 bool cancelable = proxy.get_cached_property ("Cancelable")?.get_boolean () ?? false;
                 uint64 start = proxy.get_cached_property ("StartTime")?.get_uint64 () ?? 0;
+                if (!connected_jobs.contains (path)) {
+                    connected_jobs.insert (path, path);
+                    string captured = path;
+                    proxy.g_signal.connect ((sender, signal_name, parameters) => {
+                        if (signal_name != "Completed" || !parameters.is_of_type (new VariantType ("(bs)"))) return;
+                        jobs.backend_completed (captured, parameters.get_child_value (0).get_boolean (),
+                            parameters.get_child_value (1).get_string ());
+                    });
+                }
                 jobs.observe (path, operation, objects, progress, valid, cancelable, start);
             }
             foreach (var path in observed_jobs.get_keys ()) if (!current.contains (path)) jobs.backend_removed (path);
+            foreach (var path in connected_jobs.get_keys ()) if (!current.contains (path)) connected_jobs.remove (path);
             observed_jobs = current;
         }
 
@@ -368,6 +379,8 @@ namespace MajorisDisks {
             var job = jobs.begin (job_name, block, snapshot.dependencies);
             var operation_result = new StorageOperationResult ();
             var preparation = new StoragePreparationJournal ();
+            string original_uuid = block.uuid; string original_type = block.type_id;
+            uint64 original_size = block.size; string original_table = block.table?.scheme ?? "";
             try {
                 if (destructive) {
                     jobs.phase (job, StorageJobState.PREPARING, "Preparing affected storage");
@@ -436,18 +449,34 @@ namespace MajorisDisks {
                     new Variant.tuple ({ new Variant.string (rename ? label : format), options.end () });
                 jobs.phase (job, StorageJobState.RUNNING, job_name);
                 preparation.operation_started = true;
+                preparation.backend_invoked = true;
                 yield proxy.call (ownership ? "TakeOwnership" : rename ? "SetLabel" : deleting ? "Delete" : "Format", parameters,
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
+                preparation.backend_returned = true;
                 synchronize ();
+                preparation.storage_state_changed = deleting || formatting || format == "gpt" || format == "dos" || format == "empty";
+                preparation.operation_completed = true;
                 minimum_sizes.invalidate (block.path);
                 operation_result.completed (job_name);
                 operation_result.successful = true; operation_result.summary = job_name + " completed";
                 jobs.finish (job, operation_result);
             } catch (Error error) {
                 string restore_error = "";
-                if (!preparation.operation_started && !preparation.fully_restored ()) {
+                synchronize ();
+                var current = snapshot.blocks.lookup (block.path);
+                preparation.identity_changed = current != block || !block.available || block.size != original_size ||
+                    block.uuid != original_uuid || block.type_id != original_type || (block.table?.scheme ?? "") != original_table;
+                preparation.storage_state_changed = preparation.storage_state_changed || preparation.identity_changed;
+                string? remote_error = DBusError.get_remote_error (error);
+                bool rejected_before_write = !preparation.backend_invoked || remote_error != null &&
+                    (remote_error.contains ("NotAuthorized") || remote_error.has_suffix (".AccessDenied") ||
+                     remote_error.has_suffix (".NotSupported") || remote_error.has_suffix (".OptionNotPermitted"));
+                preparation.original_state_valid = !preparation.identity_changed && rejected_before_write;
+                if (preparation.original_state_valid && !preparation.fully_restored ()) {
+                    preparation.restoration_attempted = true;
                     try { yield restore_preparation (preparation, backend_lifetime); }
                     catch (Error restoration) { restore_error = restoration.message; }
+                    preparation.restoration_succeeded = restore_error == "";
                 }
                 operation_result.fail (job_name + " failed", error);
                 if (restore_error != "") {
@@ -581,7 +610,12 @@ namespace MajorisDisks {
                         foreach (var mount in block.filesystem.mounts) state += mount;
                         var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, block.path, state, "unmount");
                         journal.add (entry);
-                        entry.prepared = yield prepare_unmounted (block, token);
+                        try { entry.prepared = yield prepare_unmounted (block, token); }
+                        catch (Error error) {
+                            synchronize ();
+                            entry.prepared = block.filesystem != null && !block.filesystem.mounted;
+                            throw error;
+                        }
                     }
                     if (block.swap_active) {
                         var entry = new StoragePreparationEntry (StoragePreparationKind.SWAP, block.path,
@@ -591,8 +625,10 @@ namespace MajorisDisks {
                         var options = new VariantBuilder (new VariantType ("a{sv}"));
                         yield swap.call ("Stop", new Variant.tuple ({ options.end () }),
                             DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
-                        synchronize ();
-                        if (block.swap_active) throw new IOError.FAILED ("Swap remained active after UDisks returned.");
+                        for (int attempt = 0; attempt < 50 && block.swap_active; attempt++) {
+                            synchronize (); if (block.swap_active) yield settle_delay (token);
+                        }
+                        if (block.swap_active) throw new IOError.TIMED_OUT ("Swap remained active after UDisks returned.");
                         entry.prepared = true;
                     }
                 }
@@ -917,26 +953,41 @@ namespace MajorisDisks {
             var result = new StorageOperationResult ();
             var job = jobs.begin ("Edit partition", block, snapshot.dependencies);
             var token = job.cancellable;
+            string partition_uuid = part.uuid; uint64 partition_offset = part.offset;
+            uint64 device_number = block.number; string expected_type = part.type_id;
+            string expected_name = part.name; uint64 expected_flags = part.flags;
             try {
                 var proxy = require_volume (block, "Partition");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
                 jobs.phase (job, StorageJobState.RUNNING, "Updating partition metadata");
                 if (type != part.type_id) {
+                    validate_metadata_target (block, disk, partition_uuid, partition_offset, device_number,
+                        expected_type, expected_name, expected_flags);
                     yield proxy.call ("SetType", new Variant.tuple ({ new Variant.string (type), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed ("Partition type updated");
+                    expected_type = type;
+                    yield wait_for_metadata (block, expected_type, expected_name, expected_flags, token);
                     options = new VariantBuilder (new VariantType ("a{sv}"));
                 }
                 if (scheme == "gpt" && name != part.name) {
+                    validate_metadata_target (block, disk, partition_uuid, partition_offset, device_number,
+                        expected_type, expected_name, expected_flags);
                     yield proxy.call ("SetName", new Variant.tuple ({ new Variant.string (name), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed ("Partition name updated");
+                    expected_name = name;
+                    yield wait_for_metadata (block, expected_type, expected_name, expected_flags, token);
                     options = new VariantBuilder (new VariantType ("a{sv}"));
                 }
                 if (flags != part.flags) {
+                    validate_metadata_target (block, disk, partition_uuid, partition_offset, device_number,
+                        expected_type, expected_name, expected_flags);
                     yield proxy.call ("SetFlags", new Variant.tuple ({ new Variant.uint64 (flags), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed ("Partition flags updated");
+                    expected_flags = flags;
+                    yield wait_for_metadata (block, expected_type, expected_name, expected_flags, token);
                 }
                 synchronize ();
                 result.successful = true;
@@ -953,6 +1004,31 @@ namespace MajorisDisks {
             } finally {
                 locks.release (block);
             }
+        }
+
+        private void validate_metadata_target (StorageBlock block, StorageBlock disk, string uuid,
+            uint64 offset, uint64 number, string expected_type, string expected_name, uint64 expected_flags) throws Error {
+            var part = block.partition;
+            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.EDIT_PARTITION,
+                block, snapshot.dependencies);
+            if (!eligibility.allowed || eligibility.unknown || eligibility.requires_preparation ||
+                snapshot.blocks.lookup (block.path) != block || !block.available || block.read_only ||
+                part == null || snapshot.blocks.lookup (part.table_path) != disk || part.uuid != uuid ||
+                part.offset != offset || block.number != number || part.type_id != expected_type ||
+                part.name != expected_name || part.flags != expected_flags)
+                throw new IOError.NOT_FOUND (eligibility.reason == "" ?
+                    "The partition identity, geometry, or metadata changed unexpectedly." : eligibility.reason);
+        }
+
+        private async void wait_for_metadata (StorageBlock block, string type, string name, uint64 flags,
+            Cancellable token) throws Error {
+            for (int attempt = 0; attempt < 50; attempt++) {
+                synchronize ();
+                var part = block.partition;
+                if (part != null && part.type_id == type && part.name == name && part.flags == flags) return;
+                yield settle_delay (token);
+            }
+            throw new IOError.TIMED_OUT ("UDisks did not publish the updated partition metadata.");
         }
 
         public async void cancel_job (StorageJob job) throws Error {

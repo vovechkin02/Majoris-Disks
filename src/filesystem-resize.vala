@@ -52,6 +52,9 @@ namespace MajorisDisks {
                     var fs = block.filesystem;
                     if (fs == null || !fs.mounted)
                         throw new IOError.NOT_SUPPORTED ("Btrfs minimum size can only be queried while mounted.");
+                    string topology = yield run ({ "btrfs", "filesystem", "show", "--raw", fs.mounts[0] }, token);
+                    if (!btrfs_single_device (topology, block.preferred))
+                        throw new IOError.NOT_SUPPORTED ("Automatic Btrfs member shrinking is limited to verified single-device filesystems.");
                     minimum = validated_boundary (parse_first_number (yield run ({ "btrfs", "inspect-internal", "min-dev-size", fs.mounts[0] }, token)), block, false);
                     break;
                 default:
@@ -61,6 +64,12 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_DATA ("The filesystem minimum-size backend returned an unsafe value.");
             var entry = new CacheEntry (); entry.size = minimum; cache.insert (key, entry);
             return minimum;
+        }
+
+        public static bool btrfs_single_device (string output, string device) {
+            int devices = 0;
+            foreach (var line in output.split ("\n")) if (line.strip ().has_prefix ("devid")) devices++;
+            return devices == 1 && output.contains (device);
         }
 
         private static uint64 validated_boundary (uint64 reported, StorageBlock block, bool estimate) throws Error {
