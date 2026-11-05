@@ -538,22 +538,24 @@ namespace MajorisDisks {
             if (target == null) throw new IOError.NOT_FOUND ("The drive has no available media.");
             var proxy = require_drive (drive, nvme ? "NVMe.Controller" : "Drive.Ata");
             locks.acquire (target, snapshot.dependencies);
-            var existing = active_selftests.lookup (drive.path);
-            if (!stop && existing != null) throw new IOError.BUSY ("A self-test is already active for this drive.");
-            if (stop && existing == null) throw new IOError.NOT_FOUND ("No tracked self-test is running for this drive.");
-            var job = stop ? existing.job : jobs.begin (
-                stop ? "Stop drive self-test" : "Drive self-test", target, snapshot.dependencies);
-            var result = new StorageOperationResult ();
-            SelftestOperation operation;
-            if (stop) operation = existing;
-            else {
-                operation = new SelftestOperation (job, type, drive.smart_selftest_status);
-                active_selftests.insert (drive.path, operation);
-            }
             try {
+                var existing = active_selftests.lookup (drive.path);
+                if (!stop && existing != null) throw new IOError.BUSY ("A self-test is already active for this drive.");
+                if (stop && existing == null) throw new IOError.NOT_FOUND ("No tracked self-test is running for this drive.");
+                var job = stop ? existing.job : jobs.begin (
+                    stop ? "Stop drive self-test" : "Drive self-test", target, snapshot.dependencies);
+                var result = new StorageOperationResult ();
+                SelftestOperation operation;
+                if (stop) operation = existing;
+                else {
+                    operation = new SelftestOperation (job, type, drive.smart_selftest_status);
+                    active_selftests.insert (drive.path, operation);
+                }
+                try {
                 operation.state = stop ? SelftestOperationState.STOPPING : SelftestOperationState.STARTING;
                 jobs.phase (job, StorageJobState.RUNNING, stop ? "Stopping " + operation.type + " self-test" :
                     "Starting " + type + " self-test");
+                jobs.expect_backend (job, "ata-smart-selftest");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
                 if (stop) yield proxy.call ("SmartSelftestAbort", new Variant.tuple ({ options.end () }),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
@@ -583,7 +585,7 @@ namespace MajorisDisks {
                         valid ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0, valid);
                 }
                 maintain_selftest_refresh ();
-            } catch (Error error) {
+                } catch (Error error) {
                 if (stop && drive.smart_selftest_status == "inprogress") {
                     operation.state = SelftestOperationState.RUNNING;
                     jobs.progress (job, operation.type + " self-test in progress",
@@ -599,6 +601,7 @@ namespace MajorisDisks {
                     jobs.finish (job, result);
                 }
                 maintain_selftest_refresh (); throw error;
+                }
             } finally { locks.release (target); }
         }
 
@@ -631,6 +634,8 @@ namespace MajorisDisks {
                     throw new IOError.NOT_FOUND ("The drive identity changed before the hardware action.");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
                 jobs.phase (job, StorageJobState.RUNNING, job.operation);
+                if (eject) jobs.expect_backend (job, "drive-eject");
+                else if (power_off) jobs.expect_backend (job, "drive-power-off");
                 var proxy = require_drive (drive, standby || wake ? "Drive.Ata" : "Drive");
                 yield proxy.call (action, new Variant.tuple ({ options.end () }),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
@@ -703,6 +708,7 @@ namespace MajorisDisks {
             string serial = drive.serial; string wwn = drive.wwn; string path = drive.path;
             locks.acquire_path (path);
             StorageJob? job = null; var result = new StorageOperationResult ();
+            bool request_dispatched = false; bool request_returned = false;
             try {
                 synchronize ();
                 if (snapshot.drives.lookup (path) != drive || drive.serial != serial || drive.wwn != wwn)
@@ -740,8 +746,10 @@ namespace MajorisDisks {
                 var proxy = require_drive (drive, "Drive");
                 job = jobs.begin_named ("Configure drive", drive.name, { path });
                 jobs.phase (job, StorageJobState.RUNNING, "Applying drive settings");
+                request_dispatched = true;
                 yield proxy.call ("SetConfiguration", new Variant.tuple ({ configuration, options.end () }),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                request_returned = true;
                 bool verified = false; Variant actual = current;
                 for (int attempt = 0; attempt < 20 && !verified; attempt++) {
                     synchronize ();
@@ -755,11 +763,21 @@ namespace MajorisDisks {
                         configuration_matches_intent (actual, "ata-read-lookahead-enabled", VariantType.BOOLEAN, read_lookahead_intent, read_expected);
                     if (!verified) yield settle_delay (backend_lifetime);
                 }
-                if (!verified) throw new IOError.FAILED ("UDisks did not retain every requested drive setting.");
+                if (!verified) throw new IOError.TIMED_OUT (
+                    "UDisks accepted the settings, but their persisted readback could not be verified.");
                 result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
                 result.summary = "Drive settings saved"; jobs.finish (job, result);
             } catch (Error error) {
-                result.fail ("Drive settings were not saved", error); if (job != null) jobs.finish (job, result); throw error;
+                result.fail ("Drive settings were not saved", error);
+                string? remote = DBusError.get_remote_error (error);
+                bool confirmed_rejection = remote != null && (remote.contains ("NotAuthorized") ||
+                    remote.has_suffix (".AccessDenied") || remote.has_suffix (".NotSupported"));
+                if (request_dispatched && (request_returned || !confirmed_rejection)) {
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.summary = request_returned ? "Drive settings were accepted but readback is uncertain" :
+                        "The drive-settings outcome is uncertain";
+                }
+                if (job != null) jobs.finish (job, result); throw error;
             } finally { locks.release_path (path); }
         }
 
@@ -855,6 +873,7 @@ namespace MajorisDisks {
             string original_uuid = block.uuid; string original_type = block.type_id;
             uint64 original_size = block.size; string original_table = block.table?.scheme ?? "";
             string original_graph = modification_identity (block);
+            preparation.capture (block);
             try {
                 if (destructive) {
                     jobs.phase (job, StorageJobState.PREPARING, "Preparing affected storage");
@@ -936,11 +955,16 @@ namespace MajorisDisks {
                 var parameters = deleting || ownership ? new Variant.tuple ({ options.end () }) :
                     new Variant.tuple ({ new Variant.string (rename ? label : format), options.end () });
                 jobs.phase (job, StorageJobState.RUNNING, job_name);
+                if (deleting) jobs.expect_backend (job, "partition-delete");
+                else if (formatting || format == "gpt" || format == "dos" || format == "empty")
+                    jobs.expect_backend (job, overwrite ? "format-erase" : "format-mkfs");
                 preparation.operation_started = true;
                 preparation.backend_invoked = true;
+                preparation.destructive_result = "dispatched-result-unknown";
                 yield proxy.call (ownership ? "TakeOwnership" : rename ? "SetLabel" : deleting ? "Delete" : "Format", parameters,
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
                 preparation.backend_returned = true;
+                preparation.destructive_result = "backend-returned-success";
                 synchronize ();
                 if (encrypting) {
                     for (int attempt = 0; attempt < 50 && (block.encrypted == null ||
@@ -970,25 +994,17 @@ namespace MajorisDisks {
                     block.uuid != original_uuid || block.type_id != original_type || (block.table?.scheme ?? "") != original_table;
                 bool graph_unchanged = !preparation.identity_changed && modification_identity (block) == original_graph;
                 preparation.storage_state_changed = preparation.storage_state_changed || !graph_unchanged;
+                // Once a destructive request was dispatched, matching identifiers, geometry, topology,
+                // or a successful consistency check cannot prove the original bytes survived.
                 preparation.original_state_valid = !preparation.backend_invoked && graph_unchanged;
-                if (preparation.backend_invoked && graph_unchanged) {
-                    if (formatting && original_type != "" && block.filesystem != null) {
-                        try {
-                            var check_options = new VariantBuilder (new VariantType ("a{sv}"));
-                            var check_reply = yield require_volume (block, "Filesystem").call ("Check",
-                                new Variant.tuple ({ check_options.end () }),
-                                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
-                            preparation.original_state_valid = check_reply.is_of_type (new VariantType ("(b)")) &&
-                                check_reply.get_child_value (0).get_boolean ();
-                        } catch (Error check_error) {
-                            preparation.original_state_valid = false;
-                        }
-                    } else preparation.original_state_valid = true;
-                }
+                preparation.restoration_eligibility = preparation.original_state_valid ?
+                    "verified-safe-before-dispatch" : preparation.backend_invoked ?
+                    "ineligible-dispatched-outcome-uncertain" : "ineligible-identity-changed";
                 foreach (var entry in preparation.entries ())
                     entry.restoration_allowed = preparation.original_state_valid;
                 if (preparation.original_state_valid && !preparation.fully_restored ()) {
                     preparation.restoration_attempted = true;
+                    preparation.restoration_eligibility = "restoration-attempted";
                     try { yield restore_preparation (preparation, backend_lifetime); }
                     catch (Error restoration) { restore_error = restoration.message; }
                     preparation.restoration_succeeded = restore_error == "";
@@ -1116,6 +1132,7 @@ namespace MajorisDisks {
 
         private async StoragePreparationJournal prepare_for_modification (StorageBlock target, Cancellable token) throws Error {
             var journal = new StoragePreparationJournal ();
+            journal.capture (target);
             var nodes = snapshot.dependencies.descendants (target);
             try {
                 for (int index = nodes.length - 1; index >= 0; index--) {
@@ -1432,25 +1449,37 @@ namespace MajorisDisks {
                     }
                 }
                 synchronize ();
+                bool filesystem_verified = !resize_filesystem;
                 if (resize_filesystem) {
                     uint64 capacity = yield mounted_filesystem_capacity (block, backend_lifetime);
                     if (capacity == 0) {
                         result.actual_state = "UDisks confirmed the resize, but the filesystem was not mounted so its capacity could not be independently measured.";
                     } else {
-                        uint64 tolerance = new_size / 100;
-                        if (tolerance < 16 * 1024 * 1024) tolerance = 16 * 1024 * 1024;
-                        if (capacity > block.size || capacity + tolerance < new_size)
+                        uint64 tolerance = FilesystemResizePlanner.capacity_tolerance (block.type_id,
+                            block.logical_sector_size, block.physical_sector_size);
+                        if (tolerance == 0) {
+                            result.actual_state = "UDisks confirmed the resize, but no authoritative capacity rule is available for " +
+                                (block.type_id == "" ? "this filesystem" : block.type_id) + ".";
+                        } else if (!FilesystemResizePlanner.capacity_matches (block.type_id, capacity,
+                            block.size, new_size, block.logical_sector_size, block.physical_sector_size)) {
                             throw new IOError.FAILED ("The filesystem capacity reported after resizing does not match the requested partition capacity.");
-                        result.actual_state = "Verified filesystem capacity: " + format_size (capacity) +
-                            "; partition capacity: " + format_size (block.size) + ".";
-                        result.completed ("Filesystem capacity verified");
+                        } else {
+                            filesystem_verified = true;
+                            result.actual_state = "Verified filesystem capacity: " + format_size (capacity) +
+                                "; partition capacity: " + format_size (block.size) +
+                                "; maximum format-specific difference: " + format_size (tolerance) + ".";
+                            result.completed ("Filesystem capacity verified");
+                        }
                     }
                 }
                 minimum_sizes.invalidate (block.path);
                 journal.operation_completed = true;
-                result.successful = true;
-                result.summary = resize_filesystem && result.actual_state.has_prefix ("UDisks confirmed") ?
-                    "Volume resized; filesystem capacity verification was unavailable" : "Volume resized";
+                result.successful = filesystem_verified;
+                result.partial = !filesystem_verified;
+                result.status = filesystem_verified ? StorageOperationStatus.SUCCEEDED :
+                    StorageOperationStatus.PARTIAL;
+                result.summary = filesystem_verified ? "Volume resized" :
+                    "Volume resized, but filesystem capacity could not be independently verified";
                 jobs.finish (job, result);
                 select_requested (block.path);
                 return result;

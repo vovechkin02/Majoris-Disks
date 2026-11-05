@@ -134,6 +134,14 @@ namespace MajorisDisks {
 
     public class StoragePreparationJournal : Object {
         private GenericArray<StoragePreparationEntry> records = new GenericArray<StoragePreparationEntry> ();
+        public string original_device_identity = "";
+        public string original_filesystem_identity = "";
+        public string original_partition_geometry = "";
+        public string[] original_mount_points = {};
+        public bool original_mounted;
+        public bool original_swap_active;
+        public string destructive_result = "not-dispatched";
+        public string restoration_eligibility = "unassessed";
         public bool operation_started;
         public bool operation_completed;
         public bool backend_invoked;
@@ -159,6 +167,19 @@ namespace MajorisDisks {
         public bool fully_restored () {
             foreach (var entry in entries ()) if (entry.prepared && !entry.restored) return false;
             return true;
+        }
+
+        public void capture (StorageBlock block) {
+            original_device_identity = new Variant ("(ssssst)", block.path, block.device,
+                block.preferred, block.physical_drive?.serial ?? "", block.physical_drive?.wwn ?? "",
+                block.number).print (false);
+            original_filesystem_identity = new Variant ("(sss)", block.path, block.uuid, block.type_id).print (false);
+            original_partition_geometry = block.partition == null ? "" :
+                new Variant ("(sttt)", block.partition.table_path, block.partition.offset,
+                    block.size, block.number).print (false);
+            original_mount_points = block.filesystem?.mounts ?? new string[0];
+            original_mounted = block.filesystem?.mounted ?? false;
+            original_swap_active = block.swap_active;
         }
     }
 
@@ -358,6 +379,11 @@ namespace MajorisDisks {
         public bool progress_valid { get; set; default = false; }
         public bool cancelable { get; set; default = false; }
         public string backend_path { get; set; default = ""; }
+        public bool local { get; set; default = false; }
+        public string expected_backend_operation { get; set; default = ""; }
+        public bool backend_completed { get; set; default = false; }
+        public bool backend_successful { get; set; default = false; }
+        public bool initiating_method_completed { get; set; default = false; }
         public string error_message { get; set; default = ""; }
         public StorageOperationResult? result { get; set; }
         public Cancellable cancellable { get; private set; default = new Cancellable (); }
@@ -393,6 +419,7 @@ namespace MajorisDisks {
             string[] affected = {};
             foreach (var node in graph.descendants (target)) affected += node.path;
             var job = new StorageJob ((++serial).to_string (), operation, target.preferred, affected);
+            job.local = true;
             jobs.append (job);
             changed ();
             return job;
@@ -400,12 +427,14 @@ namespace MajorisDisks {
 
         public StorageJob begin_named (string operation, string target, string[] affected) {
             var job = new StorageJob ((++serial).to_string (), operation, target, affected);
+            job.local = true;
             jobs.append (job);
             changed ();
             return job;
         }
 
         public void phase (StorageJob job, StorageJobState state, string phase) {
+            if (terminal (job.state)) return;
             job.state = state;
             job.phase = phase;
             changed ();
@@ -421,6 +450,13 @@ namespace MajorisDisks {
         }
 
         public void finish (StorageJob job, StorageOperationResult result) {
+            if (terminal (job.state)) return;
+            job.initiating_method_completed = true;
+            if (job.backend_completed && !job.backend_successful && result.successful) {
+                result.fail ("The backend reported that the operation failed");
+                result.technical_error = job.error_message;
+                result.status = StorageOperationStatus.NEEDS_ATTENTION;
+            }
             job.result = result;
             job.progress = 1.0;
             job.progress_valid = result.successful;
@@ -434,6 +470,24 @@ namespace MajorisDisks {
             changed ();
         }
 
+        public void expect_backend (StorageJob job, string operation) {
+            if (!job.local || terminal (job.state) || job.backend_path != "") return;
+            job.expected_backend_operation = operation;
+        }
+
+        private static bool objects_match (StorageJob job, string[] objects) {
+            if (objects.length == 0 || job.affected.length == 0) return false;
+            bool overlap = false;
+            foreach (var object_path in objects) {
+                bool found = false;
+                foreach (var affected_path in job.affected) if (object_path == affected_path) {
+                    found = true; overlap = true; break;
+                }
+                if (!found) return false;
+            }
+            return overlap;
+        }
+
         public void observe (string path, string operation, string[] objects, double progress,
             bool valid, bool cancelable, uint64 start_time) {
             StorageJob? match = null;
@@ -443,6 +497,20 @@ namespace MajorisDisks {
                     match = candidate;
                     break;
                 }
+            }
+            if (match == null && start_time > 0) {
+                StorageJob? candidate_match = null;
+                for (uint i = 0; i < jobs.get_n_items (); i++) {
+                    var candidate = jobs.get_item (i) as StorageJob;
+                    if (!candidate.local || terminal (candidate.state) || candidate.backend_path != "" ||
+                        candidate.expected_backend_operation != operation || !objects_match (candidate, objects)) continue;
+                    int64 delta = candidate.start_time - (int64) start_time;
+                    if (delta < 0) delta = -delta;
+                    if (delta > 10 * TimeSpan.SECOND) continue;
+                    if (candidate_match != null) { candidate_match = null; break; }
+                    candidate_match = candidate;
+                }
+                match = candidate_match;
             }
             if (match == null) {
                 match = new StorageJob ("udisks:" + path, operation, objects.length == 0 ? "Storage device" : objects[0], objects);
@@ -463,6 +531,14 @@ namespace MajorisDisks {
                 var job = jobs.get_item (i) as StorageJob;
                 if (job.backend_path != path) continue;
                 if (terminal (job.state)) return;
+                job.backend_completed = true; job.backend_successful = successful;
+                job.error_message = successful ? "" : message;
+                if (job.local) {
+                    job.state = StorageJobState.FINALIZING;
+                    job.phase = successful ? "Backend completed; verifying resulting storage" :
+                        "Backend reported failure; reconciling resulting storage";
+                    changed (); return;
+                }
                 job.state = successful ? StorageJobState.COMPLETED : StorageJobState.FAILED;
                 job.phase = message == "" ? (successful ? "Completed" : "Failed") : message;
                 job.error_message = successful ? "" : message;
@@ -493,7 +569,11 @@ namespace MajorisDisks {
             for (uint i = 0; i < jobs.get_n_items (); i++) {
                 var job = jobs.get_item (i) as StorageJob;
                 if (job.backend_path == path && (job.state == StorageJobState.RUNNING ||
-                    job.state == StorageJobState.CANCELLING)) {
+                    job.state == StorageJobState.CANCELLING || job.state == StorageJobState.FINALIZING)) {
+                    if (job.local) {
+                        job.phase = "Backend job disappeared; awaiting initiating method and state verification";
+                        job.cancelable = false; changed (); continue;
+                    }
                     job.state = StorageJobState.NEEDS_ATTENTION;
                     job.phase = "Backend job disappeared before its result was confirmed";
                     job.error_message = "Refresh the device state before attempting another destructive operation.";

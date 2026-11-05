@@ -406,6 +406,21 @@ private void test_resize_planner_safety () {
     assert (!FilesystemResizePlanner.build (block, 800, false, capability, 0, 2000).supported);
 }
 
+private void test_resize_capacity_verification () {
+    uint64 gib = 1024 * 1024 * 1024;
+    assert (FilesystemResizePlanner.capacity_tolerance ("ext4", 512, 4096) == 128 * 1024 * 1024);
+    assert (FilesystemResizePlanner.capacity_tolerance ("ntfs", 512, 4096) == 8 * 1024 * 1024);
+    assert (FilesystemResizePlanner.capacity_tolerance ("unknown", 512, 4096) == 0);
+    assert (FilesystemResizePlanner.capacity_matches ("ext4", 10 * gib - 64 * 1024 * 1024,
+        10 * gib, 10 * gib, 512, 4096));
+    assert (!FilesystemResizePlanner.capacity_matches ("ext4", 10 * gib - 256 * 1024 * 1024,
+        10 * gib, 10 * gib, 512, 4096));
+    assert (!FilesystemResizePlanner.capacity_matches ("unknown", 10 * gib, 10 * gib,
+        10 * gib, 512, 4096));
+    assert (!FilesystemResizePlanner.capacity_matches ("xfs", 10 * gib + 4096, 10 * gib,
+        10 * gib, 512, 4096));
+}
+
 private void test_minimum_size_parsers () {
     try {
         assert (FilesystemMinimumSizeService.parse_named_number (
@@ -533,10 +548,19 @@ private void test_job_correlation () {
     var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
     var block = new StorageBlock ("/target"); block.preferred = "/dev/test";
     var local = manager.begin ("Resize", block, graph); manager.phase (local, StorageJobState.RUNNING, "Resize");
-    manager.observe ("/backend/unrelated", "Resize", { "/different" }, 0, false, false, 1);
+    manager.expect_backend (local, "partition-modify");
+    manager.observe ("/backend/unrelated", "partition-modify", { "/different" }, 0, false, false,
+        (uint64) local.start_time);
     assert (manager.jobs.get_n_items () == 2 && local.backend_path == "");
-    manager.observe ("/backend/related", "other-name", { "/target" }, 0, false, false, 2);
-    assert (manager.jobs.get_n_items () == 3 && local.backend_path == "");
+    manager.observe ("/backend/related", "partition-modify", { "/target" }, 0.25, true, true,
+        (uint64) local.start_time);
+    assert (manager.jobs.get_n_items () == 2 && local.backend_path == "/backend/related" && local.progress == 0.25);
+    manager.backend_completed ("/backend/related", true, "Done");
+    assert (local.state == StorageJobState.FINALIZING);
+    var result = new StorageOperationResult (); result.successful = true;
+    result.status = StorageOperationStatus.SUCCEEDED; result.summary = "Verified";
+    manager.finish (local, result);
+    assert (local.state == StorageJobState.COMPLETED && local.phase == "Verified");
 }
 
 private async void query_mock_capability () throws Error {
@@ -592,6 +616,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/job-lifecycle", test_job_lifecycle);
     Test.add_func ("/operations/job-correlation", test_job_correlation);
     Test.add_func ("/operations/resize-planner-safety", test_resize_planner_safety);
+    Test.add_func ("/operations/resize-capacity-verification", test_resize_capacity_verification);
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
     Test.add_func ("/operations/preparation-journal", test_preparation_journal);
     Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);

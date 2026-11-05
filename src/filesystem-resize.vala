@@ -122,6 +122,30 @@ namespace MajorisDisks {
     }
 
     public class FilesystemResizePlanner {
+        public static uint64 capacity_tolerance (string filesystem_type, uint64 logical_sector_size,
+            uint64 physical_sector_size) {
+            uint64 sector = uint64.max (logical_sector_size, physical_sector_size);
+            switch (filesystem_type.down ()) {
+                // ext filesystems can leave one final block group unused after an online grow.
+                case "ext2": case "ext3": case "ext4": return uint64.max (128 * 1024 * 1024, sector);
+                // These formats report total filesystem bytes and only require bounded allocation-unit alignment.
+                case "ntfs": return uint64.max (8 * 1024 * 1024, sector);
+                case "vfat": case "fat": case "exfat": return uint64.max (4 * 1024 * 1024, sector);
+                case "btrfs": return uint64.max (1024 * 1024, sector);
+                case "xfs": return uint64.max (16 * 1024 * 1024, sector);
+                default: return 0;
+            }
+        }
+
+        public static bool capacity_matches (string filesystem_type, uint64 capacity,
+            uint64 partition_size, uint64 requested_size, uint64 logical_sector_size,
+            uint64 physical_sector_size) {
+            uint64 tolerance = capacity_tolerance (filesystem_type, logical_sector_size,
+                physical_sector_size);
+            if (tolerance == 0 || capacity == 0 || capacity > partition_size) return false;
+            return capacity >= requested_size || requested_size - capacity <= tolerance;
+        }
+
         public static FilesystemResizePlan build (StorageBlock block, uint64 requested,
             bool resize_filesystem, FilesystemCapability capability, uint64 minimum_size,
             uint64 maximum_size) {
