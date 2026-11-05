@@ -421,6 +421,24 @@ private void test_resize_capacity_verification () {
         10 * gib, 512, 4096));
 }
 
+private void test_offline_capacity_metadata () {
+    var fields = FilesystemCapacityProbeService.parse_export (
+        "DEVNAME=/dev/loop0p1\nUUID=abcd-1234\nTYPE=ext4\nFS_BLOCK_SIZE=4096\nFS_SIZE=1073741824\n");
+    assert (fields.lookup ("TYPE") == "ext4");
+    assert (fields.lookup ("FS_SIZE") == "1073741824");
+    var measurement = new FilesystemCapacityMeasurement ();
+    measurement.capacity = 1024 * 1024 * 1024;
+    measurement.allocation_unit = 4096;
+    assert (FilesystemCapacityProbeService.authoritative_match (measurement,
+        measurement.capacity, measurement.capacity, 512, 4096));
+    assert (FilesystemCapacityProbeService.authoritative_match (measurement,
+        measurement.capacity + 4096, measurement.capacity + 4096, 512, 4096));
+    assert (!FilesystemCapacityProbeService.authoritative_match (measurement,
+        measurement.capacity + 8192, measurement.capacity + 8192, 512, 4096));
+    assert (!FilesystemCapacityProbeService.authoritative_match (measurement,
+        measurement.capacity, measurement.capacity - 1, 512, 4096));
+}
+
 private void test_minimum_size_parsers () {
     try {
         assert (FilesystemMinimumSizeService.parse_named_number (
@@ -439,11 +457,16 @@ private void test_minimum_size_parsers () {
 
 private void test_preparation_journal () {
     var journal = new StoragePreparationJournal ();
-    var mount = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/a", { "/mnt/a" }); mount.prepared = true;
+    var mount = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/a",
+        { "uuid", "ext4", "/mnt/archive" }); mount.prepared = true;
     var swap = new StoragePreparationEntry (StoragePreparationKind.SWAP, "/b", {}); swap.prepared = true;
+    mount.actual_state = "unmounted";
+    mount.restoration_allowed = false;
     journal.add (mount); journal.add (swap);
     var reverse = journal.restoration_order ();
-    assert (reverse.length == 2 && reverse[0] == swap && reverse[1] == mount && !journal.fully_restored ());
+    assert (reverse.length == 1 && reverse[0] == swap && !journal.fully_restored ());
+    string recovery = journal.recovery_details ();
+    assert (recovery.contains ("/mnt/archive") && recovery.contains ("automatic restoration was withheld"));
     swap.restored = true; mount.restored = true; assert (journal.fully_restored ());
 }
 
@@ -548,12 +571,12 @@ private void test_job_correlation () {
     var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
     var block = new StorageBlock ("/target"); block.preferred = "/dev/test";
     var local = manager.begin ("Resize", block, graph); manager.phase (local, StorageJobState.RUNNING, "Resize");
-    manager.expect_backend (local, "partition-modify");
+    manager.expect_backend (local, "partition-modify", "/target");
     manager.observe ("/backend/unrelated", "partition-modify", { "/different" }, 0, false, false,
-        (uint64) local.start_time);
+        0);
     assert (manager.jobs.get_n_items () == 2 && local.backend_path == "");
     manager.observe ("/backend/related", "partition-modify", { "/target" }, 0.25, true, true,
-        (uint64) local.start_time);
+        0);
     assert (manager.jobs.get_n_items () == 2 && local.backend_path == "/backend/related" && local.progress == 0.25);
     manager.backend_completed ("/backend/related", true, "Done");
     assert (local.state == StorageJobState.FINALIZING);
@@ -561,6 +584,31 @@ private void test_job_correlation () {
     result.status = StorageOperationStatus.SUCCEEDED; result.summary = "Verified";
     manager.finish (local, result);
     assert (local.state == StorageJobState.COMPLETED && local.phase == "Verified");
+}
+
+private void test_job_correlation_ambiguity () {
+    var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
+    var block = new StorageBlock ("/same-target"); block.preferred = "/dev/same";
+    var first = manager.begin ("First", block, graph);
+    var second = manager.begin ("Second", block, graph);
+    manager.phase (first, StorageJobState.RUNNING, "First");
+    manager.phase (second, StorageJobState.RUNNING, "Second");
+    manager.expect_backend (first, "filesystem-resize", block.path);
+    manager.expect_backend (second, "filesystem-resize", block.path);
+    manager.observe ("/backend/ambiguous", "filesystem-resize", { block.path }, 0.1, true, true, 0);
+    assert (manager.jobs.get_n_items () == 3);
+    assert (first.backend_path == "" && second.backend_path == "");
+    var independent = manager.jobs.get_item (2) as StorageJob;
+    assert (!independent.local && independent.backend_path == "/backend/ambiguous");
+    var failed = new StorageOperationResult (); failed.fail ("First failed"); manager.finish (first, failed);
+    manager.observe ("/backend/second", "filesystem-resize", { block.path }, 0.2, true, true, 0);
+    assert (second.backend_path == "/backend/second");
+}
+
+private void test_selftest_terminal_reconciliation () {
+    assert (!StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "success", 100));
+    assert (StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "success", 101));
+    assert (StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "failed", 100));
 }
 
 private async void query_mock_capability () throws Error {
@@ -615,8 +663,11 @@ public static int main (string[] args) {
     Test.add_func ("/operations/label-validation", test_label_validation);
     Test.add_func ("/operations/job-lifecycle", test_job_lifecycle);
     Test.add_func ("/operations/job-correlation", test_job_correlation);
+    Test.add_func ("/operations/job-correlation-ambiguity", test_job_correlation_ambiguity);
+    Test.add_func ("/operations/selftest-terminal-reconciliation", test_selftest_terminal_reconciliation);
     Test.add_func ("/operations/resize-planner-safety", test_resize_planner_safety);
     Test.add_func ("/operations/resize-capacity-verification", test_resize_capacity_verification);
+    Test.add_func ("/operations/offline-capacity-metadata", test_offline_capacity_metadata);
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
     Test.add_func ("/operations/preparation-journal", test_preparation_journal);
     Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);

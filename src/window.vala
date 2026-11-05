@@ -207,7 +207,10 @@ namespace MajorisDisks {
                     string passphrase = dialog.passphrase;
                     dialog.clear_secret ();
                     pending.insert (block.path, block);
-                    backend.unlock_volume.begin (block, passphrase, identity, dialog.keyfile_path, (object, result) => {
+                    string[] keyfiles = dialog.keyfiles;
+                    uint32 pim = dialog.pim_value;
+                    bool hidden = dialog.hidden; bool system = dialog.system;
+                    backend.unlock_volume.begin (block, passphrase, identity, keyfiles, pim, hidden, system, (object, result) => {
                         passphrase = ""; pending.remove (block.path);
                         try {
                             var outcome = backend.unlock_volume.end (result);
@@ -599,21 +602,28 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button choose_keyfile;
         private string[] selected_keyfiles = {};
         public string passphrase { owned get { return secret.text; } }
-        public string keyfile_path { owned get { return selected_keyfiles.length == 0 ? "" : selected_keyfiles[0]; } }
+        public string[] keyfiles { owned get { return selected_keyfiles.copy (); } }
+        public uint32 pim_value { get {
+            uint64 value = 0; return uint64.try_parse (pim.text.strip (), out value) && value <= uint32.MAX ? (uint32) value : 0;
+        } }
+        public bool hidden { get { return hidden_volume.active; } }
+        public bool system { get { return system_volume.active; } }
         public UnlockVolumeDialog (StorageBlock block) {
             body = "%s · %s".printf (block.preferred, format_size (block.size));
             bool veracrypt = block.type_id == "crypto_TCRYPT" || block.type_id == "crypto_unknown";
             pim.visible = veracrypt; hidden_volume.visible = veracrypt; system_volume.visible = veracrypt;
             keyfile_row.visible = veracrypt;
-            pim.sensitive = false; pim.text = "Unavailable through the UDisks backend";
-            hidden_volume.sensitive = false; hidden_volume.subtitle = "Requires an authorised cryptsetup backend";
-            system_volume.sensitive = false; system_volume.subtitle = "Requires an authorised cryptsetup backend";
             secret.changed.connect (validate);
+            pim.changed.connect (validate);
+            hidden_volume.notify["active"].connect (() => { if (hidden_volume.active) system_volume.active = false; validate (); });
+            system_volume.notify["active"].connect (() => { if (system_volume.active) hidden_volume.active = false; validate (); });
             choose_keyfile.clicked.connect (select_keyfile);
             validate ();
         }
         private void validate () {
-            set_response_enabled ("unlock", secret.text.length > 0 || selected_keyfiles.length > 0);
+            uint64 parsed = 0; string text = pim.text.strip ();
+            bool valid_pim = text == "" || (uint64.try_parse (text, out parsed) && parsed > 0 && parsed <= uint32.MAX);
+            set_response_enabled ("unlock", valid_pim && (secret.text.length > 0 || selected_keyfiles.length > 0));
         }
         private void select_keyfile () {
             var chooser = new Gtk.FileDialog (); chooser.title = "Select a VeraCrypt keyfile";
@@ -621,7 +631,11 @@ namespace MajorisDisks {
                 try {
                     var file = chooser.open.end (result); string? path = file.get_path ();
                     if (path == null || path == "") return;
-                    selected_keyfiles = { path }; keyfile_row.subtitle = file.get_basename (); validate ();
+                    foreach (var selected in selected_keyfiles) if (selected == path) return;
+                    selected_keyfiles += path;
+                    keyfile_row.subtitle = selected_keyfiles.length == 1 ? file.get_basename () :
+                        "%u keyfiles selected".printf (selected_keyfiles.length);
+                    validate ();
                 } catch (Error error) {}
             });
         }

@@ -121,6 +121,113 @@ namespace MajorisDisks {
         }
     }
 
+    public class FilesystemCapacityMeasurement : Object {
+        public uint64 capacity;
+        public uint64 allocation_unit;
+        public string filesystem_type = "";
+        public string filesystem_uuid = "";
+        public string source = "";
+    }
+
+    public class FilesystemCapacityProbeService : Object {
+        public async FilesystemCapacityMeasurement query (StorageBlock block, Cancellable token) throws Error {
+            string path = block.path;
+            string device = block.preferred;
+            string expected_type = normalize_type (block.type_id);
+            string expected_uuid = block.uuid;
+            uint64 number = block.number;
+            uint64 size = block.size;
+            string serial = block.physical_drive?.serial ?? "";
+            string wwn = block.physical_drive?.wwn ?? "";
+            if (device == "" || expected_type == "")
+                throw new IOError.NOT_SUPPORTED ("The filesystem does not expose a probeable device and type.");
+
+            string output = yield run ({ "blkid", "--probe", "--output", "export", device }, token);
+            if (block.path != path || block.preferred != device || block.number != number || block.size != size ||
+                (block.physical_drive?.serial ?? "") != serial || (block.physical_drive?.wwn ?? "") != wwn)
+                throw new IOError.NOT_FOUND ("The filesystem device identity changed during capacity probing.");
+
+            var fields = parse_export (output);
+            string actual_type = normalize_type (fields.lookup ("TYPE") ?? "");
+            string actual_uuid = fields.lookup ("UUID") ?? "";
+            if (actual_type == "" || actual_type != expected_type)
+                throw new IOError.INVALID_DATA ("The capacity probe identified a different filesystem type.");
+            if (expected_uuid != "" && actual_uuid != "" && expected_uuid.ascii_casecmp (actual_uuid) != 0)
+                throw new IOError.INVALID_DATA ("The capacity probe identified a different filesystem UUID.");
+
+            uint64 block_size = parse_uint (fields.lookup ("FS_BLOCK_SIZE") ?? "", "filesystem block size", false);
+            uint64 capacity = parse_uint (fields.lookup ("FS_SIZE") ?? "", "filesystem capacity", false);
+            if (capacity == 0) {
+                uint64 last_block = parse_uint (fields.lookup ("FS_LASTBLOCK") ?? "", "last filesystem block", true);
+                if (block_size == 0 || last_block == uint64.MAX || last_block + 1 > uint64.MAX / block_size)
+                    throw new IOError.INVALID_DATA ("The filesystem capacity metadata was incomplete or overflowed.");
+                capacity = (last_block + 1) * block_size;
+            }
+            if (block_size == 0) block_size = uint64.max (block.logical_sector_size, block.physical_sector_size);
+            if (capacity == 0 || capacity > block.size)
+                throw new IOError.INVALID_DATA ("The filesystem capacity metadata is outside the containing device.");
+
+            var measurement = new FilesystemCapacityMeasurement ();
+            measurement.capacity = capacity;
+            measurement.allocation_unit = block_size;
+            measurement.filesystem_type = actual_type;
+            measurement.filesystem_uuid = actual_uuid;
+            measurement.source = "libblkid filesystem metadata";
+            return measurement;
+        }
+
+        public static HashTable<string, string> parse_export (string output) {
+            var fields = new HashTable<string, string> (str_hash, str_equal);
+            foreach (var source_line in output.split ("\n")) {
+                string line = source_line.strip ();
+                int separator = line.index_of_char ('=');
+                if (separator <= 0 || separator == line.length - 1) continue;
+                fields.insert (line.substring (0, separator), line.substring (separator + 1));
+            }
+            return fields;
+        }
+
+        public static bool authoritative_match (FilesystemCapacityMeasurement measurement,
+            uint64 requested_size, uint64 partition_size, uint64 logical_sector_size,
+            uint64 physical_sector_size) {
+            if (measurement.capacity == 0 || measurement.capacity > partition_size) return false;
+            uint64 alignment = uint64.max (measurement.allocation_unit,
+                uint64.max (logical_sector_size, physical_sector_size));
+            if (alignment == 0) alignment = 512;
+            return measurement.capacity >= requested_size || requested_size - measurement.capacity <= alignment;
+        }
+
+        private static string normalize_type (string type) {
+            string normalized = type.down ();
+            if (normalized == "fat" || normalized == "fat12" || normalized == "fat16" || normalized == "fat32")
+                return "vfat";
+            return normalized;
+        }
+
+        private static uint64 parse_uint (string text, string field, bool allow_zero) throws Error {
+            uint64 value = 0;
+            if (text == "") return 0;
+            if (!uint64.try_parse (text, out value) || (!allow_zero && value == 0))
+                throw new IOError.INVALID_DATA ("The " + field + " reported by the capacity probe was invalid.");
+            return value;
+        }
+
+        private static async string run (string[] argv, Cancellable token) throws Error {
+            var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+            launcher.setenv ("LC_ALL", "C", true);
+            Subprocess process;
+            try { process = launcher.spawnv (argv); }
+            catch (Error error) {
+                throw new IOError.NOT_SUPPORTED ("The read-only filesystem capacity probe is unavailable: " + error.message);
+            }
+            string? output; string? errors;
+            yield process.communicate_utf8_async (null, token, out output, out errors);
+            if (!process.get_successful ())
+                throw new IOError.PERMISSION_DENIED ((errors ?? "The filesystem metadata could not be read.").strip ());
+            return output ?? "";
+        }
+    }
+
     public class FilesystemResizePlanner {
         public static uint64 capacity_tolerance (string filesystem_type, uint64 logical_sector_size,
             uint64 physical_sector_size) {

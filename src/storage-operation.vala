@@ -1,4 +1,11 @@
 namespace MajorisDisks {
+    public class StorageSelftestReconciliation {
+        public static bool terminal_state_is_new (string baseline_status, uint64 baseline_updated,
+            string status, uint64 updated) {
+            return status != baseline_status || updated > baseline_updated;
+        }
+    }
+
     public enum MountVisibility { DEFAULT, SHOW, HIDE }
 
     public class MountOptionService {
@@ -113,9 +120,9 @@ namespace MajorisDisks {
     public enum StoragePreparationKind { MOUNT, SWAP, ENCRYPTED_MAPPING, LOGICAL_VOLUME, RAID }
 
     public class StoragePreparationEntry : Object {
+        private GenericArray<string> state_values = new GenericArray<string> ();
         public StoragePreparationKind kind { get; construct; }
         public string object_path { get; construct; }
-        public string[] state { get; construct; }
         public string operation_type { get; construct; }
         public bool prepared { get; set; }
         public bool action_dispatched { get; set; }
@@ -125,11 +132,22 @@ namespace MajorisDisks {
         public bool destructive_change { get; set; }
         public bool restoration_allowed { get; set; default = true; }
         public bool restored { get; set; }
+        public bool persistent_mount { get; set; }
+        public string persistent_mount_options { get; set; default = ""; }
         public string error { get; set; default = ""; }
         public StoragePreparationEntry (StoragePreparationKind kind, string object_path, string[] state,
             string operation_type = "prepare") {
-            Object (kind: kind, object_path: object_path, state: state, operation_type: operation_type);
+            Object (kind: kind, object_path: object_path, operation_type: operation_type);
+            foreach (var item in state) state_values.add (item.dup ());
         }
+
+        public uint state_length () { return state_values.length; }
+        public string state_at (uint index) { return state_values[index]; }
+
+        public uint mount_point_count () {
+            return kind == StoragePreparationKind.MOUNT && state_values.length > 2 ? state_values.length - 2 : 0;
+        }
+        public string mount_point_at (uint index) { return state_values[index + 2]; }
     }
 
     public class StoragePreparationJournal : Object {
@@ -167,6 +185,27 @@ namespace MajorisDisks {
         public bool fully_restored () {
             foreach (var entry in entries ()) if (entry.prepared && !entry.restored) return false;
             return true;
+        }
+
+        public string recovery_details () {
+            string[] details = {};
+            foreach (var entry in entries ()) {
+                if (!entry.prepared || entry.restored) continue;
+                string previous = entry.kind == StoragePreparationKind.SWAP ? "active swap" : "active";
+                if (entry.kind == StoragePreparationKind.MOUNT) {
+                    previous = "mounted";
+                    if (entry.mount_point_count () != 0) {
+                        previous = "mounted at " + entry.mount_point_at (0);
+                        for (uint i = 1; i < entry.mount_point_count (); i++)
+                            previous += ", " + entry.mount_point_at (i);
+                    }
+                }
+                string reason = entry.error == null || entry.error == "" ?
+                    (entry.restoration_allowed ? "restoration has not completed" : "automatic restoration was withheld") : entry.error;
+                details += "%s was previously %s; current state: %s; %s".printf (
+                    entry.object_path, previous, entry.actual_state, reason);
+            }
+            return string.joinv ("\n", details);
         }
 
         public void capture (StorageBlock block) {
@@ -381,6 +420,10 @@ namespace MajorisDisks {
         public string backend_path { get; set; default = ""; }
         public bool local { get; set; default = false; }
         public string expected_backend_operation { get; set; default = ""; }
+        public string expected_backend_object { get; set; default = ""; }
+        public uint64 backend_dispatch_sequence { get; set; default = 0; }
+        public int64 backend_dispatch_time { get; set; default = 0; }
+        public bool backend_expectation_open { get; set; default = false; }
         public bool backend_completed { get; set; default = false; }
         public bool backend_successful { get; set; default = false; }
         public bool initiating_method_completed { get; set; default = false; }
@@ -398,6 +441,7 @@ namespace MajorisDisks {
         private const uint RETENTION_LIMIT = 50;
         public ListStore jobs { get; private set; default = new ListStore (typeof (StorageJob)); }
         private uint64 serial;
+        private uint64 dispatch_serial;
         public signal void changed ();
         public static bool terminal (StorageJobState state) {
             return state == StorageJobState.COMPLETED || state == StorageJobState.FAILED ||
@@ -452,6 +496,7 @@ namespace MajorisDisks {
         public void finish (StorageJob job, StorageOperationResult result) {
             if (terminal (job.state)) return;
             job.initiating_method_completed = true;
+            job.backend_expectation_open = false;
             if (job.backend_completed && !job.backend_successful && result.successful) {
                 result.fail ("The backend reported that the operation failed");
                 result.technical_error = job.error_message;
@@ -470,9 +515,13 @@ namespace MajorisDisks {
             changed ();
         }
 
-        public void expect_backend (StorageJob job, string operation) {
+        public void expect_backend (StorageJob job, string operation, string expected_object = "") {
             if (!job.local || terminal (job.state) || job.backend_path != "") return;
             job.expected_backend_operation = operation;
+            job.expected_backend_object = expected_object;
+            job.backend_dispatch_sequence = ++dispatch_serial;
+            job.backend_dispatch_time = get_real_time ();
+            job.backend_expectation_open = true;
         }
 
         private static bool objects_match (StorageJob job, string[] objects) {
@@ -488,6 +537,13 @@ namespace MajorisDisks {
             return overlap;
         }
 
+        private static bool expected_object_present (StorageJob job, string[] objects) {
+            if (job.expected_backend_object == "") return true;
+            foreach (var object_path in objects)
+                if (object_path == job.expected_backend_object) return true;
+            return false;
+        }
+
         public void observe (string path, string operation, string[] objects, double progress,
             bool valid, bool cancelable, uint64 start_time) {
             StorageJob? match = null;
@@ -498,15 +554,13 @@ namespace MajorisDisks {
                     break;
                 }
             }
-            if (match == null && start_time > 0) {
+            if (match == null) {
                 StorageJob? candidate_match = null;
                 for (uint i = 0; i < jobs.get_n_items (); i++) {
                     var candidate = jobs.get_item (i) as StorageJob;
                     if (!candidate.local || terminal (candidate.state) || candidate.backend_path != "" ||
-                        candidate.expected_backend_operation != operation || !objects_match (candidate, objects)) continue;
-                    int64 delta = candidate.start_time - (int64) start_time;
-                    if (delta < 0) delta = -delta;
-                    if (delta > 10 * TimeSpan.SECOND) continue;
+                        !candidate.backend_expectation_open || candidate.expected_backend_operation != operation ||
+                        !expected_object_present (candidate, objects) || !objects_match (candidate, objects)) continue;
                     if (candidate_match != null) { candidate_match = null; break; }
                     candidate_match = candidate;
                 }
@@ -518,6 +572,7 @@ namespace MajorisDisks {
             }
             if (terminal (match.state)) return;
             match.backend_path = path;
+            match.backend_expectation_open = false;
             match.state = StorageJobState.RUNNING;
             match.phase = operation;
             match.progress = progress;
