@@ -26,6 +26,11 @@ namespace MajorisDisks {
         public bool ejectable;
         public bool can_power_off;
         public bool ata_power_management;
+        public bool ata_apm_supported;
+        public bool ata_aam_supported;
+        public bool ata_write_cache_supported;
+        public bool ata_read_lookahead_supported;
+        public Variant drive_configuration = new Variant ("a{sv}", null);
         public bool smart;
         public bool optical;
         public string media = "";

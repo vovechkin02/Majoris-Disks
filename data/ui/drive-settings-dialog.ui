@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksDriveSettingsDialog" parent="AdwAlertDialog">
+    <property name="heading">Drive Settings</property>
+    <property name="body">Settings are stored by UDisks and may be reapplied when the drive reconnects.</property>
+    <property name="extra-child"><object class="AdwPreferencesGroup">
+      <child><object class="AdwSwitchRow" id="standby_enabled"><property name="title">Manage standby timeout</property></object></child>
+      <child><object class="AdwSpinRow" id="standby"><property name="title">Standby value</property><property name="subtitle">ATA value (0–255; values 1–240 use five-second units)</property><property name="adjustment"><object class="GtkAdjustment"><property name="lower">0</property><property name="upper">255</property><property name="step-increment">1</property></object></property></object></child>
+      <child><object class="AdwSwitchRow" id="apm_enabled"><property name="title">Manage Advanced Power Management</property></object></child>
+      <child><object class="AdwSpinRow" id="apm"><property name="title">APM level</property><property name="subtitle">1 saves most power; 254 favours performance; 255 disables APM</property><property name="adjustment"><object class="GtkAdjustment"><property name="lower">1</property><property name="upper">255</property><property name="step-increment">1</property></object></property></object></child>
+      <child><object class="AdwSwitchRow" id="aam_enabled"><property name="title">Manage Acoustic Management</property></object></child>
+      <child><object class="AdwSpinRow" id="aam"><property name="title">Acoustic level</property><property name="subtitle">128 is quietest; 254 is fastest; values below 128 disable AAM</property><property name="adjustment"><object class="GtkAdjustment"><property name="lower">0</property><property name="upper">254</property><property name="step-increment">1</property></object></property></object></child>
+      <child><object class="AdwSwitchRow" id="write_cache_enabled"><property name="title">Manage write cache</property><property name="subtitle">Enabling write cache can risk data on sudden power loss.</property></object></child>
+      <child><object class="AdwSwitchRow" id="write_cache"><property name="title">Enable write cache</property></object></child>
+      <child><object class="AdwSwitchRow" id="read_lookahead_enabled"><property name="title">Manage read look-ahead</property></object></child>
+      <child><object class="AdwSwitchRow" id="read_lookahead"><property name="title">Enable read look-ahead</property></object></child>
+    </object></property>
+    <responses><response id="cancel">Cancel</response><response id="apply" appearance="suggested">Apply</response></responses>
+    <property name="close-response">cancel</property><property name="default-response">apply</property>
+  </template>
+</interface>

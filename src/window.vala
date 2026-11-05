@@ -67,6 +67,7 @@ namespace MajorisDisks {
             drive_view.encryption_options_requested.connect (edit_encryption_options);
             drive_view.health_requested.connect (show_health);
             drive_view.drive_action_requested.connect (confirm_drive_action);
+            drive_view.drive_settings_requested.connect (show_drive_settings);
             drive_view.format_requested.connect ((block) => confirm_partitioning (block, false, true));
             var jobs_popover = new JobsPopover (backend);
             jobs_button.popover = jobs_popover;
@@ -307,6 +308,32 @@ namespace MajorisDisks {
             dialog.heading = action == "Eject" ? "Eject this drive?" : "Safely power off this drive?";
             dialog.body = "Active filesystems will be safely unmounted first. System-critical storage is protected.";
             dialog.response.connect ((response) => { if (response == "continue") run (); });
+            dialog.present (this);
+        }
+
+        private void show_drive_settings (StorageDrive drive) {
+            var dialog = new DriveSettingsDialog (drive);
+            dialog.response.connect ((response) => {
+                if (response != "apply") return;
+                dialog.set_response_enabled ("apply", false);
+                backend.set_drive_configuration.begin (drive,
+                    dialog.standby_set, dialog.standby_value,
+                    dialog.apm_set, dialog.apm_value, dialog.aam_set, dialog.aam_value,
+                    dialog.write_cache_set, dialog.write_cache_value,
+                    dialog.read_lookahead_set, dialog.read_lookahead_value, (object, result) => {
+                        try {
+                            backend.set_drive_configuration.end (result);
+                            notifications.add_toast (new Adw.Toast ("Drive settings saved"));
+                            dialog.force_close ();
+                        } catch (Error error) {
+                            dialog.set_response_enabled ("apply", true);
+                            var failure = new OperationResultDialog () {
+                                heading = "Could not save drive settings", body = operation_error (error)
+                            };
+                            failure.present (this);
+                        }
+                    });
+            });
             dialog.present (this);
         }
         private void confirm_partitioning (StorageBlock block, bool deleting, bool volume = false) {
@@ -694,16 +721,77 @@ namespace MajorisDisks {
         public void clear_secret () { secret.text = ""; }
     }
 
+    [GtkTemplate (ui = "/com/majoris/disks/ui/drive-settings-dialog.ui")]
+    public class DriveSettingsDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.SwitchRow standby_enabled;
+        [GtkChild] private unowned Adw.SpinRow standby;
+        [GtkChild] private unowned Adw.SwitchRow apm_enabled;
+        [GtkChild] private unowned Adw.SpinRow apm;
+        [GtkChild] private unowned Adw.SwitchRow aam_enabled;
+        [GtkChild] private unowned Adw.SpinRow aam;
+        [GtkChild] private unowned Adw.SwitchRow write_cache_enabled;
+        [GtkChild] private unowned Adw.SwitchRow write_cache;
+        [GtkChild] private unowned Adw.SwitchRow read_lookahead_enabled;
+        [GtkChild] private unowned Adw.SwitchRow read_lookahead;
+
+        public bool standby_set { get { return standby_enabled.active; } }
+        public int standby_value { get { return (int) standby.value; } }
+        public bool apm_set { get { return apm_enabled.active; } }
+        public int apm_value { get { return (int) apm.value; } }
+        public bool aam_set { get { return aam_enabled.active; } }
+        public int aam_value { get { return (int) aam.value; } }
+        public bool write_cache_set { get { return write_cache_enabled.active; } }
+        public bool write_cache_value { get { return write_cache.active; } }
+        public bool read_lookahead_set { get { return read_lookahead_enabled.active; } }
+        public bool read_lookahead_value { get { return read_lookahead.active; } }
+
+        public DriveSettingsDialog (StorageDrive drive) {
+            body = drive.name + (drive.serial == "" ? "" : " · " + drive.serial) +
+                "\nSettings are stored by UDisks and may be reapplied when the drive reconnects.";
+            setup_integer (drive.drive_configuration, "ata-pm-standby", standby_enabled, standby, 120);
+            setup_integer (drive.drive_configuration, "ata-apm-level", apm_enabled, apm, 127);
+            setup_integer (drive.drive_configuration, "ata-aam-level", aam_enabled, aam, 254);
+            setup_boolean (drive.drive_configuration, "ata-write-cache-enabled", write_cache_enabled, write_cache, true);
+            setup_boolean (drive.drive_configuration, "ata-read-lookahead-enabled", read_lookahead_enabled, read_lookahead, true);
+            set_pair_available (standby_enabled, standby, drive.ata_power_management && drive.rotation != 0);
+            set_pair_available (apm_enabled, apm, drive.ata_apm_supported);
+            set_pair_available (aam_enabled, aam, drive.ata_aam_supported);
+            set_pair_available (write_cache_enabled, write_cache, drive.ata_write_cache_supported);
+            set_pair_available (read_lookahead_enabled, read_lookahead, drive.ata_read_lookahead_supported);
+        }
+        private void setup_integer (Variant configuration, string key, Adw.SwitchRow enabled,
+            Adw.SpinRow value, int fallback) {
+            var current = configuration.lookup_value (key, VariantType.INT32);
+            enabled.active = current != null;
+            value.value = current?.get_int32 () ?? fallback;
+            enabled.notify["active"].connect (() => value.sensitive = enabled.active);
+            value.sensitive = enabled.active;
+        }
+        private void setup_boolean (Variant configuration, string key, Adw.SwitchRow enabled,
+            Adw.SwitchRow value, bool fallback) {
+            var current = configuration.lookup_value (key, VariantType.BOOLEAN);
+            enabled.active = current != null;
+            value.active = current?.get_boolean () ?? fallback;
+            enabled.notify["active"].connect (() => value.sensitive = enabled.active);
+            value.sensitive = enabled.active;
+        }
+        private void set_pair_available (Gtk.Widget enabled, Gtk.Widget value, bool available) {
+            enabled.visible = available; value.visible = available;
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/smart-dialog.ui")]
     public class SmartDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.PreferencesGroup summary_group;
         [GtkChild] private unowned Gtk.ListBox attributes;
         [GtkChild] private unowned Adw.ComboRow selftest_type;
         [GtkChild] private unowned Adw.ActionRow selftest_result;
+        [GtkChild] private unowned Gtk.ProgressBar selftest_progress;
         [GtkChild] private unowned Gtk.Button start_selftest;
         [GtkChild] private unowned Gtk.Button stop_selftest;
         private Gtk.StringList test_names = new Gtk.StringList (null);
         private string[] test_types = {};
+        private bool test_request_busy;
         public SmartDialog (UDisksService backend, StorageDrive drive, StorageHealthReport report) {
             heading = report.nvme ? "NVMe Health" : "SMART Data";
             body = drive.name + (drive.serial == "" ? "" : " · " + drive.serial);
@@ -719,16 +807,17 @@ namespace MajorisDisks {
             add_summary ("Last updated", updated);
             add_summary ("Self-test", report.selftest + (report.selftest_remaining >= 0 ?
                 " · " + report.selftest_remaining.to_string () + "% remaining" : ""));
-            selftest_result.subtitle = report.selftest;
+            update_selftest (drive);
             selftest_type.model = test_names; add_test ("short", "Short"); add_test ("extended", "Extended");
             if (!report.nvme) add_test ("conveyance", "Conveyance");
-            stop_selftest.sensitive = report.selftest == "inprogress";
+            ulong backend_handler = backend.changed.connect (() => { update_selftest (drive); });
+            closed.connect (() => { backend.disconnect (backend_handler); });
             start_selftest.clicked.connect (() => {
                 if (selftest_type.selected >= test_types.length) return;
                 set_test_busy (true); string selected = test_types[selftest_type.selected];
                 backend.run_selftest.begin (drive, selected, false, (object, result) => {
                     set_test_busy (false);
-                    try { backend.run_selftest.end (result); selftest_result.subtitle = "inprogress"; stop_selftest.sensitive = true; }
+                    try { backend.run_selftest.end (result); update_selftest (drive); }
                     catch (Error error) { selftest_result.subtitle = error.message; }
                 });
             });
@@ -736,7 +825,7 @@ namespace MajorisDisks {
                 set_test_busy (true);
                 backend.run_selftest.begin (drive, "short", true, (object, result) => {
                     set_test_busy (false);
-                    try { backend.run_selftest.end (result); selftest_result.subtitle = "aborted"; stop_selftest.sensitive = false; }
+                    try { backend.run_selftest.end (result); update_selftest (drive); }
                     catch (Error error) { selftest_result.subtitle = error.message; }
                 });
             });
@@ -755,7 +844,22 @@ namespace MajorisDisks {
         }
         private void add_test (string type, string title) { test_types += type; test_names.append (title); }
         private void set_test_busy (bool busy) {
-            start_selftest.sensitive = !busy; stop_selftest.sensitive = !busy;
+            test_request_busy = busy;
+            start_selftest.sensitive = !busy && selftest_result.subtitle != "inprogress";
+            stop_selftest.sensitive = !busy && selftest_result.subtitle == "inprogress";
+        }
+        private void update_selftest (StorageDrive drive) {
+            string status = drive.smart_selftest_status == "" ? "Unknown" : drive.smart_selftest_status;
+            selftest_result.subtitle = status;
+            bool running = status == "inprogress";
+            start_selftest.sensitive = !test_request_busy && !running;
+            stop_selftest.sensitive = !test_request_busy && running;
+            selftest_progress.visible = running && drive.smart_selftest_remaining >= 0;
+            if (selftest_progress.visible) {
+                int complete = 100 - drive.smart_selftest_remaining;
+                selftest_progress.fraction = complete / 100.0;
+                selftest_progress.text = complete.to_string () + "% complete";
+            }
         }
         private void add_summary (string title, string value) {
             summary_group.add (new InformationRow (title, value, false));

@@ -385,6 +385,13 @@ namespace MajorisDisks {
             return job;
         }
 
+        public StorageJob begin_named (string operation, string target, string[] affected) {
+            var job = new StorageJob ((++serial).to_string (), operation, target, affected);
+            jobs.append (job);
+            changed ();
+            return job;
+        }
+
         public void phase (StorageJob job, StorageJobState state, string phase) {
             job.state = state;
             job.phase = phase;

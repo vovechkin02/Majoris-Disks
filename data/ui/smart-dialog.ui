@@ -11,6 +11,11 @@
             <child type="suffix"><object class="GtkButton" id="start_selftest"><property name="label">Start</property><property name="valign">center</property></object></child>
             <child type="suffix"><object class="GtkButton" id="stop_selftest"><property name="label">Stop</property><property name="valign">center</property></object></child>
           </object></child>
+          <child><object class="GtkProgressBar" id="selftest_progress">
+            <property name="margin-start">12</property><property name="margin-end">12</property>
+            <property name="margin-top">6</property><property name="margin-bottom">12</property>
+            <property name="show-text">True</property><property name="visible">False</property>
+          </object></child>
         </object></child>
         <child><object class="AdwPreferencesGroup"><property name="title">Detailed attributes</property>
           <child><object class="GtkListBox" id="attributes"><property name="selection-mode">none</property><style><class name="boxed-list"/></style></object></child>

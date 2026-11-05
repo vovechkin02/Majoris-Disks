@@ -10,6 +10,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button power_off_drive;
         [GtkChild] private unowned Gtk.Button standby_drive;
         [GtkChild] private unowned Gtk.Button wake_drive;
+        [GtkChild] private unowned Gtk.Button drive_settings;
         [GtkChild] private unowned PartitionMap map;
         [GtkChild] private unowned Gtk.ListBox volumes;
         [GtkChild] private unowned Adw.PreferencesGroup properties;
@@ -56,6 +57,7 @@ namespace MajorisDisks {
         public signal void action_requested (StorageBlock block, string method);
         public signal void health_requested (StorageDrive drive);
         public signal void drive_action_requested (StorageDrive drive, string action);
+        public signal void drive_settings_requested (StorageDrive drive);
         public signal void open_failed ();
         public void invalidate_usage (StorageBlock block) { usage_service.invalidate (block.path); if (target == block) usage.label = usage_service.show (block); }
 
@@ -73,6 +75,10 @@ namespace MajorisDisks {
             power_off_drive.clicked.connect (() => request_drive_action ("PowerOff"));
             standby_drive.clicked.connect (() => request_drive_action ("PmStandby"));
             wake_drive.clicked.connect (() => request_drive_action ("PmWakeup"));
+            drive_settings.clicked.connect (() => {
+                if (current != null) drive_settings_requested (current);
+                drive_actions.popover?.popdown ();
+            });
             map.region_selected.connect ((identity) => {
                 for (int i = 0; ; i++) {
                     var row = volumes.get_row_at_index (i) as VolumeRow;
@@ -160,7 +166,10 @@ namespace MajorisDisks {
             power_off_drive.visible = drive.can_power_off;
             standby_drive.visible = drive.ata_power_management;
             wake_drive.visible = drive.ata_power_management;
-            drive_actions.visible = eject_drive.visible || power_off_drive.visible || standby_drive.visible;
+            drive_settings.visible = drive.ata_apm_supported || drive.ata_aam_supported ||
+                drive.ata_write_cache_supported || drive.ata_read_lookahead_supported ||
+                (drive.ata_power_management && drive.rotation != 0);
+            drive_actions.visible = eject_drive.visible || power_off_drive.visible || standby_drive.visible || drive_settings.visible;
             drive_icon.icon_name = drive.icon;
             summary.subtitle = drive.available ? format_size (drive.size) : "No media available";
             if (disk != null) summary.subtitle += " · " + disk.preferred;

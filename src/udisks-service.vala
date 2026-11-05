@@ -9,6 +9,8 @@ namespace MajorisDisks {
         public StorageJobManager jobs { get; private set; default = new StorageJobManager (); }
         private HashTable<string, string> observed_jobs = new HashTable<string, string> (str_hash, str_equal);
         private HashTable<string, string> connected_jobs = new HashTable<string, string> (str_hash, str_equal);
+        private HashTable<string, StorageJob> active_selftests =
+            new HashTable<string, StorageJob> (str_hash, str_equal);
         private string? owner;
         private Cancellable backend_lifetime = new Cancellable ();
         public StorageSnapshot snapshot = new StorageSnapshot ();
@@ -85,6 +87,11 @@ namespace MajorisDisks {
             drive.ejectable = property (object_proxy, "Drive", "Ejectable")?.get_boolean () ?? false;
             drive.can_power_off = property (object_proxy, "Drive", "CanPowerOff")?.get_boolean () ?? false;
             drive.ata_power_management = property (object_proxy, "Drive.Ata", "PmSupported")?.get_boolean () ?? false;
+            drive.ata_apm_supported = property (object_proxy, "Drive.Ata", "ApmSupported")?.get_boolean () ?? false;
+            drive.ata_aam_supported = property (object_proxy, "Drive.Ata", "AamSupported")?.get_boolean () ?? false;
+            drive.ata_write_cache_supported = property (object_proxy, "Drive.Ata", "WriteCacheSupported")?.get_boolean () ?? false;
+            drive.ata_read_lookahead_supported = property (object_proxy, "Drive.Ata", "ReadLookaheadSupported")?.get_boolean () ?? false;
+            drive.drive_configuration = property (object_proxy, "Drive", "Configuration") ?? new Variant ("a{sv}", null);
             drive.available = property (object_proxy, "Drive", "MediaAvailable")?.get_boolean () ?? false;
             drive.smart = property (object_proxy, "Drive.Ata", "SmartSupported")?.get_boolean () ?? false;
             drive.smart_enabled = property (object_proxy, "Drive.Ata", "SmartEnabled")?.get_boolean () ?? false;
@@ -305,7 +312,67 @@ namespace MajorisDisks {
             foreach (var old in previous_blocks.get_values ())
                 if (!snapshot.blocks.contains (old.path)) minimum_sizes.invalidate (old.path);
             synchronize_jobs ();
+            synchronize_selftests ();
             changed ();
+        }
+
+        private static bool selftest_terminal_success (string status) {
+            return status == "success";
+        }
+
+        private static bool selftest_terminal_cancelled (string status) {
+            return status == "aborted" || status == "interrupted" || status == "ctrl-reset" ||
+                status == "ns-removed" || status == "aborted-format";
+        }
+
+        private void synchronize_selftests () {
+            string[] finished = {};
+            foreach (var entry in active_selftests.get_keys ()) {
+                var drive = snapshot.drives.lookup (entry);
+                var job = active_selftests.lookup (entry);
+                if (job == null) continue;
+                if (drive == null) {
+                    var missing = new StorageOperationResult ();
+                    missing.fail ("Self-test drive disappeared");
+                    missing.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    jobs.finish (job, missing); finished += entry;
+                    continue;
+                }
+                string status = drive.smart_selftest_status;
+                if (status == "inprogress") {
+                    job.state = StorageJobState.RUNNING;
+                    job.phase = "Drive self-test in progress";
+                    job.progress_valid = drive.smart_selftest_remaining >= 0;
+                    job.progress = job.progress_valid ?
+                        (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0;
+                    continue;
+                }
+                var result = new StorageOperationResult ();
+                result.actual_state = status;
+                if (selftest_terminal_success (status)) {
+                    result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
+                    result.summary = "Drive self-test completed";
+                } else if (selftest_terminal_cancelled (status)) {
+                    result.fail ("Drive self-test stopped");
+                    result.status = StorageOperationStatus.CANCELLED;
+                } else {
+                    result.fail ("Drive self-test failed");
+                    result.technical_error = status == "" ? "The backend reported no final self-test state." : status;
+                }
+                jobs.finish (job, result); finished += entry;
+            }
+            foreach (var entry in finished) active_selftests.remove (entry);
+
+            foreach (var drive in snapshot.drives.get_values ()) {
+                if (drive.smart_selftest_status != "inprogress" || active_selftests.contains (drive.path)) continue;
+                string[] affected = { drive.path };
+                if (drive.medium != null) affected += drive.medium.path;
+                var job = jobs.begin_named ("Drive self-test", drive.name, affected);
+                active_selftests.insert (drive.path, job);
+                job.state = StorageJobState.RUNNING; job.phase = "Drive self-test in progress";
+                job.progress_valid = drive.smart_selftest_remaining >= 0;
+                job.progress = job.progress_valid ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0;
+            }
         }
 
         private void synchronize_jobs () {
@@ -438,8 +505,11 @@ namespace MajorisDisks {
             if (target == null) throw new IOError.NOT_FOUND ("The drive has no available media.");
             var proxy = require_drive (drive, nvme ? "NVMe.Controller" : "Drive.Ata");
             locks.acquire (target, snapshot.dependencies);
-            var job = jobs.begin (stop ? "Stop drive self-test" : "Start drive self-test", target,
-                snapshot.dependencies); var result = new StorageOperationResult ();
+            var existing = active_selftests.lookup (drive.path);
+            var job = stop && existing != null ? existing : jobs.begin (
+                stop ? "Stop drive self-test" : "Drive self-test", target, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            if (!stop) active_selftests.insert (drive.path, job);
             try {
                 jobs.phase (job, StorageJobState.RUNNING, stop ? "Stopping self-test" : "Starting " + type + " self-test");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
@@ -457,10 +527,23 @@ namespace MajorisDisks {
                 }
                 if (!observed)
                     throw new IOError.TIMED_OUT ("UDisks accepted the self-test request, but its resulting state was not observed.");
-                result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
-                result.summary = stop ? "Self-test stopped" : "Self-test started";
-                result.actual_state = drive.smart_selftest_status; jobs.finish (job, result);
+                if (stop) {
+                    result.fail ("Drive self-test stopped"); result.status = StorageOperationStatus.CANCELLED;
+                    result.actual_state = drive.smart_selftest_status; jobs.finish (job, result);
+                    active_selftests.remove (drive.path);
+                } else if (drive.smart_selftest_status == "inprogress") {
+                    active_selftests.insert (drive.path, job);
+                    jobs.phase (job, StorageJobState.RUNNING, "Drive self-test in progress");
+                    job.progress_valid = drive.smart_selftest_remaining >= 0;
+                    job.progress = job.progress_valid ?
+                        (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0;
+                } else {
+                    result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
+                    result.summary = "Drive self-test completed"; result.actual_state = drive.smart_selftest_status;
+                    jobs.finish (job, result);
+                }
             } catch (Error error) {
+                if (!stop && active_selftests.lookup (drive.path) == job) active_selftests.remove (drive.path);
                 result.fail (stop ? "The self-test could not be stopped" : "The self-test could not be started", error);
                 jobs.finish (job, result); throw error;
             } finally { locks.release (target); }
@@ -468,22 +551,26 @@ namespace MajorisDisks {
 
         public async void drive_action (StorageDrive drive, string action) throws Error {
             var target = drive.medium;
-            if (target == null) throw new IOError.NOT_FOUND ("The drive has no available media.");
             bool eject = action == "Eject"; bool power_off = action == "PowerOff";
             bool standby = action == "PmStandby"; bool wake = action == "PmWakeup";
             if ((!eject && !power_off && !standby && !wake) || (eject && !drive.ejectable) ||
                 (power_off && !drive.can_power_off) || ((standby || wake) && !drive.ata_power_management))
                 throw new IOError.NOT_SUPPORTED ("The selected drive does not support this hardware action.");
-            var safety = StorageSafetyService.assess (target, snapshot.dependencies);
-            if ((eject || power_off) && (safety.system_critical || safety.unknown_dependencies))
-                throw new IOError.PERMISSION_DENIED ("System-critical or unresolved storage cannot be removed or powered off.");
+            if (target == null && !eject) throw new IOError.NOT_FOUND ("The drive has no available media.");
+            if (target != null) {
+                var safety = StorageSafetyService.assess (target, snapshot.dependencies);
+                if ((eject || power_off) && (safety.system_critical || safety.unknown_dependencies))
+                    throw new IOError.PERMISSION_DENIED ("System-critical or unresolved storage cannot be removed or powered off.");
+            }
             string serial = drive.serial; string wwn = drive.wwn;
-            locks.acquire (target, snapshot.dependencies);
-            var job = jobs.begin (eject ? "Eject drive" : power_off ? "Power off drive" :
-                standby ? "Standby drive" : "Wake drive", target, snapshot.dependencies);
+            if (target != null) locks.acquire (target, snapshot.dependencies);
+            string operation = eject ? "Eject drive" : power_off ? "Power off drive" :
+                standby ? "Standby drive" : "Wake drive";
+            var job = target != null ? jobs.begin (operation, target, snapshot.dependencies) :
+                jobs.begin_named (operation, drive.name, { drive.path });
             var result = new StorageOperationResult (); StoragePreparationJournal? preparation = null;
             try {
-                if (eject || power_off) {
+                if ((eject || power_off) && target != null) {
                     jobs.phase (job, StorageJobState.PREPARING, "Preparing active storage");
                     preparation = yield prepare_for_modification (target, backend_lifetime);
                 }
@@ -501,6 +588,9 @@ namespace MajorisDisks {
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
                     uint8 state = state_reply.get_child_value (0).get_byte ();
                     verified = standby ? state == 0 : state != 0;
+                } else if (eject && target == null) {
+                    verified = true;
+                    result.actual_state = "The empty optical drive accepted the eject request.";
                 } else {
                     for (int attempt = 0; attempt < 30 && !verified; attempt++) {
                         synchronize (); verified = snapshot.drives.lookup (drive.path) != drive || !drive.available;
@@ -512,17 +602,72 @@ namespace MajorisDisks {
                 result.summary = job.operation + " completed"; jobs.finish (job, result);
             } catch (Error error) {
                 synchronize ();
+                string restoration_error = "";
                 if (preparation != null && snapshot.drives.lookup (drive.path) == drive && drive.available &&
                     !preparation.fully_restored ()) {
                     result.restoration_attempted = true;
                     try { yield restore_preparation (preparation, backend_lifetime); result.restoration_succeeded = true; }
-                    catch (Error restore_error) { result.restoration_succeeded = false; result.technical_error = restore_error.message; }
+                    catch (Error restore_error) { result.restoration_succeeded = false; restoration_error = restore_error.message; }
                 }
                 result.fail (job.operation + " failed", error);
-                if (result.restoration_attempted && !result.restoration_succeeded)
+                if (result.restoration_attempted && !result.restoration_succeeded) {
                     result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.technical_error += "\nRestoration also failed: " + restoration_error;
+                }
                 jobs.finish (job, result); throw error;
-            } finally { locks.release (target); }
+            } finally { if (target != null) locks.release (target); }
+        }
+
+        public async void set_drive_configuration (StorageDrive drive,
+            bool standby_set, int standby, bool apm_set, int apm, bool aam_set, int aam,
+            bool write_cache_set, bool write_cache, bool read_lookahead_set, bool read_lookahead) throws Error {
+            if (drive.nvme_state != "") throw new IOError.NOT_SUPPORTED ("ATA settings are not available for NVMe drives.");
+            if ((standby_set && (!drive.ata_power_management || drive.rotation == 0)) ||
+                (apm_set && !drive.ata_apm_supported) || (aam_set && !drive.ata_aam_supported) ||
+                (write_cache_set && !drive.ata_write_cache_supported) ||
+                (read_lookahead_set && !drive.ata_read_lookahead_supported))
+                throw new IOError.NOT_SUPPORTED ("The drive does not support one or more selected settings.");
+            if (standby < 0 || standby > 255 || apm < 1 || apm > 255 || aam < 0 || aam > 254)
+                throw new IOError.INVALID_ARGUMENT ("A drive setting is outside its supported range.");
+
+            string serial = drive.serial; string wwn = drive.wwn;
+            var proxy = require_drive (drive, "Drive");
+            var builder = new VariantBuilder (new VariantType ("a{sv}"));
+            VariantIter iterator = drive.drive_configuration.iterator ();
+            string key; Variant value;
+            while (iterator.next ("{sv}", out key, out value)) {
+                if (key != "ata-pm-standby" && key != "ata-apm-level" && key != "ata-aam-level" &&
+                    key != "ata-write-cache-enabled" && key != "ata-read-lookahead-enabled")
+                    builder.add ("{sv}", key, value);
+            }
+            if (standby_set) builder.add ("{sv}", "ata-pm-standby", new Variant.int32 (standby));
+            if (apm_set) builder.add ("{sv}", "ata-apm-level", new Variant.int32 (apm));
+            if (aam_set) builder.add ("{sv}", "ata-aam-level", new Variant.int32 (aam < 128 ? 0 : aam));
+            if (write_cache_set) builder.add ("{sv}", "ata-write-cache-enabled", new Variant.boolean (write_cache));
+            if (read_lookahead_set) builder.add ("{sv}", "ata-read-lookahead-enabled", new Variant.boolean (read_lookahead));
+            var configuration = builder.end ();
+            var options = new VariantBuilder (new VariantType ("a{sv}"));
+            var job = jobs.begin_named ("Configure drive", drive.name, { drive.path });
+            var result = new StorageOperationResult ();
+            try {
+                jobs.phase (job, StorageJobState.RUNNING, "Applying drive settings");
+                yield proxy.call ("SetConfiguration", new Variant.tuple ({ configuration, options.end () }),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                synchronize ();
+                if (snapshot.drives.lookup (drive.path) != drive || drive.serial != serial || drive.wwn != wwn)
+                    throw new IOError.NOT_FOUND ("The drive identity changed while applying settings.");
+                Variant actual = drive.drive_configuration;
+                bool verified = (!standby_set || actual.lookup_value ("ata-pm-standby", VariantType.INT32)?.get_int32 () == standby) &&
+                    (!apm_set || actual.lookup_value ("ata-apm-level", VariantType.INT32)?.get_int32 () == apm) &&
+                    (!aam_set || actual.lookup_value ("ata-aam-level", VariantType.INT32)?.get_int32 () == (aam < 128 ? 0 : aam)) &&
+                    (!write_cache_set || actual.lookup_value ("ata-write-cache-enabled", VariantType.BOOLEAN)?.get_boolean () == write_cache) &&
+                    (!read_lookahead_set || actual.lookup_value ("ata-read-lookahead-enabled", VariantType.BOOLEAN)?.get_boolean () == read_lookahead);
+                if (!verified) throw new IOError.FAILED ("UDisks did not retain every requested drive setting.");
+                result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
+                result.summary = "Drive settings saved"; jobs.finish (job, result);
+            } catch (Error error) {
+                result.fail ("Drive settings were not saved", error); jobs.finish (job, result); throw error;
+            }
         }
 
         public string modification_identity (StorageBlock block) {
