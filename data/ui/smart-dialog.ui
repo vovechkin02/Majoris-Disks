@@ -5,6 +5,13 @@
     <property name="extra-child">
       <object class="GtkBox"><property name="orientation">vertical</property>
         <child><object class="AdwPreferencesGroup" id="summary_group"><property name="title">Health summary</property></object></child>
+        <child><object class="AdwPreferencesGroup"><property name="title">Self-test</property>
+          <child><object class="AdwComboRow" id="selftest_type"><property name="title">Test type</property></object></child>
+          <child><object class="AdwActionRow" id="selftest_result"><property name="title">Test status</property>
+            <child type="suffix"><object class="GtkButton" id="start_selftest"><property name="label">Start</property><property name="valign">center</property></object></child>
+            <child type="suffix"><object class="GtkButton" id="stop_selftest"><property name="label">Stop</property><property name="valign">center</property></object></child>
+          </object></child>
+        </object></child>
         <child><object class="AdwPreferencesGroup"><property name="title">Detailed attributes</property>
           <child><object class="GtkListBox" id="attributes"><property name="selection-mode">none</property><style><class name="boxed-list"/></style></object></child>
         </object></child>

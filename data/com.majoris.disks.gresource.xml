@@ -29,5 +29,6 @@
     <file>ui/change-passphrase-dialog.ui</file>
     <file>ui/encryption-options-dialog.ui</file>
     <file>ui/smart-dialog.ui</file>
+    <file>ui/hardware-action-confirmation-dialog.ui</file>
   </gresource>
 </gresources>

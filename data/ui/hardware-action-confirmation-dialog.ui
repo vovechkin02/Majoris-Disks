@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksHardwareActionConfirmationDialog" parent="AdwAlertDialog">
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="continue" appearance="destructive">Continue</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

@@ -31,7 +31,8 @@ public static int main (string[] args) {
         new JobRow (backend, job), new JobsPopover (backend), new ActiveJobsDialog (),
         new MountOptionsDialog (block, "identity"), new UnlockVolumeDialog (block),
         new LockVolumeConfirmationDialog (), new ChangePassphraseDialog (block),
-        new EncryptionOptionsDialog (block, null, "identity"), new SmartDialog (drive, health_report)
+        new HardwareActionConfirmationDialog (),
+        new EncryptionOptionsDialog (block, "identity"), new SmartDialog (backend, drive, health_report)
     };
     string[] resources = {
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
@@ -42,7 +43,7 @@ public static int main (string[] args) {
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
         "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui",
         "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui", "encryption-options-dialog.ui",
-        "smart-dialog.ui"
+        "smart-dialog.ui", "hardware-action-confirmation-dialog.ui"
     };
     foreach (var name in resources) {
         try { resources_lookup_data ("/com/majoris/disks/ui/" + name, ResourceLookupFlags.NONE); }

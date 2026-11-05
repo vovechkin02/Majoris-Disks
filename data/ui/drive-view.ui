@@ -9,6 +9,12 @@
 <child type="prefix"><object class="GtkImage" id="drive_icon"/></child>
 <child type="suffix"><object class="GtkButton" id="initialize_disk"><property name="label">Initialize Disk</property><property name="valign">center</property></object></child>
 <child type="suffix"><object class="GtkButton" id="health"><property name="label">Health</property><property name="valign">center</property><property name="visible">false</property></object></child>
+<child type="suffix"><object class="GtkMenuButton" id="drive_actions"><property name="label">Drive Actions</property><property name="valign">center</property><property name="popover"><object class="GtkPopover"><property name="child"><object class="GtkBox"><property name="orientation">vertical</property>
+  <child><object class="GtkButton" id="eject_drive"><property name="label">Eject</property></object></child>
+  <child><object class="GtkButton" id="power_off_drive"><property name="label">Safe Power Off</property></object></child>
+  <child><object class="GtkButton" id="standby_drive"><property name="label">Standby</property></object></child>
+  <child><object class="GtkButton" id="wake_drive"><property name="label">Wake</property></object></child>
+</object></property></object></property></object></child>
 <child type="suffix"><object class="GtkButton" id="information"><property name="label">Information</property><property name="valign">center</property></object></child></object></child></object></child>
 <child><object class="MajorisDisksPartitionMap" id="map"/></child>
 <child><object class="GtkListBox" id="volumes"><style><class name="boxed-list"/></style></object></child>

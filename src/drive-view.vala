@@ -5,6 +5,11 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Image drive_icon;
         [GtkChild] private unowned Gtk.Button information;
         [GtkChild] private unowned Gtk.Button health;
+        [GtkChild] private unowned Gtk.MenuButton drive_actions;
+        [GtkChild] private unowned Gtk.Button eject_drive;
+        [GtkChild] private unowned Gtk.Button power_off_drive;
+        [GtkChild] private unowned Gtk.Button standby_drive;
+        [GtkChild] private unowned Gtk.Button wake_drive;
         [GtkChild] private unowned PartitionMap map;
         [GtkChild] private unowned Gtk.ListBox volumes;
         [GtkChild] private unowned Adw.PreferencesGroup properties;
@@ -50,6 +55,7 @@ namespace MajorisDisks {
         private FilesystemUsageService usage_service = new FilesystemUsageService ();
         public signal void action_requested (StorageBlock block, string method);
         public signal void health_requested (StorageDrive drive);
+        public signal void drive_action_requested (StorageDrive drive, string action);
         public signal void open_failed ();
         public void invalidate_usage (StorageBlock block) { usage_service.invalidate (block.path); if (target == block) usage.label = usage_service.show (block); }
 
@@ -63,6 +69,10 @@ namespace MajorisDisks {
                 if (current != null) new DriveInformationDialog (current).present (this);
             });
             health.clicked.connect (() => { if (current != null) health_requested (current); });
+            eject_drive.clicked.connect (() => request_drive_action ("Eject"));
+            power_off_drive.clicked.connect (() => request_drive_action ("PowerOff"));
+            standby_drive.clicked.connect (() => request_drive_action ("PmStandby"));
+            wake_drive.clicked.connect (() => request_drive_action ("PmWakeup"));
             map.region_selected.connect ((identity) => {
                 for (int i = 0; ; i++) {
                     var row = volumes.get_row_at_index (i) as VolumeRow;
@@ -146,6 +156,11 @@ namespace MajorisDisks {
             initialize_disk.visible = disk != null && disk.available && !disk.read_only && !disk.system_hint;
             summary.title = drive.name;
             health.visible = drive.smart || drive.nvme_state != "";
+            eject_drive.visible = drive.ejectable;
+            power_off_drive.visible = drive.can_power_off;
+            standby_drive.visible = drive.ata_power_management;
+            wake_drive.visible = drive.ata_power_management;
+            drive_actions.visible = eject_drive.visible || power_off_drive.visible || standby_drive.visible;
             drive_icon.icon_name = drive.icon;
             summary.subtitle = drive.available ? format_size (drive.size) : "No media available";
             if (disk != null) summary.subtitle += " · " + disk.preferred;
@@ -186,6 +201,11 @@ namespace MajorisDisks {
             map.update (disk);
             updating = false;
             show_volume (chosen);
+        }
+
+        private void request_drive_action (string action) {
+            if (current != null) drive_action_requested (current, action);
+            drive_actions.popover?.popdown ();
         }
 
         private void show_volume (VolumeRow? row) {

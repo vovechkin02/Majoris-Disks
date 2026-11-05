@@ -24,6 +24,8 @@ namespace MajorisDisks {
         public int rotation;
         public bool removable;
         public bool ejectable;
+        public bool can_power_off;
+        public bool ata_power_management;
         public bool smart;
         public bool optical;
         public string media = "";
@@ -110,6 +112,7 @@ namespace MajorisDisks {
         public StorageMountConfiguration? mount_configuration;
         public StorageMountConfiguration[] mount_configurations = {};
         public StorageEncryptionConfiguration? encryption_configuration;
+        public StorageEncryptionConfiguration[] encryption_configurations = {};
 
         public StorageBlock (string path) {
             base (path);

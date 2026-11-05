@@ -4,6 +4,7 @@
     <property name="heading">Encryption Options</property>
     <property name="extra-child">
       <object class="AdwPreferencesGroup">
+        <child><object class="AdwComboRow" id="entry"><property name="title">Configuration entry</property></object></child>
         <child><object class="AdwSwitchRow" id="custom"><property name="title">Use persistent unlocking configuration</property></object></child>
         <child><object class="AdwSwitchRow" id="startup"><property name="title">Unlock at system startup</property></object></child>
         <child><object class="AdwEntryRow" id="mapping_name"><property name="title">Clear-text mapping name</property></object></child>

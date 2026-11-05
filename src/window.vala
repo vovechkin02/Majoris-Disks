@@ -66,6 +66,7 @@ namespace MajorisDisks {
             drive_view.passphrase_requested.connect (change_passphrase);
             drive_view.encryption_options_requested.connect (edit_encryption_options);
             drive_view.health_requested.connect (show_health);
+            drive_view.drive_action_requested.connect (confirm_drive_action);
             drive_view.format_requested.connect ((block) => confirm_partitioning (block, false, true));
             var jobs_popover = new JobsPopover (backend);
             jobs_button.popover = jobs_popover;
@@ -205,8 +206,7 @@ namespace MajorisDisks {
                     string passphrase = dialog.passphrase;
                     dialog.clear_secret ();
                     pending.insert (block.path, block);
-                    backend.unlock_volume.begin (block, passphrase, identity, dialog.pim_value,
-                        dialog.hidden, dialog.system, dialog.keyfiles, (object, result) => {
+                    backend.unlock_volume.begin (block, passphrase, identity, dialog.keyfile_path, (object, result) => {
                         passphrase = ""; pending.remove (block.path);
                         try {
                             var outcome = backend.unlock_volume.end (result);
@@ -265,13 +265,7 @@ namespace MajorisDisks {
         private void edit_encryption_options (StorageBlock block) {
             if (pending.contains (block.path)) return;
             string identity = backend.modification_identity (block);
-            backend.secret_encryption_configuration.begin (block, (object, result) => {
-                StorageEncryptionConfiguration? configuration;
-                try { configuration = backend.secret_encryption_configuration.end (result); }
-                catch (Error error) {
-                    show_check_message ("Could not read encryption options", operation_error (error)); return;
-                }
-                var dialog = new EncryptionOptionsDialog (block, configuration, identity);
+                var dialog = new EncryptionOptionsDialog (block, identity);
                 dialog.response.connect ((response) => {
                     if (response != "apply" || pending.contains (block.path)) return;
                     string passphrase = dialog.new_passphrase;
@@ -290,13 +284,30 @@ namespace MajorisDisks {
                         });
                 });
                 dialog.present (this);
-            });
         }
         private void show_health (StorageDrive drive) {
             backend.query_health.begin (drive, true, (object, result) => {
-                try { new SmartDialog (drive, backend.query_health.end (result)).present (this); }
+                try { new SmartDialog (backend, drive, backend.query_health.end (result)).present (this); }
                 catch (Error error) { show_check_message ("Could not read drive health", operation_error (error)); }
             });
+        }
+        private void confirm_drive_action (StorageDrive drive, string action) {
+            void run () {
+                backend.drive_action.begin (drive, action, (object, result) => {
+                    try {
+                        backend.drive_action.end (result);
+                        notifications.add_toast (new Adw.Toast (action == "Eject" ? "Drive ejected" :
+                            action == "PowerOff" ? "Drive powered off" : action == "PmStandby" ?
+                            "Drive entered standby" : "Drive awakened"));
+                    } catch (Error error) { show_check_message ("Drive action failed", operation_error (error)); }
+                });
+            }
+            if (action != "Eject" && action != "PowerOff") { run (); return; }
+            var dialog = new HardwareActionConfirmationDialog ();
+            dialog.heading = action == "Eject" ? "Eject this drive?" : "Safely power off this drive?";
+            dialog.body = "Active filesystems will be safely unmounted first. System-critical storage is protected.";
+            dialog.response.connect ((response) => { if (response == "continue") run (); });
+            dialog.present (this);
         }
         private void confirm_partitioning (StorageBlock block, bool deleting, bool volume = false) {
             string identity = backend.modification_identity (block);
@@ -561,29 +572,21 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button choose_keyfile;
         private string[] selected_keyfiles = {};
         public string passphrase { owned get { return secret.text; } }
-        public uint32 pim_value { get {
-            if (pim.text.strip () == "") return 0;
-            try { return (uint32) uint64.parse (pim.text); } catch (Error error) { return 0; }
-        } }
-        public bool hidden { get { return hidden_volume.active; } }
-        public bool system { get { return system_volume.active; } }
-        public string[] keyfiles { owned get { return selected_keyfiles; } }
+        public string keyfile_path { owned get { return selected_keyfiles.length == 0 ? "" : selected_keyfiles[0]; } }
         public UnlockVolumeDialog (StorageBlock block) {
             body = "%s · %s".printf (block.preferred, format_size (block.size));
             bool veracrypt = block.type_id == "crypto_TCRYPT" || block.type_id == "crypto_unknown";
             pim.visible = veracrypt; hidden_volume.visible = veracrypt; system_volume.visible = veracrypt;
             keyfile_row.visible = veracrypt;
-            secret.changed.connect (validate); pim.changed.connect (validate);
+            pim.sensitive = false; pim.text = "Unavailable through the UDisks backend";
+            hidden_volume.sensitive = false; hidden_volume.subtitle = "Requires an authorised cryptsetup backend";
+            system_volume.sensitive = false; system_volume.subtitle = "Requires an authorised cryptsetup backend";
+            secret.changed.connect (validate);
             choose_keyfile.clicked.connect (select_keyfile);
             validate ();
         }
         private void validate () {
-            bool pim_valid = true;
-            if (pim.visible && pim.text.strip () != "") {
-                try { uint64 value = uint64.parse (pim.text); pim_valid = value > 0 && value <= uint32.MAX; }
-                catch (Error error) { pim_valid = false; }
-            }
-            set_response_enabled ("unlock", pim_valid && (secret.text.length > 0 || selected_keyfiles.length > 0));
+            set_response_enabled ("unlock", secret.text.length > 0 || selected_keyfiles.length > 0);
         }
         private void select_keyfile () {
             var chooser = new Gtk.FileDialog (); chooser.title = "Select a VeraCrypt keyfile";
@@ -600,6 +603,9 @@ namespace MajorisDisks {
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/lock-volume-confirmation-dialog.ui")]
     public class LockVolumeConfirmationDialog : Adw.AlertDialog {}
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/hardware-action-confirmation-dialog.ui")]
+    public class HardwareActionConfirmationDialog : Adw.AlertDialog {}
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/change-passphrase-dialog.ui")]
     public class ChangePassphraseDialog : Adw.AlertDialog {
@@ -628,6 +634,7 @@ namespace MajorisDisks {
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/encryption-options-dialog.ui")]
     public class EncryptionOptionsDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow entry;
         [GtkChild] private unowned Adw.SwitchRow custom;
         [GtkChild] private unowned Adw.SwitchRow startup;
         [GtkChild] private unowned Adw.EntryRow mapping_name;
@@ -642,21 +649,35 @@ namespace MajorisDisks {
         public string new_passphrase { owned get { return secret.text; } }
         public string confirmed_identity { get; private set; }
         public string confirmed_uuid { get; private set; }
-        public Variant? original_item { get; private set; }
-        public EncryptionOptionsDialog (StorageBlock block, StorageEncryptionConfiguration? configuration,
-            string identity) {
+        private StorageBlock block;
+        private Gtk.StringList entries = new Gtk.StringList (null);
+        public Variant? original_item { owned get {
+            return entry.selected < block.encryption_configurations.length ?
+                block.encryption_configurations[entry.selected].backend_item : null;
+        } }
+        public EncryptionOptionsDialog (StorageBlock block, string identity) {
+            this.block = block;
             confirmed_identity = identity; confirmed_uuid = block.uuid;
-            original_item = configuration?.backend_item;
+            entry.model = entries;
+            foreach (var configuration in block.encryption_configurations)
+                entries.append (configuration.name + " · " + configuration.device);
+            entries.append ("New configuration"); entry.selected = 0;
+            identifier.subtitle = "UUID=" + block.uuid;
+            entry.notify["selected"].connect (load_selected);
+            custom.notify["active"].connect (validate); startup.notify["active"].connect (validate);
+            mapping_name.changed.connect (validate); options.changed.connect (validate); secret.changed.connect (validate);
+            load_selected ();
+        }
+        private void load_selected () {
+            var configuration = entry.selected < block.encryption_configurations.length ?
+                block.encryption_configurations[entry.selected] : null;
             custom.active = configuration != null;
             mapping_name.text = configuration?.name ?? "luks-" + block.uuid;
             options.text = configuration?.options ?? (block.physical_drive?.removable == true ? "nofail,noauto" : "nofail");
             startup.active = !("," + options.text + ",").contains (",noauto,");
             keyfile.subtitle = configuration == null || configuration.passphrase_path == "" ? "None" :
                 configuration.passphrase_path;
-            identifier.subtitle = "UUID=" + block.uuid;
-            custom.notify["active"].connect (validate); startup.notify["active"].connect (validate);
-            mapping_name.changed.connect (validate); options.changed.connect (validate); secret.changed.connect (validate);
-            validate ();
+            secret.text = ""; validate ();
         }
         private void validate () {
             bool fields = custom.active;
@@ -677,7 +698,13 @@ namespace MajorisDisks {
     public class SmartDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.PreferencesGroup summary_group;
         [GtkChild] private unowned Gtk.ListBox attributes;
-        public SmartDialog (StorageDrive drive, StorageHealthReport report) {
+        [GtkChild] private unowned Adw.ComboRow selftest_type;
+        [GtkChild] private unowned Adw.ActionRow selftest_result;
+        [GtkChild] private unowned Gtk.Button start_selftest;
+        [GtkChild] private unowned Gtk.Button stop_selftest;
+        private Gtk.StringList test_names = new Gtk.StringList (null);
+        private string[] test_types = {};
+        public SmartDialog (UDisksService backend, StorageDrive drive, StorageHealthReport report) {
             heading = report.nvme ? "NVMe Health" : "SMART Data";
             body = drive.name + (drive.serial == "" ? "" : " · " + drive.serial);
             add_summary ("Overall assessment", report.overall);
@@ -692,6 +719,27 @@ namespace MajorisDisks {
             add_summary ("Last updated", updated);
             add_summary ("Self-test", report.selftest + (report.selftest_remaining >= 0 ?
                 " · " + report.selftest_remaining.to_string () + "% remaining" : ""));
+            selftest_result.subtitle = report.selftest;
+            selftest_type.model = test_names; add_test ("short", "Short"); add_test ("extended", "Extended");
+            if (!report.nvme) add_test ("conveyance", "Conveyance");
+            stop_selftest.sensitive = report.selftest == "inprogress";
+            start_selftest.clicked.connect (() => {
+                if (selftest_type.selected >= test_types.length) return;
+                set_test_busy (true); string selected = test_types[selftest_type.selected];
+                backend.run_selftest.begin (drive, selected, false, (object, result) => {
+                    set_test_busy (false);
+                    try { backend.run_selftest.end (result); selftest_result.subtitle = "inprogress"; stop_selftest.sensitive = true; }
+                    catch (Error error) { selftest_result.subtitle = error.message; }
+                });
+            });
+            stop_selftest.clicked.connect (() => {
+                set_test_busy (true);
+                backend.run_selftest.begin (drive, "short", true, (object, result) => {
+                    set_test_busy (false);
+                    try { backend.run_selftest.end (result); selftest_result.subtitle = "aborted"; stop_selftest.sensitive = false; }
+                    catch (Error error) { selftest_result.subtitle = error.message; }
+                });
+            });
             if (report.warnings.length != 0) add_summary ("Critical warnings", string.joinv (", ", report.warnings));
             if (report.nvme) {
                 add_attribute ("Media/data integrity errors", report.media_errors.to_string ());
@@ -704,6 +752,10 @@ namespace MajorisDisks {
                     item.threshold < 0 ? "Unknown" : item.threshold.to_string (), item.assessment, item.description);
                 add_attribute ("%u · %s".printf (item.id, item.name), values);
             }
+        }
+        private void add_test (string type, string title) { test_types += type; test_names.append (title); }
+        private void set_test_busy (bool busy) {
+            start_selftest.sensitive = !busy; stop_selftest.sensitive = !busy;
         }
         private void add_summary (string title, string value) {
             summary_group.add (new InformationRow (title, value, false));
