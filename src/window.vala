@@ -316,11 +316,11 @@ namespace MajorisDisks {
             dialog.response.connect ((response) => {
                 if (response != "apply") return;
                 dialog.set_response_enabled ("apply", false);
-                backend.set_drive_configuration.begin (drive,
-                    dialog.standby_set, dialog.standby_value,
-                    dialog.apm_set, dialog.apm_value, dialog.aam_set, dialog.aam_value,
-                    dialog.write_cache_set, dialog.write_cache_value,
-                    dialog.read_lookahead_set, dialog.read_lookahead_value, (object, result) => {
+                backend.set_drive_configuration.begin (drive, dialog.baseline,
+                    dialog.standby_intent, dialog.standby_value,
+                    dialog.apm_intent, dialog.apm_value, dialog.aam_intent, dialog.aam_value,
+                    dialog.write_cache_intent, dialog.write_cache_value,
+                    dialog.read_lookahead_intent, dialog.read_lookahead_value, (object, result) => {
                         try {
                             backend.set_drive_configuration.end (result);
                             notifications.add_toast (new Adw.Toast ("Drive settings saved"));
@@ -734,18 +734,20 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.SwitchRow read_lookahead_enabled;
         [GtkChild] private unowned Adw.SwitchRow read_lookahead;
 
-        public bool standby_set { get { return standby_enabled.active; } }
+        public Variant baseline { get; private set; }
+        public StorageSettingIntent standby_intent { get { return integer_intent ("ata-pm-standby", standby_enabled, standby, false); } }
         public int standby_value { get { return (int) standby.value; } }
-        public bool apm_set { get { return apm_enabled.active; } }
+        public StorageSettingIntent apm_intent { get { return integer_intent ("ata-apm-level", apm_enabled, apm, false); } }
         public int apm_value { get { return (int) apm.value; } }
-        public bool aam_set { get { return aam_enabled.active; } }
+        public StorageSettingIntent aam_intent { get { return integer_intent ("ata-aam-level", aam_enabled, aam, true); } }
         public int aam_value { get { return (int) aam.value; } }
-        public bool write_cache_set { get { return write_cache_enabled.active; } }
+        public StorageSettingIntent write_cache_intent { get { return boolean_intent ("ata-write-cache-enabled", write_cache_enabled, write_cache); } }
         public bool write_cache_value { get { return write_cache.active; } }
-        public bool read_lookahead_set { get { return read_lookahead_enabled.active; } }
+        public StorageSettingIntent read_lookahead_intent { get { return boolean_intent ("ata-read-lookahead-enabled", read_lookahead_enabled, read_lookahead); } }
         public bool read_lookahead_value { get { return read_lookahead.active; } }
 
         public DriveSettingsDialog (StorageDrive drive) {
+            baseline = drive.drive_configuration;
             body = drive.name + (drive.serial == "" ? "" : " · " + drive.serial) +
                 "\nSettings are stored by UDisks and may be reapplied when the drive reconnects.";
             setup_integer (drive.drive_configuration, "ata-pm-standby", standby_enabled, standby, 120);
@@ -758,6 +760,45 @@ namespace MajorisDisks {
             set_pair_available (aam_enabled, aam, drive.ata_aam_supported);
             set_pair_available (write_cache_enabled, write_cache, drive.ata_write_cache_supported);
             set_pair_available (read_lookahead_enabled, read_lookahead, drive.ata_read_lookahead_supported);
+            standby.notify["value"].connect (update_state); apm.notify["value"].connect (update_state);
+            aam.notify["value"].connect (update_state); write_cache.notify["active"].connect (update_state);
+            read_lookahead.notify["active"].connect (update_state);
+            standby_enabled.notify["active"].connect (update_state); apm_enabled.notify["active"].connect (update_state);
+            aam_enabled.notify["active"].connect (update_state); write_cache_enabled.notify["active"].connect (update_state);
+            read_lookahead_enabled.notify["active"].connect (update_state);
+            update_state ();
+        }
+        private StorageSettingIntent integer_intent (string key, Adw.SwitchRow enabled,
+            Adw.SpinRow row, bool encode_aam) {
+            var original = baseline.lookup_value (key, VariantType.INT32);
+            if (!enabled.active) return original == null ? StorageSettingIntent.UNCHANGED : StorageSettingIntent.RESET;
+            int requested = (int) row.value; if (encode_aam && requested < 128) requested = 0;
+            return original != null && original.get_int32 () == requested ?
+                StorageSettingIntent.UNCHANGED : StorageSettingIntent.SET;
+        }
+        private StorageSettingIntent boolean_intent (string key, Adw.SwitchRow enabled, Adw.SwitchRow row) {
+            var original = baseline.lookup_value (key, VariantType.BOOLEAN);
+            if (!enabled.active) return original == null ? StorageSettingIntent.UNCHANGED : StorageSettingIntent.RESET;
+            return original != null && original.get_boolean () == row.active ?
+                StorageSettingIntent.UNCHANGED : StorageSettingIntent.SET;
+        }
+        private void update_state () {
+            bool changed = standby_intent != StorageSettingIntent.UNCHANGED ||
+                apm_intent != StorageSettingIntent.UNCHANGED || aam_intent != StorageSettingIntent.UNCHANGED ||
+                write_cache_intent != StorageSettingIntent.UNCHANGED ||
+                read_lookahead_intent != StorageSettingIntent.UNCHANGED;
+            set_response_enabled ("apply", changed);
+            int standby_code = (int) standby.value;
+            standby.subtitle = standby_code == 0 ? "Never enter standby" : standby_code <= 240 ?
+                "%d minutes %d seconds".printf ((standby_code * 5) / 60, (standby_code * 5) % 60) :
+                "Special ATA timeout value %d".printf (standby_code);
+            int apm_code = (int) apm.value;
+            apm.subtitle = apm_code == 255 ? "APM disabled" : apm_code <= 127 ?
+                "%d · power saving with spin-down permitted".printf (apm_code) :
+                "%d · performance, spin-down not permitted".printf (apm_code);
+            int aam_code = (int) aam.value;
+            aam.subtitle = aam_code < 128 ? "AAM disabled" : aam_code == 128 ?
+                "128 · quietest" : aam_code == 254 ? "254 · fastest" : aam_code.to_string ();
         }
         private void setup_integer (Variant configuration, string key, Adw.SwitchRow enabled,
             Adw.SpinRow value, int fallback) {

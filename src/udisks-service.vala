@@ -1,4 +1,16 @@
 namespace MajorisDisks {
+    internal enum SelftestOperationState { REQUESTED, STARTING, START_CONFIRMED, RUNNING, STOPPING }
+    internal class SelftestOperation : Object {
+        public StorageJob job;
+        public string type;
+        public string baseline_status;
+        public SelftestOperationState state;
+        public SelftestOperation (StorageJob job, string type, string baseline_status) {
+            this.job = job; this.type = type; this.baseline_status = baseline_status;
+            state = SelftestOperationState.REQUESTED;
+        }
+    }
+
     public class UDisksService : Object {
         public const string PREFIX = "org.freedesktop.UDisks2.";
         private DBusObjectManagerClient? manager;
@@ -9,8 +21,9 @@ namespace MajorisDisks {
         public StorageJobManager jobs { get; private set; default = new StorageJobManager (); }
         private HashTable<string, string> observed_jobs = new HashTable<string, string> (str_hash, str_equal);
         private HashTable<string, string> connected_jobs = new HashTable<string, string> (str_hash, str_equal);
-        private HashTable<string, StorageJob> active_selftests =
-            new HashTable<string, StorageJob> (str_hash, str_equal);
+        private HashTable<string, SelftestOperation> active_selftests =
+            new HashTable<string, SelftestOperation> (str_hash, str_equal);
+        private uint selftest_refresh_source;
         private string? owner;
         private Cancellable backend_lifetime = new Cancellable ();
         public StorageSnapshot snapshot = new StorageSnapshot ();
@@ -329,8 +342,9 @@ namespace MajorisDisks {
             string[] finished = {};
             foreach (var entry in active_selftests.get_keys ()) {
                 var drive = snapshot.drives.lookup (entry);
-                var job = active_selftests.lookup (entry);
-                if (job == null) continue;
+                var operation = active_selftests.lookup (entry);
+                if (operation == null) continue;
+                var job = operation.job;
                 if (drive == null) {
                     var missing = new StorageOperationResult ();
                     missing.fail ("Self-test drive disappeared");
@@ -340,21 +354,24 @@ namespace MajorisDisks {
                 }
                 string status = drive.smart_selftest_status;
                 if (status == "inprogress") {
-                    job.state = StorageJobState.RUNNING;
-                    job.phase = "Drive self-test in progress";
-                    job.progress_valid = drive.smart_selftest_remaining >= 0;
-                    job.progress = job.progress_valid ?
-                        (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0;
+                    operation.state = operation.state == SelftestOperationState.STOPPING ?
+                        SelftestOperationState.STOPPING : SelftestOperationState.RUNNING;
+                    bool valid = drive.smart_selftest_remaining >= 0;
+                    jobs.progress (job, operation.state == SelftestOperationState.STOPPING ?
+                        "Stopping " + operation.type + " self-test" : operation.type + " self-test in progress",
+                        valid ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0, valid);
                     continue;
                 }
+                if (operation.state == SelftestOperationState.REQUESTED ||
+                    operation.state == SelftestOperationState.STARTING ||
+                    operation.state == SelftestOperationState.START_CONFIRMED) continue;
                 var result = new StorageOperationResult ();
                 result.actual_state = status;
-                if (selftest_terminal_success (status)) {
+                if (operation.state == SelftestOperationState.STOPPING || selftest_terminal_cancelled (status)) {
+                    result.fail ("Drive self-test stopped"); result.status = StorageOperationStatus.CANCELLED;
+                } else if (selftest_terminal_success (status)) {
                     result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
-                    result.summary = "Drive self-test completed";
-                } else if (selftest_terminal_cancelled (status)) {
-                    result.fail ("Drive self-test stopped");
-                    result.status = StorageOperationStatus.CANCELLED;
+                    result.summary = operation.type + " drive self-test completed";
                 } else {
                     result.fail ("Drive self-test failed");
                     result.technical_error = status == "" ? "The backend reported no final self-test state." : status;
@@ -368,11 +385,27 @@ namespace MajorisDisks {
                 string[] affected = { drive.path };
                 if (drive.medium != null) affected += drive.medium.path;
                 var job = jobs.begin_named ("Drive self-test", drive.name, affected);
-                active_selftests.insert (drive.path, job);
-                job.state = StorageJobState.RUNNING; job.phase = "Drive self-test in progress";
-                job.progress_valid = drive.smart_selftest_remaining >= 0;
-                job.progress = job.progress_valid ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0;
+                var operation = new SelftestOperation (job, "Running", "");
+                operation.state = SelftestOperationState.RUNNING;
+                active_selftests.insert (drive.path, operation);
+                bool valid = drive.smart_selftest_remaining >= 0;
+                jobs.progress (job, "Drive self-test in progress",
+                    valid ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0, valid);
             }
+            maintain_selftest_refresh ();
+        }
+
+        private void maintain_selftest_refresh () {
+            if (active_selftests.size () == 0) {
+                if (selftest_refresh_source != 0) Source.remove (selftest_refresh_source);
+                selftest_refresh_source = 0; return;
+            }
+            if (selftest_refresh_source != 0) return;
+            selftest_refresh_source = Timeout.add_seconds (5, () => {
+                if (active_selftests.size () == 0) { selftest_refresh_source = 0; return Source.REMOVE; }
+                synchronize ();
+                return Source.CONTINUE;
+            });
         }
 
         private void synchronize_jobs () {
@@ -506,46 +539,66 @@ namespace MajorisDisks {
             var proxy = require_drive (drive, nvme ? "NVMe.Controller" : "Drive.Ata");
             locks.acquire (target, snapshot.dependencies);
             var existing = active_selftests.lookup (drive.path);
-            var job = stop && existing != null ? existing : jobs.begin (
+            if (!stop && existing != null) throw new IOError.BUSY ("A self-test is already active for this drive.");
+            if (stop && existing == null) throw new IOError.NOT_FOUND ("No tracked self-test is running for this drive.");
+            var job = stop ? existing.job : jobs.begin (
                 stop ? "Stop drive self-test" : "Drive self-test", target, snapshot.dependencies);
             var result = new StorageOperationResult ();
-            if (!stop) active_selftests.insert (drive.path, job);
+            SelftestOperation operation;
+            if (stop) operation = existing;
+            else {
+                operation = new SelftestOperation (job, type, drive.smart_selftest_status);
+                active_selftests.insert (drive.path, operation);
+            }
             try {
-                jobs.phase (job, StorageJobState.RUNNING, stop ? "Stopping self-test" : "Starting " + type + " self-test");
+                operation.state = stop ? SelftestOperationState.STOPPING : SelftestOperationState.STARTING;
+                jobs.phase (job, StorageJobState.RUNNING, stop ? "Stopping " + operation.type + " self-test" :
+                    "Starting " + type + " self-test");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
                 if (stop) yield proxy.call ("SmartSelftestAbort", new Variant.tuple ({ options.end () }),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
                 else yield proxy.call ("SmartSelftestStart", new Variant.tuple ({
                     new Variant.string (type), options.end () }), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
                     int.MAX, backend_lifetime);
+                if (!stop) operation.state = SelftestOperationState.START_CONFIRMED;
                 bool observed = false;
                 for (int attempt = 0; attempt < 20 && !observed; attempt++) {
                     synchronize ();
                     observed = stop ? drive.smart_selftest_status != "inprogress" :
-                        drive.smart_selftest_status == "inprogress" || drive.smart_selftest_status == "success";
+                        drive.smart_selftest_status == "inprogress";
                     if (!observed) yield settle_delay (backend_lifetime);
                 }
                 if (!observed)
                     throw new IOError.TIMED_OUT ("UDisks accepted the self-test request, but its resulting state was not observed.");
                 if (stop) {
-                    result.fail ("Drive self-test stopped"); result.status = StorageOperationStatus.CANCELLED;
-                    result.actual_state = drive.smart_selftest_status; jobs.finish (job, result);
-                    active_selftests.remove (drive.path);
-                } else if (drive.smart_selftest_status == "inprogress") {
-                    active_selftests.insert (drive.path, job);
-                    jobs.phase (job, StorageJobState.RUNNING, "Drive self-test in progress");
-                    job.progress_valid = drive.smart_selftest_remaining >= 0;
-                    job.progress = job.progress_valid ?
-                        (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0;
+                    if (active_selftests.contains (drive.path)) {
+                        result.fail ("Drive self-test stopped"); result.status = StorageOperationStatus.CANCELLED;
+                        result.actual_state = drive.smart_selftest_status; jobs.finish (job, result);
+                        active_selftests.remove (drive.path);
+                    }
                 } else {
-                    result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
-                    result.summary = "Drive self-test completed"; result.actual_state = drive.smart_selftest_status;
+                    operation.state = SelftestOperationState.RUNNING;
+                    bool valid = drive.smart_selftest_remaining >= 0;
+                    jobs.progress (job, type + " self-test in progress",
+                        valid ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0, valid);
+                }
+                maintain_selftest_refresh ();
+            } catch (Error error) {
+                if (stop && drive.smart_selftest_status == "inprogress") {
+                    operation.state = SelftestOperationState.RUNNING;
+                    jobs.progress (job, operation.type + " self-test in progress",
+                        drive.smart_selftest_remaining >= 0 ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0,
+                        drive.smart_selftest_remaining >= 0);
+                } else {
+                    active_selftests.remove (drive.path);
+                    bool timed_out = error.matches (IOError.quark (), IOError.TIMED_OUT);
+                    string failure = stop ? "The self-test could not be stopped" :
+                        (timed_out ? "Self-test result is unknown" : "The self-test could not be started");
+                    result.fail (failure, error);
+                    if (timed_out) result.status = StorageOperationStatus.NEEDS_ATTENTION;
                     jobs.finish (job, result);
                 }
-            } catch (Error error) {
-                if (!stop && active_selftests.lookup (drive.path) == job) active_selftests.remove (drive.path);
-                result.fail (stop ? "The self-test could not be stopped" : "The self-test could not be started", error);
-                jobs.finish (job, result); throw error;
+                maintain_selftest_refresh (); throw error;
             } finally { locks.release (target); }
         }
 
@@ -618,56 +671,96 @@ namespace MajorisDisks {
             } finally { if (target != null) locks.release (target); }
         }
 
-        public async void set_drive_configuration (StorageDrive drive,
-            bool standby_set, int standby, bool apm_set, int apm, bool aam_set, int aam,
-            bool write_cache_set, bool write_cache, bool read_lookahead_set, bool read_lookahead) throws Error {
+        private static bool same_configuration_value (Variant left, Variant right, string key, VariantType type) {
+            var left_value = left.lookup_value (key, type);
+            var right_value = right.lookup_value (key, type);
+            return left_value == null ? right_value == null : right_value != null && left_value.equal (right_value);
+        }
+
+        private static bool configuration_matches_intent (Variant actual, string key, VariantType type,
+            StorageSettingIntent intent, Variant? expected) {
+            var value = actual.lookup_value (key, type);
+            if (intent == StorageSettingIntent.RESET) return value == null;
+            if (intent == StorageSettingIntent.UNCHANGED) return true;
+            return value != null && expected != null && value.equal (expected);
+        }
+
+        public async void set_drive_configuration (StorageDrive drive, Variant baseline,
+            StorageSettingIntent standby_intent, int standby,
+            StorageSettingIntent apm_intent, int apm, StorageSettingIntent aam_intent, int aam,
+            StorageSettingIntent write_cache_intent, bool write_cache,
+            StorageSettingIntent read_lookahead_intent, bool read_lookahead) throws Error {
             if (drive.nvme_state != "") throw new IOError.NOT_SUPPORTED ("ATA settings are not available for NVMe drives.");
-            if ((standby_set && (!drive.ata_power_management || drive.rotation == 0)) ||
-                (apm_set && !drive.ata_apm_supported) || (aam_set && !drive.ata_aam_supported) ||
-                (write_cache_set && !drive.ata_write_cache_supported) ||
-                (read_lookahead_set && !drive.ata_read_lookahead_supported))
+            if ((standby_intent == StorageSettingIntent.SET && (!drive.ata_power_management || drive.rotation == 0)) ||
+                (apm_intent == StorageSettingIntent.SET && !drive.ata_apm_supported) ||
+                (aam_intent == StorageSettingIntent.SET && !drive.ata_aam_supported) ||
+                (write_cache_intent == StorageSettingIntent.SET && !drive.ata_write_cache_supported) ||
+                (read_lookahead_intent == StorageSettingIntent.SET && !drive.ata_read_lookahead_supported))
                 throw new IOError.NOT_SUPPORTED ("The drive does not support one or more selected settings.");
             if (standby < 0 || standby > 255 || apm < 1 || apm > 255 || aam < 0 || aam > 254)
                 throw new IOError.INVALID_ARGUMENT ("A drive setting is outside its supported range.");
 
-            string serial = drive.serial; string wwn = drive.wwn;
-            var proxy = require_drive (drive, "Drive");
-            var builder = new VariantBuilder (new VariantType ("a{sv}"));
-            VariantIter iterator = drive.drive_configuration.iterator ();
-            string key; Variant value;
-            while (iterator.next ("{sv}", out key, out value)) {
-                if (key != "ata-pm-standby" && key != "ata-apm-level" && key != "ata-aam-level" &&
-                    key != "ata-write-cache-enabled" && key != "ata-read-lookahead-enabled")
-                    builder.add ("{sv}", key, value);
-            }
-            if (standby_set) builder.add ("{sv}", "ata-pm-standby", new Variant.int32 (standby));
-            if (apm_set) builder.add ("{sv}", "ata-apm-level", new Variant.int32 (apm));
-            if (aam_set) builder.add ("{sv}", "ata-aam-level", new Variant.int32 (aam < 128 ? 0 : aam));
-            if (write_cache_set) builder.add ("{sv}", "ata-write-cache-enabled", new Variant.boolean (write_cache));
-            if (read_lookahead_set) builder.add ("{sv}", "ata-read-lookahead-enabled", new Variant.boolean (read_lookahead));
-            var configuration = builder.end ();
-            var options = new VariantBuilder (new VariantType ("a{sv}"));
-            var job = jobs.begin_named ("Configure drive", drive.name, { drive.path });
-            var result = new StorageOperationResult ();
+            string serial = drive.serial; string wwn = drive.wwn; string path = drive.path;
+            locks.acquire_path (path);
+            StorageJob? job = null; var result = new StorageOperationResult ();
             try {
+                synchronize ();
+                if (snapshot.drives.lookup (path) != drive || drive.serial != serial || drive.wwn != wwn)
+                    throw new IOError.NOT_FOUND ("The drive identity changed before applying settings.");
+                Variant current = drive.drive_configuration;
+                if ((standby_intent != StorageSettingIntent.UNCHANGED && !same_configuration_value (baseline, current, "ata-pm-standby", VariantType.INT32)) ||
+                    (apm_intent != StorageSettingIntent.UNCHANGED && !same_configuration_value (baseline, current, "ata-apm-level", VariantType.INT32)) ||
+                    (aam_intent != StorageSettingIntent.UNCHANGED && !same_configuration_value (baseline, current, "ata-aam-level", VariantType.INT32)) ||
+                    (write_cache_intent != StorageSettingIntent.UNCHANGED && !same_configuration_value (baseline, current, "ata-write-cache-enabled", VariantType.BOOLEAN)) ||
+                    (read_lookahead_intent != StorageSettingIntent.UNCHANGED && !same_configuration_value (baseline, current, "ata-read-lookahead-enabled", VariantType.BOOLEAN)))
+                    throw new IOError.BUSY ("A selected drive setting changed outside Majoris Disks. Reopen the dialog and review the newer value.");
+
+                var builder = new VariantBuilder (new VariantType ("a{sv}"));
+                VariantIter iterator = current.iterator (); string key; Variant value;
+                while (iterator.next ("{sv}", out key, out value)) {
+                    bool reset = (key == "ata-pm-standby" && standby_intent != StorageSettingIntent.UNCHANGED) ||
+                        (key == "ata-apm-level" && apm_intent != StorageSettingIntent.UNCHANGED) ||
+                        (key == "ata-aam-level" && aam_intent != StorageSettingIntent.UNCHANGED) ||
+                        (key == "ata-write-cache-enabled" && write_cache_intent != StorageSettingIntent.UNCHANGED) ||
+                        (key == "ata-read-lookahead-enabled" && read_lookahead_intent != StorageSettingIntent.UNCHANGED);
+                    if (!reset) builder.add ("{sv}", key, value);
+                }
+                Variant? standby_expected = standby_intent == StorageSettingIntent.SET ? new Variant.int32 (standby) : null;
+                Variant? apm_expected = apm_intent == StorageSettingIntent.SET ? new Variant.int32 (apm) : null;
+                Variant? aam_expected = aam_intent == StorageSettingIntent.SET ? new Variant.int32 (aam < 128 ? 0 : aam) : null;
+                Variant? write_expected = write_cache_intent == StorageSettingIntent.SET ? new Variant.boolean (write_cache) : null;
+                Variant? read_expected = read_lookahead_intent == StorageSettingIntent.SET ? new Variant.boolean (read_lookahead) : null;
+                if (standby_expected != null) builder.add ("{sv}", "ata-pm-standby", standby_expected);
+                if (apm_expected != null) builder.add ("{sv}", "ata-apm-level", apm_expected);
+                if (aam_expected != null) builder.add ("{sv}", "ata-aam-level", aam_expected);
+                if (write_expected != null) builder.add ("{sv}", "ata-write-cache-enabled", write_expected);
+                if (read_expected != null) builder.add ("{sv}", "ata-read-lookahead-enabled", read_expected);
+                var configuration = builder.end ();
+                var options = new VariantBuilder (new VariantType ("a{sv}"));
+                var proxy = require_drive (drive, "Drive");
+                job = jobs.begin_named ("Configure drive", drive.name, { path });
                 jobs.phase (job, StorageJobState.RUNNING, "Applying drive settings");
                 yield proxy.call ("SetConfiguration", new Variant.tuple ({ configuration, options.end () }),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
-                synchronize ();
-                if (snapshot.drives.lookup (drive.path) != drive || drive.serial != serial || drive.wwn != wwn)
-                    throw new IOError.NOT_FOUND ("The drive identity changed while applying settings.");
-                Variant actual = drive.drive_configuration;
-                bool verified = (!standby_set || actual.lookup_value ("ata-pm-standby", VariantType.INT32)?.get_int32 () == standby) &&
-                    (!apm_set || actual.lookup_value ("ata-apm-level", VariantType.INT32)?.get_int32 () == apm) &&
-                    (!aam_set || actual.lookup_value ("ata-aam-level", VariantType.INT32)?.get_int32 () == (aam < 128 ? 0 : aam)) &&
-                    (!write_cache_set || actual.lookup_value ("ata-write-cache-enabled", VariantType.BOOLEAN)?.get_boolean () == write_cache) &&
-                    (!read_lookahead_set || actual.lookup_value ("ata-read-lookahead-enabled", VariantType.BOOLEAN)?.get_boolean () == read_lookahead);
+                bool verified = false; Variant actual = current;
+                for (int attempt = 0; attempt < 20 && !verified; attempt++) {
+                    synchronize ();
+                    if (snapshot.drives.lookup (path) != drive || drive.serial != serial || drive.wwn != wwn)
+                        throw new IOError.NOT_FOUND ("The drive identity changed while applying settings.");
+                    actual = drive.drive_configuration;
+                    verified = configuration_matches_intent (actual, "ata-pm-standby", VariantType.INT32, standby_intent, standby_expected) &&
+                        configuration_matches_intent (actual, "ata-apm-level", VariantType.INT32, apm_intent, apm_expected) &&
+                        configuration_matches_intent (actual, "ata-aam-level", VariantType.INT32, aam_intent, aam_expected) &&
+                        configuration_matches_intent (actual, "ata-write-cache-enabled", VariantType.BOOLEAN, write_cache_intent, write_expected) &&
+                        configuration_matches_intent (actual, "ata-read-lookahead-enabled", VariantType.BOOLEAN, read_lookahead_intent, read_expected);
+                    if (!verified) yield settle_delay (backend_lifetime);
+                }
                 if (!verified) throw new IOError.FAILED ("UDisks did not retain every requested drive setting.");
                 result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
                 result.summary = "Drive settings saved"; jobs.finish (job, result);
             } catch (Error error) {
-                result.fail ("Drive settings were not saved", error); jobs.finish (job, result); throw error;
-            }
+                result.fail ("Drive settings were not saved", error); if (job != null) jobs.finish (job, result); throw error;
+            } finally { locks.release_path (path); }
         }
 
         public string modification_identity (StorageBlock block) {
@@ -690,7 +783,7 @@ namespace MajorisDisks {
         }
 
         private void validate_modification (StorageBlock block, bool deleting, bool volume = false,
-            bool allow_mounted = false, bool allow_active = false) throws Error {
+            bool allow_mounted = false, bool allow_active = false, bool allow_system = false) throws Error {
             if (block.partition?.container == true) {
                 foreach (var child in snapshot.dependencies.children (block))
                     if ((child as StorageBlock)?.partition?.logical == true)
@@ -702,13 +795,13 @@ namespace MajorisDisks {
                 throw new IOError.NOT_SUPPORTED ("This operation requires a plain disk or partition.");
             foreach (var node in snapshot.dependencies.descendants (block)) {
                 var child = node as StorageBlock;
-                if (child == null || !child.available || child.system_hint || child.ignored || child.read_only ||
+                if (child == null || !child.available || (!allow_system && child.system_hint) || child.ignored || child.read_only ||
                     child.raid_member_path != "/" || child.physical_volume_group_path != "/" ||
                     child.usage == "raid" || child.usage == "crypto")
                     throw new IOError.PERMISSION_DENIED ("The target includes protected or unsupported storage.");
                 var safety = StorageSafetyService.assess (child, snapshot.dependencies);
                 if ((!allow_mounted && safety.mounted) || (!allow_active && safety.active_dependents) ||
-                    safety.system_critical || safety.unknown_dependencies)
+                    (!allow_system && safety.system_critical) || safety.unknown_dependencies)
                     throw new IOError.BUSY ("The target has active mounts or unresolved dependencies.");
             }
         }
@@ -725,6 +818,7 @@ namespace MajorisDisks {
             bool rename = command == "label";
             bool ownership = command == "ownership";
             bool metadata = command == "name" || command == "bootable" || command == "type" || command == "flags";
+            bool metadata_name = command == "name";
             bool partition_operation = deleting || metadata;
             bool formatting = command.has_prefix ("format:") || command.has_prefix ("format-zero:");
             bool encrypting = formatting && encryption_passphrase != "";
@@ -739,7 +833,8 @@ namespace MajorisDisks {
             if (rename) FilesystemCapabilityService.validate_label (block.type_id, label);
             StorageOperationKind operation_kind = deleting ? StorageOperationKind.DELETE_PARTITION :
                 formatting ? StorageOperationKind.FORMAT_VOLUME : ownership ? StorageOperationKind.TAKE_OWNERSHIP :
-                rename ? StorageOperationKind.EDIT_FILESYSTEM_LABEL : metadata ? StorageOperationKind.EDIT_PARTITION :
+                rename ? StorageOperationKind.EDIT_FILESYSTEM_LABEL : metadata_name ? StorageOperationKind.EDIT_PARTITION_NAME :
+                command == "type" ? StorageOperationKind.EDIT_PARTITION_TYPE : metadata ? StorageOperationKind.EDIT_PARTITION_FLAGS :
                 StorageOperationKind.INITIALIZE_DISK;
             var eligibility = StorageSafetyService.assess_operation (operation_kind, block, snapshot.dependencies);
             if (!eligibility.allowed || eligibility.unknown)
@@ -747,7 +842,8 @@ namespace MajorisDisks {
             string iface = rename || ownership ? "Filesystem" : partition_operation ? "Partition" : "Block";
             var proxy = require_volume (block, iface);
             var lifetime = backend_lifetime;
-            validate_modification (block, partition_operation, volume, destructive || ownership, destructive);
+            validate_modification (block, partition_operation, volume, destructive || ownership || metadata_name,
+                destructive || metadata_name, metadata_name);
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The target changed after confirmation.");
             locks.acquire (block, snapshot.dependencies);
@@ -758,6 +854,7 @@ namespace MajorisDisks {
             var preparation = new StoragePreparationJournal ();
             string original_uuid = block.uuid; string original_type = block.type_id;
             uint64 original_size = block.size; string original_table = block.table?.scheme ?? "";
+            string original_graph = modification_identity (block);
             try {
                 if (destructive) {
                     jobs.phase (job, StorageJobState.PREPARING, "Preparing affected storage");
@@ -787,7 +884,7 @@ namespace MajorisDisks {
                     var child = node as StorageBlock;
                     if (child != null) {
                         if (ownership) yield KernelStorageSafety.require_no_holders (child, lifetime);
-                        else yield KernelStorageSafety.require_idle (child, lifetime);
+                        else if (!metadata_name) yield KernelStorageSafety.require_idle (child, lifetime);
                     }
                 }
                 if (lifetime.is_cancelled () || require_volume (block, iface) != proxy ||
@@ -871,12 +968,25 @@ namespace MajorisDisks {
                 var current = snapshot.blocks.lookup (block.path);
                 preparation.identity_changed = current != block || !block.available || block.size != original_size ||
                     block.uuid != original_uuid || block.type_id != original_type || (block.table?.scheme ?? "") != original_table;
-                preparation.storage_state_changed = preparation.storage_state_changed || preparation.identity_changed;
-                string? remote_error = DBusError.get_remote_error (error);
-                bool rejected_before_write = !preparation.backend_invoked || remote_error != null &&
-                    (remote_error.contains ("NotAuthorized") || remote_error.has_suffix (".AccessDenied") ||
-                     remote_error.has_suffix (".NotSupported") || remote_error.has_suffix (".OptionNotPermitted"));
-                preparation.original_state_valid = !preparation.identity_changed && rejected_before_write;
+                bool graph_unchanged = !preparation.identity_changed && modification_identity (block) == original_graph;
+                preparation.storage_state_changed = preparation.storage_state_changed || !graph_unchanged;
+                preparation.original_state_valid = !preparation.backend_invoked && graph_unchanged;
+                if (preparation.backend_invoked && graph_unchanged) {
+                    if (formatting && original_type != "" && block.filesystem != null) {
+                        try {
+                            var check_options = new VariantBuilder (new VariantType ("a{sv}"));
+                            var check_reply = yield require_volume (block, "Filesystem").call ("Check",
+                                new Variant.tuple ({ check_options.end () }),
+                                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                            preparation.original_state_valid = check_reply.is_of_type (new VariantType ("(b)")) &&
+                                check_reply.get_child_value (0).get_boolean ();
+                        } catch (Error check_error) {
+                            preparation.original_state_valid = false;
+                        }
+                    } else preparation.original_state_valid = true;
+                }
+                foreach (var entry in preparation.entries ())
+                    entry.restoration_allowed = preparation.original_state_valid;
                 if (preparation.original_state_valid && !preparation.fully_restored ()) {
                     preparation.restoration_attempted = true;
                     try { yield restore_preparation (preparation, backend_lifetime); }
@@ -884,6 +994,10 @@ namespace MajorisDisks {
                     preparation.restoration_succeeded = restore_error == "";
                 }
                 operation_result.fail (job_name + " failed", error);
+                if (preparation.backend_invoked && !preparation.original_state_valid) {
+                    operation_result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    operation_result.technical_error += "\nThe original storage state could not be verified; automatic restoration was not attempted.";
+                }
                 if (restore_error != "") {
                     operation_result.status = StorageOperationStatus.NEEDS_ATTENTION;
                     operation_result.technical_error += "\nRestore: " + restore_error;
@@ -1036,24 +1150,31 @@ namespace MajorisDisks {
                         entry.action_dispatched = true;
                         var swap = require_volume (block, "Swapspace");
                         var options = new VariantBuilder (new VariantType ("a{sv}"));
-                        yield swap.call ("Stop", new Variant.tuple ({ options.end () }),
-                            DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
-                        for (int attempt = 0; attempt < 50 && block.swap_active; attempt++) {
-                            synchronize (); if (block.swap_active) yield settle_delay (token);
+                        Error? stop_error = null;
+                        try {
+                            yield swap.call ("Stop", new Variant.tuple ({ options.end () }),
+                                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
+                            entry.backend_confirmed = true;
+                        } catch (Error error) {
+                            stop_error = error;
                         }
-                        entry.backend_confirmed = true;
+                        for (int attempt = 0; attempt < 50 && block.swap_active; attempt++) {
+                            synchronize (); if (block.swap_active) yield settle_delay (backend_lifetime);
+                        }
                         if (block.swap_active) {
                             synchronize ();
                             entry.prepared = !block.swap_active;
                             entry.actual_state = entry.prepared ? "inactive" : "active or unavailable";
+                            if (stop_error != null) throw stop_error;
                             throw new IOError.TIMED_OUT ("Swap remained active after UDisks returned.");
                         }
                         entry.prepared = true; entry.expected_state_observed = true; entry.actual_state = "inactive";
+                        if (stop_error != null) entry.error = "The response was lost after swap became inactive: " + stop_error.message;
                     }
                 }
                 return journal;
             } catch (Error error) {
-                try { yield restore_preparation (journal, token); }
+                try { yield restore_preparation (journal, backend_lifetime); }
                 catch (Error restore_error) { throw new IOError.FAILED (error.message + " Restoration also failed: " + restore_error.message); }
                 throw error;
             }
@@ -1311,10 +1432,25 @@ namespace MajorisDisks {
                     }
                 }
                 synchronize ();
+                if (resize_filesystem) {
+                    uint64 capacity = yield mounted_filesystem_capacity (block, backend_lifetime);
+                    if (capacity == 0) {
+                        result.actual_state = "UDisks confirmed the resize, but the filesystem was not mounted so its capacity could not be independently measured.";
+                    } else {
+                        uint64 tolerance = new_size / 100;
+                        if (tolerance < 16 * 1024 * 1024) tolerance = 16 * 1024 * 1024;
+                        if (capacity > block.size || capacity + tolerance < new_size)
+                            throw new IOError.FAILED ("The filesystem capacity reported after resizing does not match the requested partition capacity.");
+                        result.actual_state = "Verified filesystem capacity: " + format_size (capacity) +
+                            "; partition capacity: " + format_size (block.size) + ".";
+                        result.completed ("Filesystem capacity verified");
+                    }
+                }
                 minimum_sizes.invalidate (block.path);
                 journal.operation_completed = true;
                 result.successful = true;
-                result.summary = "Volume resized";
+                result.summary = resize_filesystem && result.actual_state.has_prefix ("UDisks confirmed") ?
+                    "Volume resized; filesystem capacity verification was unavailable" : "Volume resized";
                 jobs.finish (job, result);
                 select_requested (block.path);
                 return result;
@@ -1343,6 +1479,18 @@ namespace MajorisDisks {
             } finally {
                 locks.release (block);
             }
+        }
+
+        private async uint64 mounted_filesystem_capacity (StorageBlock block, Cancellable token) {
+            synchronize ();
+            var mounts = block.filesystem?.mounts ?? new string[0];
+            if (mounts.length == 0) return 0;
+            try {
+                var info = yield File.new_for_path (mounts[0]).query_filesystem_info_async (
+                    FileAttribute.FILESYSTEM_SIZE, Priority.DEFAULT, token);
+                return info.has_attribute (FileAttribute.FILESYSTEM_SIZE) ?
+                    info.get_attribute_uint64 (FileAttribute.FILESYSTEM_SIZE) : 0;
+            } catch (Error error) { return 0; }
         }
 
         private void validate_resize_target (StorageBlock block, StorageBlock disk, string partition_uuid,
@@ -1381,7 +1529,8 @@ namespace MajorisDisks {
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
                 jobs.phase (job, StorageJobState.RUNNING, "Updating partition metadata");
                 if (type != part.type_id) {
-                    validate_metadata_target (block, disk, partition_uuid, partition_offset, device_number,
+                    yield KernelStorageSafety.require_idle (block, token);
+                    validate_metadata_target (StorageOperationKind.EDIT_PARTITION_TYPE, block, disk, partition_uuid, partition_offset, device_number,
                         expected_type, expected_name, expected_flags);
                     yield proxy.call ("SetType", new Variant.tuple ({ new Variant.string (type), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
@@ -1391,7 +1540,7 @@ namespace MajorisDisks {
                     options = new VariantBuilder (new VariantType ("a{sv}"));
                 }
                 if (scheme == "gpt" && name != part.name) {
-                    validate_metadata_target (block, disk, partition_uuid, partition_offset, device_number,
+                    validate_metadata_target (StorageOperationKind.EDIT_PARTITION_NAME, block, disk, partition_uuid, partition_offset, device_number,
                         expected_type, expected_name, expected_flags);
                     yield proxy.call ("SetName", new Variant.tuple ({ new Variant.string (name), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
@@ -1401,7 +1550,8 @@ namespace MajorisDisks {
                     options = new VariantBuilder (new VariantType ("a{sv}"));
                 }
                 if (flags != part.flags) {
-                    validate_metadata_target (block, disk, partition_uuid, partition_offset, device_number,
+                    yield KernelStorageSafety.require_idle (block, token);
+                    validate_metadata_target (StorageOperationKind.EDIT_PARTITION_FLAGS, block, disk, partition_uuid, partition_offset, device_number,
                         expected_type, expected_name, expected_flags);
                     yield proxy.call ("SetFlags", new Variant.tuple ({ new Variant.uint64 (flags), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
@@ -1426,10 +1576,10 @@ namespace MajorisDisks {
             }
         }
 
-        private void validate_metadata_target (StorageBlock block, StorageBlock disk, string uuid,
+        private void validate_metadata_target (StorageOperationKind operation, StorageBlock block, StorageBlock disk, string uuid,
             uint64 offset, uint64 number, string expected_type, string expected_name, uint64 expected_flags) throws Error {
             var part = block.partition;
-            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.EDIT_PARTITION,
+            var eligibility = StorageSafetyService.assess_operation (operation,
                 block, snapshot.dependencies);
             if (!eligibility.allowed || eligibility.unknown || eligibility.requires_preparation ||
                 snapshot.blocks.lookup (block.path) != block || !block.available || block.read_only ||

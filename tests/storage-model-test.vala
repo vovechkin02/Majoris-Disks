@@ -168,9 +168,28 @@ private void test_operation_locks () {
         locks.release (partition);
         assert (!locks.conflicts (disk, graph));
         assert (!locks.conflicts (sibling, refreshed_graph));
+        locks.acquire_path (partition.path);
+        try { locks.acquire (partition, graph); assert_not_reached (); }
+        catch (Error error) { assert (error is IOError.BUSY); }
+        locks.release_path (partition.path);
     } catch (Error error) {
         assert_not_reached ();
     }
+}
+
+private void test_metadata_safety_classes () {
+    var graph = new StorageDependencyService ();
+    var block = new StorageBlock ("/metadata");
+    block.filesystem = new StorageFilesystem (); block.filesystem.mounts = { "/data" };
+    var rename = StorageSafetyService.assess_operation (StorageOperationKind.EDIT_PARTITION_NAME, block, graph);
+    var type = StorageSafetyService.assess_operation (StorageOperationKind.EDIT_PARTITION_TYPE, block, graph);
+    var flags = StorageSafetyService.assess_operation (StorageOperationKind.EDIT_PARTITION_FLAGS, block, graph);
+    assert (rename.allowed && !rename.blocked);
+    assert (!type.allowed && type.blocked);
+    assert (!flags.allowed && flags.blocked);
+    block.filesystem.mounts = { "/" };
+    rename = StorageSafetyService.assess_operation (StorageOperationKind.EDIT_PARTITION_NAME, block, graph);
+    assert (rename.allowed && !rename.blocked);
 }
 
 private void test_check_capability () {
@@ -467,6 +486,19 @@ private void test_job_terminal_precedence () {
     assert (job.state == StorageJobState.COMPLETED);
 }
 
+private void test_job_progress_notifications () {
+    var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
+    var block = new StorageBlock ("/progress"); block.preferred = "/dev/progress";
+    var job = manager.begin ("Diagnostic", block, graph); int changes = 0;
+    manager.changed.connect (() => changes++);
+    manager.progress (job, "Running", 0.35, true);
+    assert (job.state == StorageJobState.RUNNING && job.progress_valid && job.progress == 0.35 && changes == 1);
+    var result = new StorageOperationResult (); result.successful = true;
+    result.status = StorageOperationStatus.SUCCEEDED; result.summary = "Done"; manager.finish (job, result);
+    manager.progress (job, "Stale", 0.7, true);
+    assert (job.state == StorageJobState.COMPLETED && job.phase == "Done" && job.progress == 1.0);
+}
+
 private void test_mount_option_normalization () {
     try {
         assert (MountOptionService.normalize ("defaults,noauto,rw", true) == "defaults,rw");
@@ -546,6 +578,7 @@ public static int main (string[] args) {
     Test.add_func ("/storage/hierarchy", test_hierarchy);
     Test.add_func ("/storage/capabilities", test_capabilities);
     Test.add_func ("/operations/locks", test_operation_locks);
+    Test.add_func ("/operations/metadata-safety-classes", test_metadata_safety_classes);
     Test.add_func ("/operations/check-capability", test_check_capability);
     Test.add_func ("/operations/resize-capability", test_resize_capability);
     Test.add_func ("/operations/capability-invalid-responses", test_capability_invalid_responses);
@@ -566,6 +599,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/terminal-states", test_operation_terminal_states);
     Test.add_func ("/operations/job-retention", test_job_retention);
     Test.add_func ("/operations/job-terminal-precedence", test_job_terminal_precedence);
+    Test.add_func ("/operations/job-progress-notifications", test_job_progress_notifications);
     Test.add_func ("/operations/mount-option-normalization", test_mount_option_normalization);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     return Test.run ();

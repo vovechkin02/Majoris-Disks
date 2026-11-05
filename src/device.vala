@@ -1,4 +1,6 @@
 namespace MajorisDisks {
+    public enum StorageSettingIntent { UNCHANGED, SET, RESET }
+
     public class StorageDevice : Object {
         public string path;
         public string name = "";

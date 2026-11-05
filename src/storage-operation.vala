@@ -191,6 +191,19 @@ namespace MajorisDisks {
         public void release (StorageBlock target) {
             active.remove (target.path);
         }
+
+        public void acquire_path (string path) throws Error {
+            foreach (var running in active.get_values ())
+                if (running.contains (path))
+                    throw new IOError.BUSY ("Another storage operation is using this device.");
+            var footprint = new HashTable<string, string> (str_hash, str_equal);
+            footprint.insert (path, path);
+            active.insert (path, footprint);
+        }
+
+        public void release_path (string path) {
+            active.remove (path);
+        }
     }
 
     [Flags]
@@ -395,6 +408,15 @@ namespace MajorisDisks {
         public void phase (StorageJob job, StorageJobState state, string phase) {
             job.state = state;
             job.phase = phase;
+            changed ();
+        }
+
+        public void progress (StorageJob job, string phase, double value, bool valid) {
+            if (terminal (job.state)) return;
+            job.state = StorageJobState.RUNNING;
+            job.phase = phase;
+            job.progress = value;
+            job.progress_valid = valid;
             changed ();
         }
 
