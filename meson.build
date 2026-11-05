@@ -5,6 +5,7 @@ deps = [
   dependency('gtk4'),
   dependency('libadwaita-1', version: '>=1.5'),
   dependency('gio-2.0', version: '>=2.74'),
+  dependency('gio-unix-2.0'),
 ]
 subdir('src')
 layout_test = executable('storage-model-test', 'tests/storage-model-test.vala',

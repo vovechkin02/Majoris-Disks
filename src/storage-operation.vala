@@ -1,10 +1,8 @@
 namespace MajorisDisks {
     public class StorageSelftestReconciliation {
-        public static bool terminal_state_is_new (string baseline_status, uint64 baseline_updated,
-            string status, uint64 updated) {
-            // SmartUpdated is only a data-refresh timestamp, not a diagnostic generation ID.
-            // Until Running has been observed, only a status transition can be correlated.
-            return status != baseline_status;
+        public static bool can_attribute_terminal_state (bool running_observed, string status) {
+            // A terminal status can describe a previous test. SmartUpdated only dates a refresh.
+            return running_observed && status != "" && status != "unknown" && status != "inprogress";
         }
     }
 
@@ -121,6 +119,8 @@ namespace MajorisDisks {
 
     public enum StoragePreparationKind { MOUNT, SWAP, ENCRYPTED_MAPPING, LOGICAL_VOLUME, RAID }
 
+    public enum MountRestorationStatus { FULLY_RESTORED, PARTIALLY_RESTORED, NOT_RESTORED, UNSAFE_TO_RESTORE, UNKNOWN }
+
     public class StoragePreparationEntry : Object {
         private GenericArray<string> state_values = new GenericArray<string> ();
         public StoragePreparationKind kind { get; construct; }
@@ -136,6 +136,9 @@ namespace MajorisDisks {
         public bool restored { get; set; }
         public bool persistent_mount { get; set; }
         public string persistent_mount_options { get; set; default = ""; }
+        public Variant? persistent_mount_configuration { get; set; }
+        public string[] observed_mount_points = {};
+        public MountRestorationStatus mount_restoration = MountRestorationStatus.UNKNOWN;
         public string error { get; set; default = ""; }
         public StoragePreparationEntry (StoragePreparationKind kind, string object_path, string[] state,
             string operation_type = "prepare") {
@@ -150,6 +153,20 @@ namespace MajorisDisks {
             return kind == StoragePreparationKind.MOUNT && state_values.length > 2 ? state_values.length - 2 : 0;
         }
         public string mount_point_at (uint index) { return state_values[index + 2]; }
+        public void record_mount_restoration (string[]? actual_mounts) {
+            observed_mount_points = actual_mounts ?? new string[0];
+            restored = actual_mounts != null && mount_set_matches (actual_mounts);
+            if (restored) mount_restoration = MountRestorationStatus.FULLY_RESTORED;
+            else if (!restoration_allowed) mount_restoration = MountRestorationStatus.UNSAFE_TO_RESTORE;
+            else if (actual_mounts == null) mount_restoration = MountRestorationStatus.UNKNOWN;
+            else {
+                mount_restoration = MountRestorationStatus.NOT_RESTORED;
+                foreach (var point in actual_mounts)
+                    for (uint i = 0; i < mount_point_count (); i++)
+                        if (point == mount_point_at (i)) mount_restoration = MountRestorationStatus.PARTIALLY_RESTORED;
+            }
+        }
+
         public bool mount_set_matches (string[] actual_mounts) {
             if (kind != StoragePreparationKind.MOUNT || mount_point_count () != actual_mounts.length) return false;
             for (uint i = 0; i < mount_point_count (); i++) {
@@ -572,6 +589,7 @@ namespace MajorisDisks {
                     var candidate = jobs.get_item (i) as StorageJob;
                     if (!candidate.local || terminal (candidate.state) || candidate.backend_path != "" ||
                         !candidate.backend_expectation_open || candidate.expected_backend_operation != operation ||
+                        start_time == 0 || start_time < (uint64) candidate.backend_dispatch_time ||
                         !expected_object_present (candidate, objects) || !objects_match (candidate, objects)) continue;
                     if (candidate_match != null) { candidate_match = null; break; }
                     candidate_match = candidate;

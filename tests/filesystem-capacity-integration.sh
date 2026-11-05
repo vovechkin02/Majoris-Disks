@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-for tool in mktemp truncate mkfs.ext4 blkid; do
+for tool in mktemp truncate mkfs.ext4 blkid dumpe2fs; do
   command -v "$tool" >/dev/null || { echo "SKIP: $tool is unavailable"; exit 77; }
 done
 
@@ -27,3 +27,13 @@ esac
 [ "$size" -gt 66000000 ] || { echo "FSSIZE is unexpectedly smaller than the fixture" >&2; exit 1; }
 
 printf 'Verified ext4 metadata: FSSIZE=%s FSBLOCKSIZE=%s\n' "$size" "$block_size"
+
+# Check the independent ext superblock geometry and identity against libblkid.
+header=$(LC_ALL=C dumpe2fs -h "$fixture" 2>/dev/null)
+ext_uuid=$(printf '%s\n' "$header" | sed -n 's/^Filesystem UUID:[[:space:]]*//p')
+blkid_uuid=$(printf '%s\n' "$metadata" | sed -n 's/^UUID=//p')
+blocks=$(printf '%s\n' "$header" | sed -n 's/^Block count:[[:space:]]*//p')
+ext_block_size=$(printf '%s\n' "$header" | sed -n 's/^Block size:[[:space:]]*//p')
+[ -n "$ext_uuid" ] && [ "$ext_uuid" = "$blkid_uuid" ]
+[ "$ext_block_size" -eq "$block_size" ]
+[ "$((blocks * ext_block_size))" -eq "$size" ]

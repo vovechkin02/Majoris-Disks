@@ -207,14 +207,13 @@ namespace MajorisDisks {
             if (unlock) {
                 var dialog = new UnlockVolumeDialog (block);
                 dialog.response.connect ((response) => {
-                    if (response != "unlock" || pending.contains (block.path)) return;
                     string passphrase = dialog.passphrase;
                     string[] keyfiles = dialog.keyfiles;
-                    uint32 pim = dialog.pim_value;
-                    bool hidden = dialog.hidden; bool system = dialog.system;
+                    bool read_only = dialog.read_only;
                     dialog.clear_secret ();
+                    if (response != "unlock" || pending.contains (block.path)) return;
                     pending.insert (block.path, block);
-                    backend.unlock_volume.begin (block, passphrase, identity, keyfiles, pim, hidden, system, (object, result) => {
+                    backend.unlock_volume.begin (block, passphrase, identity, keyfiles, 0, false, false, read_only, (object, result) => {
                         passphrase = ""; pending.remove (block.path);
                         try {
                             var outcome = backend.unlock_volume.end (result);
@@ -434,6 +433,8 @@ namespace MajorisDisks {
                             if (result.partial || result.status == StorageOperationStatus.NEEDS_ATTENTION)
                                 show_check_message (result.status == StorageOperationStatus.NEEDS_ATTENTION ?
                                     "Volume needs attention" : "Volume partially resized", operation_result_details (result));
+                            else if (!result.successful)
+                                show_check_message ("Could not resize " + block.preferred, operation_result_details (result));
                             else notifications.add_toast (new Adw.Toast (result.summary));
                         } catch (Error error) {
                             show_check_message ("Could not resize volume", operation_error (error));
@@ -601,54 +602,52 @@ namespace MajorisDisks {
     [GtkTemplate (ui = "/com/majoris/disks/ui/unlock-volume-dialog.ui")]
     public class UnlockVolumeDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.PasswordEntryRow secret;
-        [GtkChild] private unowned Adw.EntryRow pim;
-        [GtkChild] private unowned Adw.SwitchRow hidden_volume;
-        [GtkChild] private unowned Adw.SwitchRow system_volume;
+        [GtkChild] private unowned Adw.SwitchRow use_keyfile;
+        [GtkChild] private unowned Adw.SwitchRow read_only_row;
         [GtkChild] private unowned Adw.ActionRow keyfile_row;
         [GtkChild] private unowned Gtk.Button choose_keyfile;
         private string[] selected_keyfiles = {};
-        public string passphrase { owned get { return secret.text; } }
-        public string[] keyfiles { owned get { return selected_keyfiles.copy (); } }
-        public uint32 pim_value { get {
-            uint64 value = 0; return uint64.try_parse (pim.text.strip (), out value) && value <= uint32.MAX ? (uint32) value : 0;
-        } }
-        public bool hidden { get { return hidden_volume.active; } }
-        public bool system { get { return system_volume.active; } }
+        private bool closed = false;
+
+        public string passphrase { owned get { return use_keyfile.active ? "" : secret.text; } }
+        public string[] keyfiles { owned get { return use_keyfile.active ? selected_keyfiles.copy () : new string[0]; } }
+        public bool read_only { get { return read_only_row.active; } }
+
         public UnlockVolumeDialog (StorageBlock block) {
             body = "%s · %s".printf (block.preferred, format_size (block.size));
-            bool veracrypt = block.type_id == "crypto_TCRYPT" || block.type_id == "crypto_unknown";
-            pim.visible = veracrypt; hidden_volume.visible = veracrypt; system_volume.visible = veracrypt;
-            keyfile_row.visible = veracrypt;
-            pim.sensitive = false; pim.text = "";
-            hidden_volume.sensitive = false;
-            hidden_volume.subtitle = "Requires a verified VeraCrypt-capable authorised backend";
-            system_volume.sensitive = false;
-            system_volume.subtitle = "Requires a verified VeraCrypt-capable authorised backend";
+            use_keyfile.visible = block.type_id == "crypto_LUKS" || block.type_id == "crypto_TCRYPT" ||
+                block.type_id == "crypto_unknown";
+            read_only_row.active = block.read_only;
+            read_only_row.sensitive = !block.read_only;
             secret.changed.connect (validate);
-            pim.changed.connect (validate);
-            hidden_volume.notify["active"].connect (() => { if (hidden_volume.active) system_volume.active = false; validate (); });
-            system_volume.notify["active"].connect (() => { if (system_volume.active) hidden_volume.active = false; validate (); });
+            use_keyfile.notify["active"].connect (() => {
+                secret.text = "";
+                selected_keyfiles = {};
+                keyfile_row.subtitle = "None selected";
+                secret.visible = !use_keyfile.active;
+                keyfile_row.visible = use_keyfile.active;
+                validate ();
+            });
             choose_keyfile.clicked.connect (select_keyfile);
             validate ();
         }
         private void validate () {
-            uint64 parsed = 0; string text = pim.text.strip ();
-            bool valid_pim = text == "" || (uint64.try_parse (text, out parsed) && parsed > 0 && parsed <= uint32.MAX);
-            set_response_enabled ("unlock", valid_pim && (secret.text.length > 0 || selected_keyfiles.length > 0));
+            set_response_enabled ("unlock",
+                use_keyfile.active ? selected_keyfiles.length == 1 : secret.text.length > 0);
         }
         private void select_keyfile () {
             var chooser = new Gtk.FileDialog (); chooser.title = "Select a VeraCrypt keyfile";
             chooser.open.begin (null, null, (object, result) => {
                 try {
                     var file = chooser.open.end (result); string? path = file.get_path ();
-                    if (path == null || path == "") return;
+                    if (closed || !use_keyfile.active || path == null || path == "") return;
                     selected_keyfiles = { path };
                     keyfile_row.subtitle = file.get_basename ();
                     validate ();
                 } catch (Error error) {}
             });
         }
-        public void clear_secret () { secret.text = ""; selected_keyfiles = {}; }
+        public void clear_secret () { closed = true; secret.text = ""; selected_keyfiles = {}; }
     }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/lock-volume-confirmation-dialog.ui")]

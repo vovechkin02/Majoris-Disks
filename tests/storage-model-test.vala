@@ -421,6 +421,44 @@ private void test_resize_capacity_verification () {
         10 * gib, 512, 4096));
 }
 
+private void test_ext_capacity_header () {
+    try {
+        var geometry = FilesystemCapacityProbeService.parse_ext_header (
+            "Filesystem UUID: abcd\nBlock count: 65536\nBlock size: 1024\n");
+        assert (geometry.capacity == 67108864 && geometry.allocation_unit == 1024);
+        assert (geometry.filesystem_uuid == "abcd");
+    } catch (Error error) { assert_not_reached (); }
+    try {
+        FilesystemCapacityProbeService.parse_ext_header ("Block count: 18446744073709551615\nBlock size: 4096\n");
+        assert_not_reached ();
+    } catch (Error error) { assert (error is IOError.INVALID_DATA); }
+}
+
+private void test_mount_restoration_status () {
+    var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/test",
+        { "uuid", "ext4", "/first", "/second" });
+    entry.record_mount_restoration ({ "/second", "/first" });
+    assert (entry.restored && entry.mount_restoration == MountRestorationStatus.FULLY_RESTORED);
+    entry.record_mount_restoration ({ "/first" });
+    assert (!entry.restored && entry.mount_restoration == MountRestorationStatus.PARTIALLY_RESTORED);
+    entry.record_mount_restoration ({ "/unrelated" });
+    assert (!entry.restored && entry.mount_restoration == MountRestorationStatus.NOT_RESTORED);
+    entry.record_mount_restoration (null);
+    assert (!entry.restored && entry.mount_restoration == MountRestorationStatus.UNKNOWN);
+    entry.restoration_allowed = false;
+    entry.record_mount_restoration ({});
+    assert (!entry.restored && entry.mount_restoration == MountRestorationStatus.UNSAFE_TO_RESTORE);
+}
+
+private void test_offline_capacity_identity () {
+    try { FilesystemCapacityProbeService.verify_uuid ("abcd", "ABCD"); }
+    catch (Error error) { assert_not_reached (); }
+    try { FilesystemCapacityProbeService.verify_uuid ("abcd", ""); assert_not_reached (); }
+    catch (Error error) { assert (error is IOError.NOT_SUPPORTED); }
+    try { FilesystemCapacityProbeService.verify_uuid ("abcd", "ef01"); assert_not_reached (); }
+    catch (Error error) { assert (error is IOError.INVALID_DATA); }
+}
+
 private void test_offline_capacity_metadata () {
     var fields = FilesystemCapacityProbeService.parse_export (
         "DEVNAME=/dev/loop0p1\nUUID=abcd-1234\nTYPE=ext4\nFSBLOCKSIZE=4096\nFSSIZE=1073741824\nFSLASTBLOCK=262143\n");
@@ -590,9 +628,12 @@ private void test_job_correlation () {
     manager.observe ("/backend/unrelated", "partition-modify", { "/different" }, 0, false, false,
         0);
     assert (manager.jobs.get_n_items () == 2 && local.backend_path == "");
+    manager.observe ("/backend/stale", "partition-modify", { "/target" }, 0, false, false,
+        (uint64) (local.backend_dispatch_time - 1));
+    assert (manager.jobs.get_n_items () == 3 && local.backend_path == "");
     manager.observe ("/backend/related", "partition-modify", { "/target" }, 0.25, true, true,
-        0);
-    assert (manager.jobs.get_n_items () == 2 && local.backend_path == "/backend/related" && local.progress == 0.25);
+        (uint64) local.backend_dispatch_time);
+    assert (manager.jobs.get_n_items () == 3 && local.backend_path == "/backend/related" && local.progress == 0.25);
     manager.backend_completed ("/backend/related", true, "Done");
     assert (local.state == StorageJobState.FINALIZING);
     var result = new StorageOperationResult (); result.successful = true;
@@ -610,20 +651,23 @@ private void test_job_correlation_ambiguity () {
     manager.phase (second, StorageJobState.RUNNING, "Second");
     manager.expect_backend (first, "filesystem-resize", block.path);
     manager.expect_backend (second, "filesystem-resize", block.path);
-    manager.observe ("/backend/ambiguous", "filesystem-resize", { block.path }, 0.1, true, true, 0);
+    manager.observe ("/backend/ambiguous", "filesystem-resize", { block.path }, 0.1, true, true, (uint64) second.backend_dispatch_time);
     assert (manager.jobs.get_n_items () == 3);
     assert (first.backend_path == "" && second.backend_path == "");
     var independent = manager.jobs.get_item (2) as StorageJob;
     assert (!independent.local && independent.backend_path == "/backend/ambiguous");
     var failed = new StorageOperationResult (); failed.fail ("First failed"); manager.finish (first, failed);
-    manager.observe ("/backend/second", "filesystem-resize", { block.path }, 0.2, true, true, 0);
+    manager.observe ("/backend/second", "filesystem-resize", { block.path }, 0.2, true, true, (uint64) second.backend_dispatch_time);
     assert (second.backend_path == "/backend/second");
 }
 
 private void test_selftest_terminal_reconciliation () {
-    assert (!StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "success", 100));
-    assert (!StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "success", 101));
-    assert (StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "failed", 100));
+    assert (!StorageSelftestReconciliation.can_attribute_terminal_state (false, "success"));
+    assert (!StorageSelftestReconciliation.can_attribute_terminal_state (false, "failed"));
+    assert (!StorageSelftestReconciliation.can_attribute_terminal_state (true, ""));
+    assert (!StorageSelftestReconciliation.can_attribute_terminal_state (true, "inprogress"));
+    assert (StorageSelftestReconciliation.can_attribute_terminal_state (true, "success"));
+    assert (StorageSelftestReconciliation.can_attribute_terminal_state (true, "aborted"));
 }
 
 private async void query_mock_capability () throws Error {
@@ -682,8 +726,11 @@ public static int main (string[] args) {
     Test.add_func ("/operations/selftest-terminal-reconciliation", test_selftest_terminal_reconciliation);
     Test.add_func ("/operations/resize-planner-safety", test_resize_planner_safety);
     Test.add_func ("/operations/resize-capacity-verification", test_resize_capacity_verification);
+    Test.add_func ("/operations/ext-capacity-header", test_ext_capacity_header);
+    Test.add_func ("/operations/offline-capacity-identity", test_offline_capacity_identity);
     Test.add_func ("/operations/offline-capacity-metadata", test_offline_capacity_metadata);
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
+    Test.add_func ("/operations/mount-restoration-status", test_mount_restoration_status);
     Test.add_func ("/operations/preparation-journal", test_preparation_journal);
     Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);
     Test.add_func ("/operations/create-active-dependency", test_create_partition_active_dependency);

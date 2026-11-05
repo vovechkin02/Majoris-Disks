@@ -143,20 +143,34 @@ namespace MajorisDisks {
                 throw new IOError.NOT_SUPPORTED ("The filesystem does not expose a probeable device and type.");
 
             string output = yield run ({ "blkid", "--probe", "--output", "export", device }, token);
-            if (block.path != path || block.preferred != device || block.number != number || block.size != size ||
-                (block.physical_drive?.serial ?? "") != serial || (block.physical_drive?.wwn ?? "") != wwn)
-                throw new IOError.NOT_FOUND ("The filesystem device identity changed during capacity probing.");
-
             var fields = parse_export (output);
             string actual_type = normalize_type (fields.lookup ("TYPE") ?? "");
             string actual_uuid = fields.lookup ("UUID") ?? "";
             if (actual_type == "" || actual_type != expected_type)
                 throw new IOError.INVALID_DATA ("The capacity probe identified a different filesystem type.");
-            if (expected_uuid != "" && actual_uuid != "" && expected_uuid.ascii_casecmp (actual_uuid) != 0)
-                throw new IOError.INVALID_DATA ("The capacity probe identified a different filesystem UUID.");
+            string source = "libblkid filesystem metadata";
+            uint64 block_size;
+            uint64 capacity;
+            if ((actual_type == "ext2" || actual_type == "ext3" || actual_type == "ext4") &&
+                (!fields.contains ("FSSIZE") || (expected_uuid != "" && actual_uuid == ""))) {
+                string header = yield run ({ "dumpe2fs", "-h", device }, token);
+                var ext = parse_ext_header (header);
+                verify_uuid (actual_uuid, ext.filesystem_uuid);
+                actual_uuid = ext.filesystem_uuid;
+                block_size = ext.allocation_unit;
+                capacity = ext.capacity;
+                source = ext.source;
+            } else {
+                block_size = parse_uint (fields.lookup ("FSBLOCKSIZE") ?? "", "filesystem block size", false);
+                capacity = capacity_from_metadata (fields);
+            }
+            verify_uuid (expected_uuid, actual_uuid);
 
-            uint64 block_size = parse_uint (fields.lookup ("FSBLOCKSIZE") ?? "", "filesystem block size", false);
-            uint64 capacity = capacity_from_metadata (fields);
+            if (block.path != path || block.preferred != device || block.number != number || block.size != size ||
+                !block.available || normalize_type (block.type_id) != expected_type || block.uuid != expected_uuid ||
+                (block.physical_drive?.serial ?? "") != serial || (block.physical_drive?.wwn ?? "") != wwn)
+                throw new IOError.NOT_FOUND ("The filesystem device identity changed during capacity probing.");
+
             if (block_size == 0) block_size = uint64.max (block.logical_sector_size, block.physical_sector_size);
             if (capacity == 0 || capacity > block.size)
                 throw new IOError.INVALID_DATA ("The filesystem capacity metadata is outside the containing device.");
@@ -166,8 +180,36 @@ namespace MajorisDisks {
             measurement.allocation_unit = block_size;
             measurement.filesystem_type = actual_type;
             measurement.filesystem_uuid = actual_uuid;
-            measurement.source = "libblkid filesystem metadata";
+            measurement.source = source;
             return measurement;
+        }
+
+        public static FilesystemCapacityMeasurement parse_ext_header (string output) throws Error {
+            var fields = new HashTable<string, string> (str_hash, str_equal);
+            foreach (var line in output.split ("\n")) {
+                int separator = line.index_of_char (':');
+                if (separator > 0)
+                    fields.insert (line.substring (0, separator), line.substring (separator + 1).strip ());
+            }
+            uint64 blocks = parse_uint (fields.lookup ("Block count") ?? "", "ext block count", false);
+            uint64 block_size = parse_uint (fields.lookup ("Block size") ?? "", "ext block size", false);
+            if (blocks == 0 || block_size == 0 || blocks > uint64.MAX / block_size)
+                throw new IOError.INVALID_DATA ("The ext filesystem header did not report valid geometry.");
+
+            var measurement = new FilesystemCapacityMeasurement ();
+            measurement.capacity = blocks * block_size;
+            measurement.allocation_unit = block_size;
+            measurement.filesystem_uuid = fields.lookup ("Filesystem UUID") ?? "";
+            measurement.source = "dumpe2fs filesystem header";
+            return measurement;
+        }
+
+        public static void verify_uuid (string expected, string actual) throws Error {
+            if (expected == "") return;
+            if (actual == "")
+                throw new IOError.NOT_SUPPORTED ("The capacity probe could not verify the filesystem UUID.");
+            if (expected.ascii_casecmp (actual) != 0)
+                throw new IOError.INVALID_DATA ("The capacity probe identified a different filesystem UUID.");
         }
 
         public static HashTable<string, string> parse_export (string output) {
