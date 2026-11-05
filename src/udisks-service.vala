@@ -508,9 +508,36 @@ namespace MajorisDisks {
                 var reply = yield proxy.call ("SmartGetAttributes", new Variant.tuple ({ options.end () }),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
                 var attributes = reply.get_child_value (0);
-                report.media_errors = attributes.lookup_value ("media_errors", VariantType.UINT64)?.get_uint64 () ?? 0;
-                report.unsafe_shutdowns = attributes.lookup_value ("unsafe_shutdowns", VariantType.UINT64)?.get_uint64 () ?? 0;
-                report.error_log_entries = attributes.lookup_value ("num_err_log_entries", VariantType.UINT64)?.get_uint64 () ?? 0;
+                var byte_value = attributes.lookup_value ("avail_spare", VariantType.BYTE);
+                if (byte_value != null) report.available_spare = byte_value.get_byte ();
+                byte_value = attributes.lookup_value ("spare_thresh", VariantType.BYTE);
+                if (byte_value != null) report.spare_threshold = byte_value.get_byte ();
+                byte_value = attributes.lookup_value ("percent_used", VariantType.BYTE);
+                if (byte_value != null) report.percentage_used = byte_value.get_byte ();
+                var uint_value = attributes.lookup_value ("total_data_read", VariantType.UINT64);
+                if (uint_value != null) { report.has_total_data_read = true; report.total_data_read = uint_value.get_uint64 (); }
+                uint_value = attributes.lookup_value ("total_data_written", VariantType.UINT64);
+                if (uint_value != null) { report.has_total_data_written = true; report.total_data_written = uint_value.get_uint64 (); }
+                uint_value = attributes.lookup_value ("ctrl_busy_time", VariantType.UINT64);
+                if (uint_value != null) { report.has_controller_busy_minutes = true; report.controller_busy_minutes = uint_value.get_uint64 (); }
+                uint_value = attributes.lookup_value ("power_cycles", VariantType.UINT64);
+                if (uint_value != null) { report.has_power_cycles = true; report.power_cycles = uint_value.get_uint64 (); }
+                uint_value = attributes.lookup_value ("media_errors", VariantType.UINT64);
+                if (uint_value != null) { report.has_media_errors = true; report.media_errors = uint_value.get_uint64 (); }
+                uint_value = attributes.lookup_value ("unsafe_shutdowns", VariantType.UINT64);
+                if (uint_value != null) { report.has_unsafe_shutdowns = true; report.unsafe_shutdowns = uint_value.get_uint64 (); }
+                uint_value = attributes.lookup_value ("num_err_log_entries", VariantType.UINT64);
+                if (uint_value != null) { report.has_error_log_entries = true; report.error_log_entries = uint_value.get_uint64 (); }
+                var sensors = attributes.lookup_value ("temp_sensors", new VariantType ("aq"));
+                if (sensors != null) {
+                    for (size_t index = 0; index < sensors.n_children (); index++) {
+                        uint16 kelvin = sensors.get_child_value (index).get_uint16 ();
+                        if (kelvin == 0) continue;
+                        if (report.temperature_sensors != "") report.temperature_sensors += ", ";
+                        report.temperature_sensors += "Sensor %u: %.1f °C".printf ((uint) index + 1,
+                            (double) kelvin - 273.15);
+                    }
+                }
                 return report;
             }
             report.power_on_hours = drive.smart_power_on_seconds / 3600;
@@ -850,7 +877,7 @@ namespace MajorisDisks {
             string type = block.type_id.down ();
             return type != "ntfs" && type != "vfat" && type != "exfat" && type != "udf" && type != "iso9660";
         }
-        public async void modify_partitioning (StorageBlock block, string command, string confirmed_identity,
+        public async StorageOperationResult modify_partitioning (StorageBlock block, string command, string confirmed_identity,
             string label = "", bool recursive = false, string encryption_passphrase = "") throws Error {
             bool deleting = command == "delete";
             bool rename = command == "label";
@@ -970,7 +997,7 @@ namespace MajorisDisks {
                     operation_result.completed ("Partition metadata updated");
                     operation_result.successful = true; operation_result.summary = "Partition metadata updated";
                     jobs.finish (job, operation_result);
-                    return;
+                    return operation_result;
                 }
                 var parameters = deleting || ownership ? new Variant.tuple ({ options.end () }) :
                     new Variant.tuple ({ new Variant.string (rename ? label : format), options.end () });
@@ -1006,6 +1033,7 @@ namespace MajorisDisks {
                 operation_result.completed (job_name);
                 operation_result.successful = true; operation_result.summary = job_name + " completed";
                 jobs.finish (job, operation_result);
+                return operation_result;
             } catch (Error error) {
                 string restore_error = "";
                 synchronize ();
@@ -1045,6 +1073,8 @@ namespace MajorisDisks {
                     operation_result.technical_error += "\nAffected storage still requiring attention:\n" + recovery;
                 }
                 jobs.finish (job, operation_result);
+                if (operation_result.status == StorageOperationStatus.NEEDS_ATTENTION || operation_result.partial)
+                    return operation_result;
                 if (restore_error != "")
                     throw new IOError.FAILED (error.message + " Restoration failed: " + restore_error);
                 throw error;
@@ -1248,17 +1278,10 @@ namespace MajorisDisks {
                     string[] actual_mounts = block.filesystem?.mounts ?? new string[0];
                     entry.actual_state = actual_mounts.length == 0 ? "unmounted" :
                         "mounted at " + string.joinv (", ", actual_mounts);
-                    bool exact = entry.mount_point_count () == actual_mounts.length;
-                    for (uint i = 0; i < entry.mount_point_count (); i++) {
-                        string expected = entry.mount_point_at (i);
-                        bool found = false;
-                        foreach (var actual in actual_mounts) if (actual == expected) { found = true; break; }
-                        exact &= found;
-                    }
-                    if (exact && actual_mounts.length != 0) entry.restored = true;
+                    entry.restored = entry.mount_set_matches (actual_mounts);
                 } else if (entry.kind == StoragePreparationKind.SWAP) {
                     entry.actual_state = block.swap_active ? "active" : "inactive";
-                    if (block.swap_active) entry.restored = true;
+                    entry.restored = block.swap_active;
                 }
             }
         }
@@ -1314,6 +1337,12 @@ namespace MajorisDisks {
             }
             synchronize ();
             reconcile_preparation (journal);
+            foreach (var entry in journal.entries ()) {
+                if (!entry.prepared || !entry.restoration_allowed || entry.restored || entry.error != "") continue;
+                entry.error = entry.kind == StoragePreparationKind.MOUNT ?
+                    "Not every original mount point was restored." : "The original active state was not restored.";
+                failures += entry.object_path + ": " + entry.error;
+            }
             if (failures.length != 0) throw new IOError.FAILED (string.joinv ("; ", failures));
         }
 
@@ -1915,12 +1944,12 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_ARGUMENT ("Enter a passphrase or select a supported keyfile.");
             if (!veracrypt && (keyfile_paths.length != 0 || pim != 0 || hidden || system))
                 throw new IOError.NOT_SUPPORTED ("VeraCrypt options are not supported for this encrypted volume.");
-            if (hidden && system)
-                throw new IOError.INVALID_ARGUMENT ("Hidden-volume and system-volume modes cannot be combined.");
-            if (keyfile_paths.length > 64)
-                throw new IOError.INVALID_ARGUMENT ("Select no more than 64 VeraCrypt keyfiles.");
+            if (pim != 0 || hidden || system || keyfile_paths.length > 1)
+                throw new IOError.NOT_SUPPORTED (
+                    "The installed UDisks backend supports password or one keyfile, but not advanced VeraCrypt modes.");
             var unique_keyfiles = new HashTable<string, string> (str_hash, str_equal);
             int64 total_keyfile_size = 0;
+            uint8[] keyfile_contents = {};
             foreach (var keyfile_path in keyfile_paths) {
                 if (keyfile_path == "" || unique_keyfiles.contains (keyfile_path))
                     throw new IOError.INVALID_ARGUMENT ("Every VeraCrypt keyfile must be a unique local file.");
@@ -1934,6 +1963,10 @@ namespace MajorisDisks {
                 total_keyfile_size += info.get_size ();
                 if (total_keyfile_size > 64 * 1024 * 1024)
                     throw new IOError.INVALID_ARGUMENT ("The selected VeraCrypt keyfiles exceed the 64 MiB safety limit.");
+                string? etag;
+                yield keyfile.load_contents_async (backend_lifetime, out keyfile_contents, out etag);
+                if (keyfile_contents.length == 0 || keyfile_contents.length > 8 * 1024 * 1024)
+                    throw new IOError.INVALID_ARGUMENT ("The keyfile is empty or too large.");
             }
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The encrypted volume changed before it could be unlocked.");
@@ -1949,10 +1982,9 @@ namespace MajorisDisks {
                 if (modification_identity (block) != confirmed_identity || block.encrypted?.mapping != null)
                     throw new IOError.NOT_FOUND ("The encrypted volume changed before the unlock request was sent.");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
-                if (hidden) options.add ("{sv}", "hidden", new Variant.boolean (true));
-                if (system) options.add ("{sv}", "system", new Variant.boolean (true));
-                if (pim != 0) options.add ("{sv}", "pim", new Variant.uint32 (pim));
-                if (keyfile_paths.length != 0) options.add ("{sv}", "keyfiles", new Variant.strv (keyfile_paths));
+                if (keyfile_contents.length != 0)
+                    options.add ("{sv}", "keyfile_contents", new Variant.from_bytes (
+                        new VariantType ("ay"), new Bytes (keyfile_contents), true));
                 var reply = yield require_volume (block, "Encrypted").call ("Unlock",
                     new Variant ("(s@a{sv})", passphrase, options.end ()),
                     DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);

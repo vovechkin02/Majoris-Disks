@@ -153,9 +153,11 @@ namespace MajorisDisks {
                     (obj, result) => {
                         pending.remove (block.path);
                         try {
-                            backend.modify_partitioning.end (result);
+                            var outcome = backend.modify_partitioning.end (result);
                             drive_view.invalidate_usage (block);
-                            notifications.add_toast (new Adw.Toast ("Filesystem ownership updated"));
+                            if (outcome.status == StorageOperationStatus.NEEDS_ATTENTION || outcome.partial)
+                                show_check_message ("Ownership operation needs attention", operation_result_details (outcome));
+                            else notifications.add_toast (new Adw.Toast ("Filesystem ownership updated"));
                         } catch (Error error) {
                             show_check_message ("Could not change ownership", operation_error (error));
                         }
@@ -172,9 +174,11 @@ namespace MajorisDisks {
                 backend.modify_partitioning.begin (block, "label", identity, dialog.label_text, false, "", (obj, result) => {
                     pending.remove (block.path);
                     try {
-                        backend.modify_partitioning.end (result);
+                        var outcome = backend.modify_partitioning.end (result);
                         drive_view.invalidate_usage (block);
-                        notifications.add_toast (new Adw.Toast ("Filesystem label updated"));
+                        if (outcome.status == StorageOperationStatus.NEEDS_ATTENTION || outcome.partial)
+                            show_check_message ("Label operation needs attention", operation_result_details (outcome));
+                        else notifications.add_toast (new Adw.Toast ("Filesystem label updated"));
                     } catch (Error error) {
                         show_check_message ("Could not update the filesystem label", operation_error (error));
                     }
@@ -205,11 +209,11 @@ namespace MajorisDisks {
                 dialog.response.connect ((response) => {
                     if (response != "unlock" || pending.contains (block.path)) return;
                     string passphrase = dialog.passphrase;
-                    dialog.clear_secret ();
-                    pending.insert (block.path, block);
                     string[] keyfiles = dialog.keyfiles;
                     uint32 pim = dialog.pim_value;
                     bool hidden = dialog.hidden; bool system = dialog.system;
+                    dialog.clear_secret ();
+                    pending.insert (block.path, block);
                     backend.unlock_volume.begin (block, passphrase, identity, keyfiles, pim, hidden, system, (object, result) => {
                         passphrase = ""; pending.remove (block.path);
                         try {
@@ -376,9 +380,11 @@ namespace MajorisDisks {
                     encryption_secret = "";
                     pending.remove (block.path);
                     try {
-                        backend.modify_partitioning.end (result);
+                        var outcome = backend.modify_partitioning.end (result);
                         drive_view.invalidate_usage (block);
-                        notifications.add_toast (new Adw.Toast (volume ? "Volume formatted" : deleting ? "Partition deleted" : "Disk initialized"));
+                        if (outcome.status == StorageOperationStatus.NEEDS_ATTENTION || outcome.partial)
+                            show_check_message ("Storage operation needs attention", operation_result_details (outcome));
+                        else notifications.add_toast (new Adw.Toast (volume ? "Volume formatted" : deleting ? "Partition deleted" : "Disk initialized"));
                     } catch (Error error) {
                         show_check_message ("Could not modify " + device, operation_error (error));
                     }
@@ -613,6 +619,11 @@ namespace MajorisDisks {
             bool veracrypt = block.type_id == "crypto_TCRYPT" || block.type_id == "crypto_unknown";
             pim.visible = veracrypt; hidden_volume.visible = veracrypt; system_volume.visible = veracrypt;
             keyfile_row.visible = veracrypt;
+            pim.sensitive = false; pim.text = "";
+            hidden_volume.sensitive = false;
+            hidden_volume.subtitle = "Requires a verified VeraCrypt-capable authorised backend";
+            system_volume.sensitive = false;
+            system_volume.subtitle = "Requires a verified VeraCrypt-capable authorised backend";
             secret.changed.connect (validate);
             pim.changed.connect (validate);
             hidden_volume.notify["active"].connect (() => { if (hidden_volume.active) system_volume.active = false; validate (); });
@@ -631,10 +642,8 @@ namespace MajorisDisks {
                 try {
                     var file = chooser.open.end (result); string? path = file.get_path ();
                     if (path == null || path == "") return;
-                    foreach (var selected in selected_keyfiles) if (selected == path) return;
-                    selected_keyfiles += path;
-                    keyfile_row.subtitle = selected_keyfiles.length == 1 ? file.get_basename () :
-                        "%u keyfiles selected".printf (selected_keyfiles.length);
+                    selected_keyfiles = { path };
+                    keyfile_row.subtitle = file.get_basename ();
                     validate ();
                 } catch (Error error) {}
             });
@@ -886,9 +895,18 @@ namespace MajorisDisks {
             });
             if (report.warnings.length != 0) add_summary ("Critical warnings", string.joinv (", ", report.warnings));
             if (report.nvme) {
-                add_attribute ("Media/data integrity errors", report.media_errors.to_string ());
-                add_attribute ("Unsafe shutdowns", report.unsafe_shutdowns.to_string ());
-                add_attribute ("Error log entries", report.error_log_entries.to_string ());
+                if (report.available_spare >= 0) add_attribute ("Available spare", report.available_spare.to_string () + "%");
+                if (report.spare_threshold >= 0) add_attribute ("Spare threshold", report.spare_threshold.to_string () + "%");
+                if (report.percentage_used >= 0) add_attribute ("Estimated endurance used", report.percentage_used.to_string () + "%");
+                if (report.has_total_data_read) add_attribute ("Data read", format_size (report.total_data_read));
+                if (report.has_total_data_written) add_attribute ("Data written", format_size (report.total_data_written));
+                if (report.has_power_cycles) add_attribute ("Power cycles", report.power_cycles.to_string ());
+                if (report.has_controller_busy_minutes)
+                    add_attribute ("Controller busy time", report.controller_busy_minutes.to_string () + " minutes");
+                if (report.has_media_errors) add_attribute ("Media/data integrity errors", report.media_errors.to_string ());
+                if (report.has_unsafe_shutdowns) add_attribute ("Unsafe shutdowns", report.unsafe_shutdowns.to_string ());
+                if (report.has_error_log_entries) add_attribute ("Error log entries", report.error_log_entries.to_string ());
+                if (report.temperature_sensors != "") add_attribute ("Temperature sensors", report.temperature_sensors);
             } else foreach (var item in report.attributes) {
                 string values = "Raw: %s · Normalised: %s · Worst: %s · Threshold: %s · %s\n%s".printf (
                     item.raw, item.normalized < 0 ? "Unknown" : item.normalized.to_string (),

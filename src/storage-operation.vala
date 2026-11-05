@@ -2,7 +2,9 @@ namespace MajorisDisks {
     public class StorageSelftestReconciliation {
         public static bool terminal_state_is_new (string baseline_status, uint64 baseline_updated,
             string status, uint64 updated) {
-            return status != baseline_status || updated > baseline_updated;
+            // SmartUpdated is only a data-refresh timestamp, not a diagnostic generation ID.
+            // Until Running has been observed, only a status transition can be correlated.
+            return status != baseline_status;
         }
     }
 
@@ -148,6 +150,16 @@ namespace MajorisDisks {
             return kind == StoragePreparationKind.MOUNT && state_values.length > 2 ? state_values.length - 2 : 0;
         }
         public string mount_point_at (uint index) { return state_values[index + 2]; }
+        public bool mount_set_matches (string[] actual_mounts) {
+            if (kind != StoragePreparationKind.MOUNT || mount_point_count () != actual_mounts.length) return false;
+            for (uint i = 0; i < mount_point_count (); i++) {
+                bool found = false;
+                foreach (var actual in actual_mounts)
+                    if (actual == mount_point_at (i)) { found = true; break; }
+                if (!found) return false;
+            }
+            return actual_mounts.length != 0;
+        }
     }
 
     public class StoragePreparationJournal : Object {

@@ -155,14 +155,8 @@ namespace MajorisDisks {
             if (expected_uuid != "" && actual_uuid != "" && expected_uuid.ascii_casecmp (actual_uuid) != 0)
                 throw new IOError.INVALID_DATA ("The capacity probe identified a different filesystem UUID.");
 
-            uint64 block_size = parse_uint (fields.lookup ("FS_BLOCK_SIZE") ?? "", "filesystem block size", false);
-            uint64 capacity = parse_uint (fields.lookup ("FS_SIZE") ?? "", "filesystem capacity", false);
-            if (capacity == 0) {
-                uint64 last_block = parse_uint (fields.lookup ("FS_LASTBLOCK") ?? "", "last filesystem block", true);
-                if (block_size == 0 || last_block == uint64.MAX || last_block + 1 > uint64.MAX / block_size)
-                    throw new IOError.INVALID_DATA ("The filesystem capacity metadata was incomplete or overflowed.");
-                capacity = (last_block + 1) * block_size;
-            }
+            uint64 block_size = parse_uint (fields.lookup ("FSBLOCKSIZE") ?? "", "filesystem block size", false);
+            uint64 capacity = capacity_from_metadata (fields);
             if (block_size == 0) block_size = uint64.max (block.logical_sector_size, block.physical_sector_size);
             if (capacity == 0 || capacity > block.size)
                 throw new IOError.INVALID_DATA ("The filesystem capacity metadata is outside the containing device.");
@@ -185,6 +179,16 @@ namespace MajorisDisks {
                 fields.insert (line.substring (0, separator), line.substring (separator + 1));
             }
             return fields;
+        }
+
+        public static uint64 capacity_from_metadata (HashTable<string, string> fields) throws Error {
+            uint64 capacity = parse_uint (fields.lookup ("FSSIZE") ?? "", "filesystem capacity", false);
+            // libblkid probers do not give FSLASTBLOCK one portable meaning. It is intentionally
+            // not converted to bytes unless a filesystem-specific implementation can establish
+            // whether the value is a count or a final zero-based index.
+            if (capacity == 0)
+                throw new IOError.NOT_SUPPORTED ("libblkid did not report an authoritative filesystem capacity.");
+            return capacity;
         }
 
         public static bool authoritative_match (FilesystemCapacityMeasurement measurement,

@@ -423,9 +423,18 @@ private void test_resize_capacity_verification () {
 
 private void test_offline_capacity_metadata () {
     var fields = FilesystemCapacityProbeService.parse_export (
-        "DEVNAME=/dev/loop0p1\nUUID=abcd-1234\nTYPE=ext4\nFS_BLOCK_SIZE=4096\nFS_SIZE=1073741824\n");
+        "DEVNAME=/dev/loop0p1\nUUID=abcd-1234\nTYPE=ext4\nFSBLOCKSIZE=4096\nFSSIZE=1073741824\nFSLASTBLOCK=262143\n");
     assert (fields.lookup ("TYPE") == "ext4");
-    assert (fields.lookup ("FS_SIZE") == "1073741824");
+    assert (fields.lookup ("FSSIZE") == "1073741824");
+    try { assert (FilesystemCapacityProbeService.capacity_from_metadata (fields) == 1073741824); }
+    catch (Error error) { assert_not_reached (); }
+    var ambiguous = FilesystemCapacityProbeService.parse_export (
+        "TYPE=ext4\nFSBLOCKSIZE=4096\nFSLASTBLOCK=262143\n");
+    try { FilesystemCapacityProbeService.capacity_from_metadata (ambiguous); assert_not_reached (); }
+    catch (Error error) { assert (error is IOError.NOT_SUPPORTED); }
+    var invalid = FilesystemCapacityProbeService.parse_export ("TYPE=ext4\nFSSIZE=not-a-number\n");
+    try { FilesystemCapacityProbeService.capacity_from_metadata (invalid); assert_not_reached (); }
+    catch (Error error) { assert (error is IOError.INVALID_DATA); }
     var measurement = new FilesystemCapacityMeasurement ();
     measurement.capacity = 1024 * 1024 * 1024;
     measurement.allocation_unit = 4096;
@@ -467,6 +476,12 @@ private void test_preparation_journal () {
     assert (reverse.length == 1 && reverse[0] == swap && !journal.fully_restored ());
     string recovery = journal.recovery_details ();
     assert (recovery.contains ("/mnt/archive") && recovery.contains ("automatic restoration was withheld"));
+    var multiple = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/multi",
+        { "uuid", "ext4", "/mnt/one", "/mnt/two" });
+    assert (multiple.mount_set_matches ({ "/mnt/two", "/mnt/one" }));
+    multiple.restored = true;
+    multiple.restored = multiple.mount_set_matches ({ "/mnt/one" });
+    assert (!multiple.restored);
     swap.restored = true; mount.restored = true; assert (journal.fully_restored ());
 }
 
@@ -607,7 +622,7 @@ private void test_job_correlation_ambiguity () {
 
 private void test_selftest_terminal_reconciliation () {
     assert (!StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "success", 100));
-    assert (StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "success", 101));
+    assert (!StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "success", 101));
     assert (StorageSelftestReconciliation.terminal_state_is_new ("success", 100, "failed", 100));
 }
 

@@ -9,7 +9,10 @@ deps = [
 subdir('src')
 layout_test = executable('storage-model-test', 'tests/storage-model-test.vala',
   storage_model_sources, dependencies: dependency('gio-2.0'))
+sh = find_program('sh')
 test('storage-model', layout_test)
+test('filesystem-capacity-integration', sh,
+  args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh'])
 xvfb = find_program('xvfb-run', required: false)
 if xvfb.found()
   ui_test = executable('ui-template-test', 'tests/ui-template-test.vala',
@@ -18,7 +21,6 @@ if xvfb.found()
     resources, dependencies: deps)
   test('ui-templates', xvfb, args: ['-a', ui_test])
 endif
-sh = find_program('sh')
 test('disposable-loop-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],
   timeout: 120)

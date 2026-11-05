@@ -82,6 +82,21 @@ namespace MajorisDisks {
         public uint64 media_errors;
         public uint64 unsafe_shutdowns;
         public uint64 error_log_entries;
+        public int available_spare = -1;
+        public int spare_threshold = -1;
+        public int percentage_used = -1;
+        public bool has_total_data_read;
+        public uint64 total_data_read;
+        public bool has_total_data_written;
+        public uint64 total_data_written;
+        public bool has_controller_busy_minutes;
+        public uint64 controller_busy_minutes;
+        public bool has_power_cycles;
+        public uint64 power_cycles;
+        public bool has_media_errors;
+        public bool has_unsafe_shutdowns;
+        public bool has_error_log_entries;
+        public string temperature_sensors = "";
         public StorageHealthAttribute[] attributes = {};
     }
 
