@@ -23,11 +23,15 @@ UDisks unlock supports passphrases, read-only access, and single LUKS keyfiles. 
 
 The installed desktop autostart entry starts `majoris-disks-health-monitor` independently of the Disks window. It monitors cached UDisks health data without issuing SMART refresh commands that can wake drives. Preferences in the application menu control warning, critical-failure, and failed-self-test notifications.
 
-Drive Actions offers raw backup and restoration. A raw backup of active storage may contain inconsistent data. Restoration checks the selected target, takes an exclusive UDisks descriptor, and verifies the bytes by readback before requesting a rescan. For `.img.xz` images, liblzma validates the complete stream before writing. The second pass decodes directly to the target and compares its digest against preflight and target readback.
+Drive Actions offers raw backup and restoration. A raw backup of active storage may contain inconsistent data. Restoration checks the selected target, takes an exclusive UDisks descriptor, and verifies the bytes by readback before requesting a rescan. Restoration writes the image-length region and preserves bytes beyond it. For `.img.xz` images, liblzma validates the complete stream before writing. The second pass decodes directly to the target and compares its digest against preflight and target readback.
 
 Disk benchmarks measure read throughput and access latency. The optional write benchmark uses a disposable scratch file in the folder you select. The application menu also creates sparse raw images and attaches raw images through UDisks.
 
 For optional VHD, VHDX, and QCOW2 inspection, creation, and conversion, install Debian's `qemu-utils` and a version of `bubblewrap` supporting `--ro-bind-fd`. The sandbox needs working user namespaces. The application can attach a saved raw conversion read-only. Virtual images with external backing or data files are unsupported.
+
+Direct VHD, VHDX and QCOW2 attachment also requires `libnbd0`, `util-linux`, the Linux NBD module with partition support, and the installed Majoris system-bus helper and Polkit policy. The sandboxed QEMU exporter runs as the desktop user. The helper handles only attachment and detachment of negotiated local sockets and checks kernel ownership before disconnecting. Read-only attachment is the default. Mount filesystems only from trusted images.
+
+For isolated Debian test systems, `MAJORIS_DISKS_RUN_NBD_TESTS=1` enables the disposable NBD lifecycle test. Install the helper and policy before running it. The separate raw/XZ device tests still use `MAJORIS_DISKS_RUN_LOOP_TESTS=1`.
 
 ## Architecture
 

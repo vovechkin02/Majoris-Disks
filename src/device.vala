@@ -131,6 +131,7 @@ namespace MajorisDisks {
         public StorageFilesystem? filesystem;
         public StorageEncryptedVolume? encrypted;
         public StorageLoopDevice? loop;
+        internal VirtualAttachment? virtual_attachment;
         public StorageMountConfiguration? mount_configuration;
         public StorageMountConfiguration[] mount_configurations = {};
         public StorageEncryptionConfiguration? encryption_configuration;

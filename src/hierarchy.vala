@@ -28,20 +28,23 @@ namespace MajorisDisks {
                     blocks += block;
                     physical.blocks = blocks;
                 }
-                if (block.partition != null || block.backing_path != "/" || block.ignored ||
+                if (block.partition != null || block.backing_path != "/" ||
+                    (block.ignored && block.virtual_attachment == null) ||
                     block.device.has_prefix ("/dev/ram") || block.device.has_prefix ("/dev/zram") ||
                     (block.loop != null && block.loop.backing_file == "")) continue;
                 var drive = physical;
                 if (drive == null) {
                     drive = previous.lookup (block.path) ?? new StorageDrive (block.path);
                     drive.blocks = { block };
-                    drive.name = block.loop != null ? Path.get_basename (block.loop.backing_file) : block.name;
+                    drive.name = block.virtual_attachment != null && block.virtual_attachment.file != "" ?
+                        Path.get_basename (block.virtual_attachment.file) :
+                        block.loop != null ? Path.get_basename (block.loop.backing_file) : block.name;
                     if (block.raid_path != "/")
                         drive.category = "RAID Arrays";
                     else if (block.logical_volume_path != "/")
                         drive.category = "Logical Volumes";
                     else
-                        drive.category = block.loop != null ? "Disk Images" : "Other";
+                        drive.category = block.loop != null || block.virtual_attachment != null ? "Disk Images" : "Other";
                     drive.size = block.size;
                     drive.available = block.available;
                     snapshot.drives.insert (drive.path, drive);

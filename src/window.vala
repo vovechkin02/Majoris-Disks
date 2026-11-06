@@ -495,10 +495,15 @@ namespace MajorisDisks {
             return "UDisks could not complete the operation. " + error.message;
         }
         internal void choose_attach_image () {
-            var chooser = new Gtk.FileDialog () { title = "Select a Raw Disk Image" };
+            var chooser = new Gtk.FileDialog () { title = "Select a Disk Image" };
             chooser.open.begin (this, null, (object, result) => {
                 File file;
                 try { file = chooser.open.end (result); } catch (Error error) { return; }
+                string name = (file.get_basename () ?? "").down ();
+                if (name.has_suffix (".vhd") || name.has_suffix (".vhdx") || name.has_suffix (".qcow2")) {
+                    inspect_virtual_image (file);
+                    return;
+                }
                 var confirmation = new DiskImageConfirmation () {
                     heading = "Attach Disk Image?",
                     body = file.get_parse_name () + "\n\nRead/write access allows changes to the image file."
@@ -525,33 +530,60 @@ namespace MajorisDisks {
             });
         }
 
+        private void attach_virtual (File file, bool read_only, string? completed = null) {
+            backend.attach_virtual_image.begin (file, read_only, (object, result) => {
+                try {
+                    select_drive ("session:" + backend.attach_virtual_image.end (result));
+                    notifications.add_toast (new Adw.Toast ("Virtual disk attached"));
+                } catch (Error error) {
+                    show_check_message (completed == null ? "Could not attach virtual disk" :
+                        completed + ", but attachment failed", error.message);
+                }
+            });
+        }
+
         internal void choose_virtual_image () {
             var chooser = new Gtk.FileDialog () { title = "Inspect a Disk Image" };
             chooser.open.begin (this, null, (object, result) => {
                 File source;
                 try { source = chooser.open.end (result); } catch (Error error) { return; }
-                VirtualDisk.inspect.begin (source, new Cancellable (), (object, inspected) => {
-                    try {
-                        var info = VirtualDisk.inspect.end (inspected);
-                        var dialog = new VirtualImageDialog () {
-                            body = "%s\nFormat: %s\nVirtual capacity: %s\nFile size: %s\n\nThe original image is preserved. A raw copy can be attached read-only.".printf (
-                                source.get_parse_name (), info.format, format_size (info.capacity), format_size (info.file_size))
-                        };
-                        dialog.response.connect ((response) => {
-                            if (response != "convert") return;
-                            string format = dialog.format;
-                            bool attach = dialog.attach_copy;
-                            var save = new Gtk.FileDialog () { title = "Save Converted Image",
-                                initial_name = "Converted" + image_extension (format) };
-                            save.save.begin (this, null, (object, saved) => {
-                                File target;
-                                try { target = save.save.end (saved); } catch (Error error) { return; }
-                                write_virtual_image (source, target, format, 0, attach);
-                            });
+                inspect_virtual_image (source);
+            });
+        }
+
+        private void inspect_virtual_image (File source) {
+            VirtualDisk.inspect.begin (source, new Cancellable (), (object, inspected) => {
+                try {
+                    var info = VirtualDisk.inspect.end (inspected);
+                    var dialog = new VirtualImageDialog () {
+                        body = "%s\nFormat: %s\nVirtual capacity: %s\nFile size: %s\n\nRead/write access modifies the selected image. Mount only images you trust, even when attached read-only.".printf (
+                            source.get_parse_name (), info.format, format_size (info.capacity), format_size (info.file_size))
+                    };
+                    string? unavailable = VirtualDiskAttachment.unavailable_reason ();
+                    bool direct = info.format != "raw" && unavailable == null;
+                    dialog.set_response_enabled ("attach-readonly", direct);
+                    string? source_path = source.get_path ();
+                    dialog.set_response_enabled ("attach-writable", direct && source_path != null &&
+                        Posix.access (source_path, Posix.W_OK) == 0);
+                    if (unavailable != null) dialog.body += "\n\n" + unavailable + " You can still convert to raw.";
+                    dialog.response.connect ((response) => {
+                        if (response == "attach-readonly" || response == "attach-writable") {
+                            attach_virtual (source, response == "attach-readonly");
+                            return;
+                        }
+                        if (response != "convert") return;
+                        string format = dialog.format;
+                        bool attach = dialog.attach_copy;
+                        var save = new Gtk.FileDialog () { title = "Save Converted Image",
+                            initial_name = "Converted" + image_extension (format) };
+                        save.save.begin (this, null, (object, saved) => {
+                            File target;
+                            try { target = save.save.end (saved); } catch (Error error) { return; }
+                            write_virtual_image (source, target, format, 0, attach);
                         });
-                        dialog.present (this);
-                    } catch (Error error) { show_check_message ("Could not inspect the image", error.message); }
-                });
+                    });
+                    dialog.present (this);
+                } catch (Error error) { show_check_message ("Could not inspect the image", error.message); }
             });
         }
 
@@ -572,7 +604,10 @@ namespace MajorisDisks {
                     outcome.successful = true;
                     outcome.summary = source == null ? "Virtual disk created" : "Disk image converted";
                     notifications.add_toast (new Adw.Toast (outcome.summary));
-                    if (attach && format == "raw") attach_image (destination, true, outcome.summary);
+                    if (attach) {
+                        if (format == "raw") attach_image (destination, true, outcome.summary);
+                        else attach_virtual (destination, true, outcome.summary);
+                    }
                 } catch (Error error) {
                     outcome.fail ("Could not write the virtual image", error);
                     show_check_message (outcome.summary, error.message);
@@ -593,7 +628,7 @@ namespace MajorisDisks {
                     File file;
                     try { file = chooser.save.end (result); } catch (Error error) { return; }
                     if (format != "raw") {
-                        write_virtual_image (null, file, format, size, false);
+                        write_virtual_image (null, file, format, size, attach);
                         return;
                     }
                     DiskImageCopy.create_blank.begin (file, size, null, (object, outcome) => {
@@ -812,12 +847,13 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.DropDown format_choice;
         [GtkChild] private unowned Adw.SwitchRow attach;
         public string format { owned get { return disk_image_format (format_choice.selected); } }
-        public bool attach_copy { get { return format_choice.selected == 0 && attach.active; } }
+        public bool attach_copy { get { return attach.sensitive && attach.active; } }
 
         construct {
             format_choice.notify["selected"].connect (() => {
-                attach.sensitive = format_choice.selected == 0;
-                attach.subtitle = attach.sensitive ? "" : "Direct virtual-image attachment is unavailable. Choose Raw to attach the output.";
+                string? unavailable = VirtualDiskAttachment.unavailable_reason ();
+                attach.sensitive = format_choice.selected == 0 || unavailable == null;
+                attach.subtitle = attach.sensitive ? "" : unavailable;
             });
         }
     }
@@ -839,13 +875,14 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.DropDown format_choice;
         public string format { owned get { return disk_image_format (format_choice.selected); } }
         public uint64 bytes { get { return (uint64) size.get_value_as_int () * (unit.selected == 0 ? 1048576 : 1073741824); } }
-        public bool attach_after { get { return format_choice.selected == 0 && attach.active; } }
+        public bool attach_after { get { return attach.sensitive && attach.active; } }
 
         construct {
             format_choice.sensitive = VirtualDisk.available ();
             format_choice.notify["selected"].connect (() => {
-                attach.sensitive = format_choice.selected == 0;
-                attach.subtitle = attach.sensitive ? "" : "Direct virtual-image attachment is unavailable. Choose Raw to attach the output.";
+                string? unavailable = VirtualDiskAttachment.unavailable_reason ();
+                attach.sensitive = format_choice.selected == 0 || unavailable == null;
+                attach.subtitle = attach.sensitive ? "" : unavailable;
             });
         }
     }

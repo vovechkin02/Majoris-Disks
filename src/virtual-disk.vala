@@ -87,7 +87,7 @@ namespace MajorisDisks {
             return true;
         }
 
-        private static async VirtualDiskInfo inspect_fd (int input, Cancellable token) throws Error {
+        internal static async VirtualDiskInfo inspect_fd (int input, Cancellable token) throws Error {
             Posix.Stat file = {};
             if (Posix.fstat (input, out file) != 0 || !Posix.S_ISREG (file.st_mode))
                 throw new IOError.INVALID_DATA ("Choose a regular local image file.");

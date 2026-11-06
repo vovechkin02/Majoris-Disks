@@ -184,7 +184,7 @@ namespace MajorisDisks {
             drive_settings.visible = drive.ata_apm_supported || drive.ata_aam_supported ||
                 drive.ata_write_cache_supported || drive.ata_read_lookahead_supported ||
                 (drive.ata_power_management && drive.rotation != 0);
-            detach_image_button.visible = drive.medium?.loop != null;
+            detach_image_button.visible = drive.medium?.loop != null || drive.medium?.virtual_attachment != null;
             backup_drive.visible = drive.medium?.size > 0;
             restore_drive.visible = false;
             if (disk != null && disk.available && disk.size > 0 && backend != null) {
@@ -199,6 +199,12 @@ namespace MajorisDisks {
             if (disk != null) summary.subtitle += " · " + disk.preferred;
             if (disk?.loop != null) summary.subtitle += "\n" + disk.loop.backing_file +
                 (disk.read_only ? " · Read-only" : " · Read/write");
+            if (disk?.virtual_attachment != null) {
+                var attachment = disk.virtual_attachment;
+                summary.subtitle += "\n" + (attachment.file == "" ? "Managed NBD image · recovery details unavailable" :
+                    attachment.file + " · " + (attachment.format == "vpc" ? "VHD" : attachment.format.up ()));
+                summary.subtitle += disk.read_only ? " · Read-only" : " · Read/write";
+            }
             if (disk?.table != null) summary.subtitle += " · " + disk.table.scheme.up ();
             StorageDevice[] ordered = {};
             if (disk != null) {

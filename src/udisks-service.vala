@@ -223,6 +223,7 @@ namespace MajorisDisks {
                 loop.backing_file = property (object_proxy, "Loop", "BackingFile")?.get_bytestring () ?? "";
                 block.loop = loop;
             } else block.loop = null;
+            block.virtual_attachment = VirtualDiskAttachment.lookup (block.device);
             var config = property (object_proxy, "Block", "Configuration");
             block.mount_configuration = null;
             block.mount_configurations = {};
@@ -653,9 +654,10 @@ namespace MajorisDisks {
 
         private void check_image_filesystem (StorageBlock block, Posix.Stat info) throws Error {
             Posix.Stat backing = {};
-            if (block.loop != null && Posix.stat (block.loop.backing_file, out backing) == 0 &&
+            string? backing_path = block.loop?.backing_file ?? block.virtual_attachment?.file;
+            if (backing_path != null && backing_path != "" && Posix.stat (backing_path, out backing) == 0 &&
                 backing.st_dev == info.st_dev && backing.st_ino == info.st_ino)
-                throw new IOError.INVALID_ARGUMENT ("The source is the selected loop device’s backing file.");
+                throw new IOError.INVALID_ARGUMENT ("The source is the selected device’s backing image.");
             foreach (var node in snapshot.dependencies.descendants (block)) {
                 var dependent = node as StorageBlock;
                 if (dependent != null && dependent.number == (uint64) info.st_dev)
@@ -832,7 +834,83 @@ namespace MajorisDisks {
             } finally { if (fd >= 0) Posix.close (fd); }
         }
 
+        internal async string attach_virtual_image (File source, bool read_only) throws Error {
+            var job = jobs.begin_named ("Attach virtual disk", source.get_parse_name (), {});
+            var outcome = new StorageOperationResult ();
+            VirtualAttachment? record = null;
+            try {
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.RUNNING, "Inspecting and authorizing the virtual disk");
+                record = yield VirtualDiskAttachment.attach (source, read_only, job.cancellable);
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.FINALIZING, "Waiting for UDisks discovery");
+                string path = "/org/freedesktop/UDisks2/block_devices/nbd%u".printf (record.index);
+                for (int attempt = 0; attempt < 75; attempt++) {
+                    synchronize ();
+                    var block = snapshot.blocks.lookup (path);
+                    if (block?.virtual_attachment?.token == record.token && block.read_only == read_only &&
+                        block.available && block.size == record.capacity) {
+                        Posix.Stat device_info = {};
+                        if (Posix.stat (block.device, out device_info) != 0 || !Posix.S_ISBLK (device_info.st_mode) ||
+                            (uint64) device_info.st_rdev != block.number)
+                            throw new IOError.INVALID_DATA ("The UDisks object does not match the connected NBD device.");
+                        outcome.successful = true;
+                        outcome.summary = "Virtual disk attached";
+                        jobs.finish (job, outcome);
+                        return path;
+                    }
+                    yield settle_delay (backend_lifetime);
+                }
+                throw new IOError.TIMED_OUT ("The kernel mapping was created but UDisks did not verify it. Refresh before retrying.");
+            } catch (Error error) {
+                outcome.fail ("Virtual attachment did not complete", error);
+                if (record != null || error is VirtualAttachmentError.UNCERTAIN)
+                    outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                jobs.finish (job, outcome);
+                throw error;
+            }
+        }
+
+        private async void detach_virtual_image (StorageBlock block, VirtualAttachment record) throws Error {
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Detach virtual disk", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            bool disconnect_started = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking virtual-disk dependencies");
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.unknown_dependencies || safety.active_dependents || safety.mounted)
+                    throw new IOError.BUSY ("Unmount virtual volumes and close their unlocked mappings before detaching.");
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var dependent = node as StorageBlock;
+                    if (dependent != null) yield KernelStorageSafety.require_idle (dependent, backend_lifetime);
+                }
+                synchronize ();
+                if (snapshot.blocks.lookup (block.path) != block || block.virtual_attachment?.token != record.token)
+                    throw new IOError.NOT_FOUND ("The selected virtual attachment changed.");
+                jobs.phase (job, StorageJobState.RUNNING, "Disconnecting the managed NBD device");
+                disconnect_started = true;
+                yield VirtualDiskAttachment.detach (record);
+                synchronize ();
+                outcome.successful = true;
+                outcome.summary = "Virtual disk detached";
+            } catch (Error error) {
+                outcome.fail (disconnect_started ? "Virtual disk detach requires attention" : "Virtual disk was not detached", error);
+                if (disconnect_started) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                synchronize ();
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+        }
+
         internal async void detach_disk_image (StorageBlock block) throws Error {
+            var virtual_image = block.virtual_attachment;
+            if (virtual_image != null) {
+                yield detach_virtual_image (block, virtual_image);
+                return;
+            }
             if (block.loop == null)
                 throw new IOError.NOT_SUPPORTED ("The selected device is not an attached raw image.");
             locks.acquire (block, snapshot.dependencies);

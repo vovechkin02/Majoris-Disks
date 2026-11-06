@@ -1222,6 +1222,15 @@ private void test_virtual_workflows () {
     if (!finished) loop.run ();
 }
 
+private void test_nbd_device_identity () {
+    uint index;
+    assert (VirtualDiskAttachment.parse_device ("/dev/nbd17", out index) && index == 17);
+    assert (!VirtualDiskAttachment.parse_device ("/dev/nbd17p1", out index));
+    assert (!VirtualDiskAttachment.parse_device ("/dev/nbd017", out index));
+    assert (!VirtualDiskAttachment.parse_device ("/dev/nbd-1", out index));
+    assert (!VirtualDiskAttachment.parse_device ("/dev/sda", out index));
+}
+
 public static int main (string[] args) {
     Test.init (ref args);
     if (Environment.get_variable ("MAJORIS_CAPACITY_LOOP") != null)
@@ -1270,6 +1279,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     Test.add_func ("/features/drive-health", test_health_problem_assessment);
     Test.add_func ("/features/virtual-image-descriptor-sandbox", test_image_descriptor_sandbox);
+    Test.add_func ("/features/nbd-device-identity", test_nbd_device_identity);
     Test.add_func ("/features/virtual-images", test_virtual_workflows);
     Test.add_func ("/features/mock-restore-rescan", test_mock_rescan);
     Test.add_func ("/features/restore-failure-classification", test_restore_failure_classification);

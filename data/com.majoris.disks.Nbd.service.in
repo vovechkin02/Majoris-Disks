@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.majoris.disks.Nbd
+Exec=@LIBEXECDIR@/majoris-disks-nbd-helper
+User=root
