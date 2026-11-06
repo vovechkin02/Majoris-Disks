@@ -11,7 +11,7 @@ namespace MajorisDisks {
         [CCode (cname = "blkid_do_safeprobe")]
         public int safe_probe ();
         [CCode (cname = "blkid_probe_lookup_value")]
-        public int lookup_value (string key, out unowned string value, void* length = null);
+        public int lookup_value (string key, out unowned string value, size_t* length = null);
     }
 
     [CCode (cname = "BLKID_SUBLKS_DEFAULT", cheader_filename = "blkid/blkid.h")]

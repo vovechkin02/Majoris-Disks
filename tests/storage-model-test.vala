@@ -434,6 +434,22 @@ private void test_ext_capacity_header () {
     } catch (Error error) { assert (error is IOError.INVALID_DATA); }
 }
 
+private void test_mount_configuration_snapshot () {
+    var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/test",
+        { "uuid", "ext4", "/first", "/second" });
+    var first = new StorageMountConfiguration ();
+    first.directory = "/first";
+    first.backend_item = new Variant ("(ss)", "/first", "ro");
+    var second = new StorageMountConfiguration ();
+    second.directory = "/second";
+    second.backend_item = new Variant ("(ss)", "/second", "rw");
+    entry.capture_mount_configuration ({ first, second });
+    assert (entry.persistent_mount && entry.mount_configuration_matches ({ second, first }));
+    assert (!entry.mount_configuration_matches ({ first }));
+    second.backend_item = new Variant ("(ss)", "/second", "ro");
+    assert (!entry.mount_configuration_matches ({ first, second }));
+}
+
 private void test_mount_restoration_status () {
     var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/test",
         { "uuid", "ext4", "/first", "/second" });
@@ -645,6 +661,42 @@ private void test_job_correlation () {
     assert (local.state == StorageJobState.COMPLETED && local.phase == "Verified");
 }
 
+private void test_late_backend_job () {
+    var manager = new StorageJobManager ();
+    var local = manager.begin_named ("Resize", "/dev/test", { "/target" });
+    manager.expect_backend (local, "partition-modify", "/target");
+    manager.method_returned (local, true);
+
+    var verified = new StorageOperationResult ();
+    verified.successful = true;
+    verified.summary = "Verified";
+    manager.finish (local, verified);
+    uint64 started = (uint64) local.backend_dispatch_time;
+    manager.observe ("/backend/other", "partition-modify", { "/target" }, 0, false, false,
+        (uint64) local.backend_method_return_time + 1, Posix.getuid ());
+    assert (local.backend_path == "");
+    manager.observe ("/backend/late", "partition-modify", { "/target" }, 0.5, true, true,
+        started, Posix.getuid ());
+    assert (local.backend_path == "/backend/late");
+    assert (manager.jobs.get_n_items () == 2 && local.state == StorageJobState.COMPLETED);
+    manager.backend_completed ("/backend/late", true, "");
+    assert (local.backend_completed && local.phase == "Verified");
+
+    var expired = manager.begin_named ("Resize", "/dev/test", { "/target" });
+    manager.expect_backend (expired, "partition-modify", "/target");
+    manager.method_returned (expired, true);
+    expired.backend_observation_deadline = 0;
+    manager.observe ("/backend/expired", "partition-modify", { "/target" }, 0, false, false,
+        (uint64) expired.backend_dispatch_time, Posix.getuid ());
+    assert (expired.backend_path == "" && expired.backend_expectation == BackendJobExpectation.EXPIRED);
+
+    var disconnected = manager.begin_named ("Resize", "/dev/test", { "/target" });
+    manager.expect_backend (disconnected, "partition-modify", "/target");
+    manager.method_returned (disconnected, true);
+    manager.backend_disconnected ();
+    assert (local.backend_path == "" && disconnected.backend_expectation == BackendJobExpectation.EXPIRED);
+}
+
 private void test_job_correlation_ambiguity () {
     var manager = new StorageJobManager (); var graph = new StorageDependencyService ();
     var block = new StorageBlock ("/same-target"); block.preferred = "/dev/same";
@@ -717,7 +769,7 @@ private async void run_mock_open_device () throws Error {
         var node = new DBusNodeInfo.for_xml ("<node><interface name='org.freedesktop.UDisks2.Block'>" +
             "<method name='OpenDevice'><arg type='s' direction='in'/><arg type='a{sv}' direction='in'/>" +
             "<arg type='h' direction='out'/></method></interface></node>");
-        foreach (var path in new string[] { "/test/denied", "/test/missing", "/test/not_block" }) {
+        foreach (var path in new string[] { "/test/denied", "/test/missing", "/test/invalid_index", "/test/not_block" }) {
             uint registration = register_mock_open_device (server, path, node.lookup_interface (iface));
             var proxy = yield new DBusProxy (client, DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, null,
                 server.unique_name, path, iface, null);
@@ -745,26 +797,80 @@ private void test_mock_open_device () {
     loop.run ();
 }
 
-private void test_capacity_descriptor_fixture () {
+private async void probe_file_fixture () throws Error {
     string fixture = Environment.get_variable ("MAJORIS_CAPACITY_FIXTURE") ?? "";
     int fd = Posix.open (fixture, Posix.O_RDONLY | Posix.O_CLOEXEC);
     assert (fd >= 0);
-    var loop = new MainLoop ();
-    FilesystemCapacityProbeService.probe_descriptor.begin (fd, new Cancellable (), (object, result) => {
+    try {
+        var fields = yield FilesystemCapacityProbeService.probe_descriptor (fd, new Cancellable ());
+        assert (fields.lookup ("TYPE") == "ext4");
+        assert (FilesystemCapacityProbeService.capacity_from_metadata (fields) == 67108864);
+        assert (fields.lookup ("UUID") == Environment.get_variable ("MAJORIS_CAPACITY_UUID"));
+        assert (Posix.fcntl (fd, Posix.F_GETFD) >= 0);
+
+        var token = new Cancellable ();
+        token.cancel ();
         try {
-            var fields = FilesystemCapacityProbeService.probe_descriptor.end (result);
-            assert (fields.lookup ("TYPE") == "ext4");
-            assert (FilesystemCapacityProbeService.capacity_from_metadata (fields) == 67108864);
-            assert (fields.lookup ("UUID") == Environment.get_variable ("MAJORIS_CAPACITY_UUID"));
-        } catch (Error error) { GLib.error ("%s", error.message); }
+            yield FilesystemCapacityProbeService.probe_descriptor (fd, token);
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.CANCELLED); }
+        assert (Posix.fcntl (fd, Posix.F_GETFD) >= 0);
+    } finally { Posix.close (fd); }
+
+    int empty = Posix.open ("/dev/null", Posix.O_RDONLY | Posix.O_CLOEXEC);
+    assert (empty >= 0);
+    try {
+        yield FilesystemCapacityProbeService.probe_descriptor (empty, new Cancellable ());
+        assert_not_reached ();
+    } catch (Error error) {
+        assert (error is IOError.INVALID_DATA);
+        assert (Posix.fcntl (empty, Posix.F_GETFD) >= 0);
+    } finally { Posix.close (empty); }
+}
+
+private void test_capacity_descriptor_fixture () {
+    var loop = new MainLoop ();
+    probe_file_fixture.begin ((object, result) => {
+        try { probe_file_fixture.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
         loop.quit ();
     });
     loop.run ();
-    Posix.close (fd);
+}
+
+private async void probe_udisks_fixture () throws Error {
+    string path = Environment.get_variable ("MAJORIS_CAPACITY_LOOP") ?? "";
+    Posix.Stat info;
+    if (Posix.stat (path, out info) != 0 || !Posix.S_ISBLK (info.st_mode))
+        throw new IOError.INVALID_DATA ("The disposable loop device is unavailable.");
+    var proxy = yield new DBusProxy.for_bus (BusType.SYSTEM, DBusProxyFlags.DO_NOT_AUTO_START,
+        null, "org.freedesktop.UDisks2",
+        "/org/freedesktop/UDisks2/block_devices/" + Path.get_basename (path),
+        "org.freedesktop.UDisks2.Block");
+    assert (proxy.get_cached_property ("ReadOnly")?.get_boolean () == true);
+    var fields = yield FilesystemCapacityProbeService.probe_authorized (proxy,
+        (uint64) info.st_rdev, new Cancellable ());
+    assert (fields.lookup ("TYPE") == "ext4");
+    assert (FilesystemCapacityProbeService.capacity_from_metadata (fields) == 67108864);
+    assert (fields.lookup ("UUID") == Environment.get_variable ("MAJORIS_CAPACITY_UUID"));
+    try {
+        yield FilesystemCapacityProbeService.probe_authorized (proxy, (uint64) info.st_rdev + 1, new Cancellable ());
+        assert_not_reached ();
+    } catch (Error error) { assert (error is IOError.INVALID_DATA); }
+}
+
+private void test_capacity_udisks_fixture () {
+    var loop = new MainLoop ();
+    probe_udisks_fixture.begin ((object, result) => {
+        try { probe_udisks_fixture.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
+        loop.quit ();
+    });
+    loop.run ();
 }
 
 public static int main (string[] args) {
     Test.init (ref args);
+    if (Environment.get_variable ("MAJORIS_CAPACITY_LOOP") != null)
+        Test.add_func ("/operations/capacity-udisks-fixture", test_capacity_udisks_fixture);
     if (Environment.get_variable ("MAJORIS_CAPACITY_FIXTURE") != null)
         Test.add_func ("/operations/capacity-descriptor-fixture", test_capacity_descriptor_fixture);
     Test.add_func ("/layout/gaps", test_gaps);
@@ -787,6 +893,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/label-validation", test_label_validation);
     Test.add_func ("/operations/job-lifecycle", test_job_lifecycle);
     Test.add_func ("/operations/job-correlation", test_job_correlation);
+    Test.add_func ("/operations/late-backend-job", test_late_backend_job);
     Test.add_func ("/operations/job-correlation-ambiguity", test_job_correlation_ambiguity);
     Test.add_func ("/operations/selftest-terminal-reconciliation", test_selftest_terminal_reconciliation);
     Test.add_func ("/operations/resize-planner-safety", test_resize_planner_safety);
@@ -795,6 +902,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/offline-capacity-identity", test_offline_capacity_identity);
     Test.add_func ("/operations/offline-capacity-metadata", test_offline_capacity_metadata);
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
+    Test.add_func ("/operations/mount-configuration-snapshot", test_mount_configuration_snapshot);
     Test.add_func ("/operations/mount-restoration-status", test_mount_restoration_status);
     Test.add_func ("/operations/preparation-journal", test_preparation_journal);
     Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);

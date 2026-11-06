@@ -5,9 +5,28 @@ for tool in mktemp truncate mkfs.ext4 blkid dumpe2fs; do
   command -v "$tool" >/dev/null || { echo "SKIP: $tool is unavailable"; exit 77; }
 done
 
+mode=${2:-file}
+loop=""
+attached=""
 fixture=$(mktemp "${TMPDIR:-/tmp}/majoris-disks-capacity.XXXXXX.img")
-cleanup() { rm -f -- "$fixture"; }
-trap cleanup EXIT HUP INT TERM
+matches_fixture() {
+  [ -n "$loop" ] && [ -b "$loop" ] &&
+    [ "$(cat "/sys/class/block/${loop##*/}/loop/backing_file" 2>/dev/null)" = "$fixture" ]
+}
+cleanup() {
+  if matches_fixture; then
+    if ! udisksctl loop-delete --block-device "$loop" --no-user-interaction >/dev/null; then
+      echo "Could not detach disposable fixture $loop. Retained $fixture." >&2
+      return 1
+    fi
+  elif [ -n "$attached" ]; then
+    echo "Could not verify the loop fixture for cleanup. Retained $fixture." >&2
+    return 1
+  fi
+  rm -f -- "$fixture"
+}
+trap 'status=$?; cleanup || status=1; exit "$status"' EXIT
+trap 'exit 1' HUP INT TERM
 
 truncate -s 64M "$fixture"
 mkfs.ext4 -q -F "$fixture"
@@ -38,7 +57,22 @@ ext_block_size=$(printf '%s\n' "$header" | sed -n 's/^Block size:[[:space:]]*//p
 [ "$ext_block_size" -eq "$block_size" ]
 [ "$((blocks * ext_block_size))" -eq "$size" ]
 
-if [ "$#" -gt 0 ]; then
+if [ "$mode" = live ]; then
+  command -v udisksctl >/dev/null || { echo "SKIP: udisksctl is unavailable"; exit 77; }
+  fixture=$(readlink -f "$fixture")
+  if ! attached=$(LC_ALL=C udisksctl loop-setup --read-only --file "$fixture" --no-user-interaction 2>&1); then
+    printf 'SKIP: could not attach read-only disposable loop fixture: %s\n' "$attached"
+    attached=""
+    exit 77
+  fi
+  loop=$(printf '%s\n' "$attached" | sed -n 's/.* as \(\/dev\/loop[0-9][0-9]*\)\.$/\1/p')
+  if ! matches_fixture; then
+    printf 'Could not verify disposable loop setup: %s\n' "$attached" >&2
+    exit 1
+  fi
+  MAJORIS_CAPACITY_LOOP="$loop" MAJORIS_CAPACITY_UUID="$blkid_uuid" \
+    "$1" -p /operations/capacity-udisks-fixture
+elif [ "$#" -gt 0 ]; then
   MAJORIS_CAPACITY_FIXTURE="$fixture" MAJORIS_CAPACITY_UUID="$blkid_uuid" \
     "$1" -p /operations/capacity-descriptor-fixture
 fi

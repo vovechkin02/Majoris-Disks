@@ -203,7 +203,10 @@ namespace MajorisDisks {
                 DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, -1, null, token, out descriptors);
             if (descriptors == null || !reply.is_of_type (new VariantType ("(h)")))
                 throw new IOError.INVALID_DATA ("UDisks did not return a read-only block descriptor.");
-            int fd = descriptors.get (reply.get_child_value (0).get_handle ());
+            int handle = reply.get_child_value (0).get_handle ();
+            if (handle < 0 || handle >= descriptors.get_length ())
+                throw new IOError.INVALID_DATA ("UDisks returned an invalid block descriptor index.");
+            int fd = descriptors.get (handle);
             try {
                 Posix.Stat info;
                 if (Posix.fstat (fd, out info) != 0)
@@ -223,18 +226,8 @@ namespace MajorisDisks {
             var context = MainContext.ref_thread_default ();
             var fields = new HashTable<string, string> (str_hash, str_equal);
             int status = -1;
-            new Thread<void*> ("filesystem-capacity", () => {
-                var probe = new BlkidProbe ();
-                if (probe != null && probe.set_device (fd, 0, 0) == 0 &&
-                    probe.set_superblocks_flags (BLKID_DEFAULT_FIELDS | BLKID_FILESYSTEM_FIELDS) == 0) {
-                    status = probe.safe_probe ();
-                    if (status == 0) {
-                        foreach (var key in new string[] { "TYPE", "UUID", "FSSIZE", "FSBLOCKSIZE" }) {
-                            unowned string value;
-                            if (probe.lookup_value (key, out value) == 0) fields.insert (key, value);
-                        }
-                    }
-                }
+            new Thread<void*>.try ("filesystem-capacity", () => {
+                status = read_probe_fields (fd, fields);
                 var resume = new IdleSource ();
                 resume.set_callback (probe_descriptor.callback);
                 resume.attach (context);
@@ -245,6 +238,21 @@ namespace MajorisDisks {
             if (status != 0)
                 throw new IOError.INVALID_DATA ("libblkid could not establish unambiguous filesystem metadata.");
             return fields;
+        }
+
+        private static int read_probe_fields (int fd, HashTable<string, string> fields) {
+            var probe = new BlkidProbe ();
+            if (probe == null || probe.set_device (fd, 0, 0) != 0 ||
+                probe.set_superblocks_flags (BLKID_DEFAULT_FIELDS | BLKID_FILESYSTEM_FIELDS) != 0)
+                return -1;
+            int status = probe.safe_probe ();
+            if (status != 0) return status;
+            foreach (var key in new string[] { "TYPE", "UUID", "FSSIZE", "FSBLOCKSIZE" }) {
+                unowned string value;
+                if (probe.lookup_value (key, out value) == 0)
+                    fields.insert (key, value.dup ());
+            }
+            return status;
         }
 
         public static FilesystemCapacityMeasurement parse_ext_header (string output) throws Error {

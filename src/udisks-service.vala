@@ -5,9 +5,26 @@ namespace MajorisDisks {
         public string type;
         public int64 observation_deadline;
         public SelftestOperationState state;
-        public SelftestOperation (StorageJob job, string type) {
+        private StorageDrive original_drive;
+        private string serial;
+        private string wwn;
+
+        public SelftestOperation (StorageJob job, string type, StorageDrive drive) {
             this.job = job; this.type = type;
+            original_drive = drive;
+            serial = drive.serial;
+            wwn = drive.wwn;
             state = SelftestOperationState.REQUESTED;
+        }
+
+        public bool matches_drive (StorageDrive drive) {
+            if (serial != "" || wwn != "") return drive.serial == serial && drive.wwn == wwn;
+            return drive == original_drive;
+        }
+
+        public void await_observation () {
+            state = SelftestOperationState.UNCERTAIN;
+            observation_deadline = get_monotonic_time () + 30 * TimeSpan.SECOND;
         }
     }
 
@@ -64,6 +81,13 @@ namespace MajorisDisks {
             if (current == owner) return;
             backend_lifetime.cancel ();
             backend_lifetime = new Cancellable ();
+            if (owner != null) {
+                foreach (var operation in active_selftests.get_values ())
+                    operation.await_observation ();
+                jobs.backend_disconnected ();
+                observed_jobs.remove_all ();
+                connected_jobs.remove_all ();
+            }
             owner = current;
         }
         private void queue_refresh () {
@@ -347,9 +371,11 @@ namespace MajorisDisks {
                 var operation = active_selftests.lookup (entry);
                 if (operation == null) continue;
                 var job = operation.job;
-                if (drive == null) {
+                if (drive == null || !operation.matches_drive (drive)) {
+                    if (drive == null && operation.state == SelftestOperationState.UNCERTAIN &&
+                        get_monotonic_time () < operation.observation_deadline) continue;
                     var missing = new StorageOperationResult ();
-                    missing.fail ("Self-test drive disappeared");
+                    missing.fail ("The original self-test drive is no longer available");
                     missing.status = StorageOperationStatus.NEEDS_ATTENTION;
                     jobs.finish (job, missing); finished += entry;
                     continue;
@@ -372,7 +398,7 @@ namespace MajorisDisks {
                         var unknown = new StorageOperationResult ();
                         unknown.fail ("Self-test result is unknown");
                         unknown.status = StorageOperationStatus.NEEDS_ATTENTION;
-                        unknown.technical_error = "The drive never reported this test running.";
+                        unknown.technical_error = "A current running state could not be verified.";
                         jobs.finish (job, unknown); finished += entry;
                     }
                     continue;
@@ -402,7 +428,7 @@ namespace MajorisDisks {
                 string[] affected = { drive.path };
                 if (drive.medium != null) affected += drive.medium.path;
                 var job = jobs.begin_named ("Discovered drive self-test", drive.name, affected);
-                var operation = new SelftestOperation (job, "Discovered");
+                var operation = new SelftestOperation (job, "Discovered", drive);
                 operation.state = SelftestOperationState.RUNNING;
                 active_selftests.insert (drive.path, operation);
                 bool valid = drive.smart_selftest_remaining >= 0;
@@ -441,8 +467,9 @@ namespace MajorisDisks {
                 if (!connected_jobs.contains (path)) {
                     connected_jobs.insert (path, path);
                     string captured = path;
+                    string? job_owner = owner;
                     proxy.g_signal.connect ((sender, signal_name, parameters) => {
-                        if (signal_name != "Completed" || !parameters.is_of_type (new VariantType ("(bs)"))) return;
+                        if (job_owner != owner || signal_name != "Completed" || !parameters.is_of_type (new VariantType ("(bs)"))) return;
                         jobs.backend_completed (captured, parameters.get_child_value (0).get_boolean (),
                             parameters.get_child_value (1).get_string ());
                     });
@@ -458,12 +485,15 @@ namespace MajorisDisks {
 
         private async Variant call_tracked_method (StorageJob job, DBusProxy proxy, string method,
             Variant parameters, Cancellable token) throws Error {
+            bool received_reply = false;
             try {
-                return yield proxy.call (method, parameters, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
+                var reply = yield proxy.call (method, parameters, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
                     int.MAX, token);
+                received_reply = true;
+                return reply;
             } finally {
-                synchronize_jobs ();
-                job.backend_expectation_open = false;
+                jobs.method_returned (job, received_reply && !token.is_cancelled ());
+                if (!token.is_cancelled ()) synchronize_jobs ();
             }
         }
 
@@ -606,7 +636,7 @@ namespace MajorisDisks {
                 SelftestOperation operation;
                 if (stop) operation = existing;
                 else {
-                    operation = new SelftestOperation (job, type);
+                    operation = new SelftestOperation (job, type, drive);
                     active_selftests.insert (drive.path, operation);
                 }
                 try {
@@ -656,8 +686,7 @@ namespace MajorisDisks {
                             drive.smart_selftest_remaining >= 0 ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0,
                             drive.smart_selftest_remaining >= 0);
                     } else if (uncertain) {
-                        operation.state = SelftestOperationState.UNCERTAIN;
-                        operation.observation_deadline = get_monotonic_time () + 30 * TimeSpan.SECOND;
+                        operation.await_observation ();
                         jobs.phase (job, StorageJobState.FINALIZING, "Waiting to verify the self-test outcome");
                     } else {
                         active_selftests.remove (drive.path);
@@ -1275,16 +1304,7 @@ namespace MajorisDisks {
 
         private void capture_mount_state (StorageBlock block, StoragePreparationEntry entry) {
             entry.device_identity = StoragePreparationJournal.device_identity (block);
-            foreach (var configuration in block.mount_configurations) {
-                for (uint i = 0; i < entry.mount_point_count (); i++) {
-                    string mount = entry.mount_point_at (i);
-                    if (configuration.directory != mount) continue;
-                    entry.persistent_mount = true;
-                    entry.persistent_mount_options = configuration.options;
-                    entry.persistent_mount_configuration = configuration.backend_item;
-                    return;
-                }
-            }
+            entry.capture_mount_configuration (block.mount_configurations);
         }
 
         private void reconcile_preparation (StoragePreparationJournal journal) {
@@ -1339,20 +1359,9 @@ namespace MajorisDisks {
                 }
                 try {
                     if (entry.kind == StoragePreparationKind.MOUNT) {
-                        if (entry.persistent_mount) {
-                            bool configuration_matches = false;
-                            foreach (var current in block.mount_configurations) {
-                                if (entry.persistent_mount_configuration != null && current.backend_item != null &&
-                                    entry.persistent_mount_configuration.equal (current.backend_item))
-                                    configuration_matches = true;
-                            }
-                            if (!configuration_matches) {
-                                entry.restoration_allowed = false;
-                                throw new IOError.FAILED ("The saved mount configuration changed.");
-                            }
-                        } else if (block.mount_configurations.length != 0) {
+                        if (!entry.mount_configuration_matches (block.mount_configurations)) {
                             entry.restoration_allowed = false;
-                            throw new IOError.FAILED ("A persistent mount configuration now applies to this filesystem.");
+                            throw new IOError.FAILED ("The saved mount configuration changed.");
                         }
                         if (entry.observed_mount_points.length != 0)
                             throw new IOError.FAILED ("The filesystem is already mounted, but some original mount locations are missing or have changed.");

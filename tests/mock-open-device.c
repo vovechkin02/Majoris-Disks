@@ -33,7 +33,7 @@ mock_open_device (GDBusConnection *connection, const char *sender, const char *p
     close (fd);
     g_assert_no_error (error);
     g_dbus_method_invocation_return_value_with_unix_fd_list (invocation,
-        g_variant_new ("(h)", handle), descriptors);
+        g_variant_new ("(h)", g_str_equal (path, "/test/invalid_index") ? handle + 1 : handle), descriptors);
 }
 
 guint

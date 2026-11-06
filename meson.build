@@ -17,6 +17,9 @@ sh = find_program('sh')
 test('storage-model', layout_test)
 test('filesystem-capacity-integration', sh,
   args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test])
+test('filesystem-capacity-udisks', sh,
+  args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test, 'live'],
+  timeout: 60)
 xvfb = find_program('xvfb-run', required: false)
 if xvfb.found()
   ui_test = executable('ui-template-test', 'tests/ui-template-test.vala',
