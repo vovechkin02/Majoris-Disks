@@ -20,6 +20,9 @@
                     <property name="adjustment"><object class="GtkAdjustment"><property name="lower">1</property><property name="upper">16</property><property name="step-increment">1</property><property name="value">4</property></object></property>
                   </object></child>
                 </object></child>
+                <child><object class="AdwSwitchRow" id="buffered"><property name="title">Buffered I/O</property>
+                  <property name="subtitle">Use this when direct I/O is unavailable. Results may include cached data.</property>
+                </object></child>
                 <child><object class="GtkButton" id="start"><property name="label">Start Benchmark</property></object></child>
               </object>
             </child>

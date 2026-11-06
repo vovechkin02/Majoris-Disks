@@ -50,7 +50,7 @@ namespace MajorisDisks {
                 bool stable = !identity.has_prefix ("session:");
                 string id = Checksum.compute_for_string (ChecksumType.SHA256, identity);
                 present.insert (id, id);
-                if (drive.smart_updated == 0) continue;
+                if (!DriveHealth.has_current_data (drive)) continue;
                 bool urgent;
                 string problem = DriveHealth.problem (drive, preferences?.get_boolean ("warnings") ?? true,
                     preferences?.get_boolean ("critical") ?? true, preferences?.get_boolean ("self-tests") ?? true,

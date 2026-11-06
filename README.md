@@ -4,7 +4,7 @@ Disks is the native GTK4 and libadwaita storage inspector for Majoris. It uses t
 
 ## Build and test
 
-On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, `libblkid-dev`, `libjson-glib-dev`, and `udisks2`. The build requires libadwaita 1.5 or later.
+On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, `libblkid-dev`, `libjson-glib-dev`, `liblzma-dev`, and `udisks2`. The build requires libadwaita 1.5 or later.
 
 ```sh
 meson setup build --prefix=/usr --sysconfdir=/etc
@@ -23,7 +23,7 @@ UDisks unlock supports passphrases, read-only access, and single LUKS keyfiles. 
 
 The installed desktop autostart entry starts `majoris-disks-health-monitor` independently of the Disks window. It monitors cached UDisks health data without issuing SMART refresh commands that can wake drives. Preferences in the application menu control warning, critical-failure, and failed-self-test notifications.
 
-Drive Actions offers raw backup and restoration. A raw backup of active storage may contain inconsistent data. Restoration checks the selected target, takes an exclusive UDisks descriptor, and verifies the bytes by readback before requesting a rescan. For `.img.xz` images, install `xz-utils`. Compressed restoration validates and expands the image into a temporary file before writing the target, so it requires enough temporary space for the expanded image.
+Drive Actions offers raw backup and restoration. A raw backup of active storage may contain inconsistent data. Restoration checks the selected target, takes an exclusive UDisks descriptor, and verifies the bytes by readback before requesting a rescan. For `.img.xz` images, liblzma validates the complete stream before writing. The second pass decodes directly to the target and compares its digest against preflight and target readback.
 
 Disk benchmarks measure read throughput and access latency. The optional write benchmark uses a disposable scratch file in the folder you select. The application menu also creates sparse raw images and attaches raw images through UDisks.
 

@@ -6,12 +6,16 @@ namespace MajorisDisks {
             return "session:" + drive.path;
         }
 
+        public static bool has_current_data (StorageDrive drive) {
+            if (drive.smart_updated == 0) return false;
+            return drive.nvme_state != "" ? drive.nvme_state == "live" : drive.smart && drive.smart_enabled;
+        }
+
         public static string problem (StorageDrive drive, bool warnings, bool critical, bool selftests,
             out bool urgent) {
             urgent = false;
-            if (drive.smart_updated == 0) return "";
+            if (!has_current_data (drive)) return "";
             bool nvme = drive.nvme_state != "";
-            if (!nvme && (!drive.smart || !drive.smart_enabled)) return "";
             string[] problems = {};
             if (critical && (drive.smart_failing || drive.smart_attributes_failing > 0 ||
                 (nvme && drive.nvme_warnings.length != 0))) {

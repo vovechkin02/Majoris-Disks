@@ -3,6 +3,13 @@
   <template class="MajorisDisksDiskImageConfirmation" parent="AdwAlertDialog">
     <property name="default-response">cancel</property>
     <property name="close-response">cancel</property>
+    <property name="extra-child">
+      <object class="AdwSwitchRow" id="verify">
+        <property name="title">Verify the saved image by reading it back</property>
+        <property name="visible">false</property>
+        <property name="active">true</property>
+      </object>
+    </property>
     <responses>
       <response id="cancel">Cancel</response>
       <response id="proceed">Continue</response>

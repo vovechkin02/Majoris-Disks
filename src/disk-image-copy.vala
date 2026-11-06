@@ -4,13 +4,68 @@ namespace MajorisDisks {
     [CCode (cname = "write", cheader_filename = "unistd.h")]
     private extern ssize_t write_bytes (int fd, void* bytes, size_t count);
 
+    internal enum ImageWritePhase { VALIDATING, PREPARING, WRITING, FLUSHING, VERIFYING, WRITTEN_VERIFIED, RESCANNING, COMPLETED }
+
+    internal class ImageWriteState : Object {
+        public ImageWritePhase phase;
+        public bool descriptor_closed;
+        public bool rescan_requested;
+        public bool rescan_completed;
+        public bool model_refreshed;
+
+        public async void rescan (DBusProxy proxy, Cancellable token) throws Error {
+            phase = ImageWritePhase.RESCANNING;
+            rescan_requested = true;
+            yield proxy.call ("Rescan", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
+            rescan_completed = true;
+        }
+
+        public void describe_failure (StorageOperationResult result, Error error) {
+            string summary;
+            switch (phase) {
+                case ImageWritePhase.WRITING: summary = "Writing stopped. The target may be partially overwritten."; break;
+                case ImageWritePhase.FLUSHING: summary = "All image bytes were written, but durability could not be confirmed."; break;
+                case ImageWritePhase.VERIFYING: summary = "All image bytes were written and flushed, but verification did not complete."; break;
+                case ImageWritePhase.WRITTEN_VERIFIED: summary = "The image was written and verified, but closing the target failed."; break;
+                case ImageWritePhase.RESCANNING:
+                    summary = rescan_completed ?
+                        "The image was written and verified and the rescan completed, but the device model could not be refreshed." :
+                        rescan_requested ? "The image was written and verified, but the partition rescan failed." :
+                        "The image was written and verified, but a device rescan could not be requested.";
+                    break;
+                default: summary = "Restoration stopped before writing to the target."; break;
+            }
+            result.fail (summary, error);
+            if (phase >= ImageWritePhase.WRITING) {
+                result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                result.partial = phase == ImageWritePhase.WRITING;
+            }
+        }
+    }
+
+    [CCode (cname = "MajorisXzProgress", cheader_filename = "xz-stream.h")]
+    private delegate void XzProgress (uint64 compressed, uint64 expanded);
+
+    [CCode (cname = "majoris_xz_decode", cheader_filename = "xz-stream.h")]
+    private extern bool decode_xz_native (InputStream input, OutputStream? output, uint64 limit,
+        Cancellable token, XzProgress? progress, out uint64 size, out string digest) throws Error;
+
+    [CCode (cname = "majoris_image_identity", cheader_filename = "xz-stream.h")]
+    internal extern string? image_identity (int fd);
+
+    internal class XzImage : Object {
+        public uint64 size;
+        public string digest = "";
+    }
+
     internal class DiskImageCopy {
         public static async void copy (int input, int output, uint64 bytes,
-            StorageJobManager jobs, StorageJob job, bool verify_output = false) throws Error {
+            StorageJobManager jobs, StorageJob job, bool verify_output = false, ImageWriteState? state = null) throws Error {
             var context = MainContext.ref_thread_default ();
             Error? failure = null;
             new Thread<void*>.try ("disk-image", () => {
-                try { copy_sync (input, output, bytes, context, jobs, job, verify_output); }
+                try { copy_sync (input, output, bytes, context, jobs, job, verify_output, state); }
                 catch (Error error) { failure = error; }
                 var resume = new IdleSource ();
                 resume.set_callback (copy.callback);
@@ -51,44 +106,73 @@ namespace MajorisDisks {
             }
         }
 
+        public static async XzImage decode_xz (int input, OutputStream? output, uint64 limit,
+            Cancellable token, StorageJobManager? jobs = null, StorageJob? job = null) throws Error {
+            var context = MainContext.ref_thread_default ();
+            var decoded = new XzImage ();
+            Error? failure = null;
+            new Thread<void*>.try ("xz-decode", () => {
+                try {
+                    var stream = new UnixInputStream (input, false);
+                    int64 started = get_monotonic_time ();
+                    decode_xz_native (stream, output, limit, token, (compressed, expanded) => {
+                        if (jobs == null || job == null) return;
+                        uint64 rate = (uint64) (expanded * 1000000.0 /
+                            int64.max (1, get_monotonic_time () - started));
+                        string phase = "%s · %s compressed · %s %s · %s/s".printf (
+                            output == null ? "Validating XZ" : "Restoring XZ", format_size (compressed),
+                            format_size (expanded), output == null ? "decoded" : "written", format_size (rate));
+                        double fraction = output == null ? 0 : (double) expanded / limit;
+                        var update = new IdleSource ();
+                        update.set_callback (() => {
+                            if (!token.is_cancelled ()) jobs.progress (job, phase, fraction, output != null);
+                            return Source.REMOVE;
+                        });
+                        update.attach (context);
+                    }, out decoded.size, out decoded.digest);
+                } catch (Error error) { failure = error; }
+                var resume = new IdleSource ();
+                resume.set_callback (decode_xz.callback);
+                resume.attach (context);
+                return null;
+            });
+            yield;
+            if (failure != null) throw failure;
+            return decoded;
+        }
+
         public static async uint64 expand_xz (int input, OutputStream output, uint64 capacity,
             Cancellable token) throws Error {
-            string? executable = Environment.find_program_in_path ("xz");
-            if (executable == null) throw new IOError.NOT_SUPPORTED ("Install xz-utils to restore compressed images.");
-            int copy = Posix.dup (input);
-            if (copy < 0) throw new IOError.FAILED ("Could not duplicate the image descriptor.");
-            var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_SILENCE);
-            launcher.take_stdin_fd (copy);
-            var decoder = launcher.spawnv ({ executable, "--format=xz", "--decompress", "--stdout",
-                "--memlimit-decompress=256MiB" });
-            var stream = decoder.get_stdout_pipe ();
-            var buffer = new uint8[1024 * 1024];
-            uint64 bytes = 0;
-            bool complete = false;
-            try {
-                while (true) {
-                    ssize_t got = yield stream.read_async (buffer, Priority.DEFAULT, token);
-                    if (got == 0) break;
-                    if ((uint64) got > capacity - bytes)
-                        throw new IOError.NO_SPACE ("The decompressed image is larger than the target.");
-                    size_t written;
-                    yield output.write_all_async (buffer[0:(int) got], Priority.DEFAULT, token, out written);
-                    bytes += written;
-                }
-                try { yield decoder.wait_check_async (token); }
-                catch (Error error) {
-                    if (error is IOError.CANCELLED) throw error;
-                    throw new IOError.INVALID_DATA ("XZ rejected the image or the compressed stream was truncated.");
-                }
-                complete = true;
-                return bytes;
-            } finally {
-                if (!complete) decoder.force_exit ();
-            }
+            var decoded = yield decode_xz (input, output, capacity, token);
+            return decoded.size;
+        }
+
+        public static async void verify_streamed_write (int output, XzImage decoded, XzImage expected,
+            StorageJobManager jobs, StorageJob job, ImageWriteState state) throws Error {
+            if (decoded.size != expected.size)
+                throw new IOError.INVALID_DATA ("The decompressed byte count changed after preflight.");
+            var context = MainContext.ref_thread_default ();
+            Error? failure = null;
+            new Thread<void*>.try ("image-readback", () => {
+                try {
+                    flush_output (output, state);
+                    state.phase = ImageWritePhase.VERIFYING;
+                    if (decoded.digest != expected.digest)
+                        throw new IOError.INVALID_DATA ("The decompressed image changed after preflight.");
+                    verify_readback (output, decoded.size, decoded.digest, context, jobs, job);
+                    state.phase = ImageWritePhase.WRITTEN_VERIFIED;
+                } catch (Error error) { failure = error; }
+                var resume = new IdleSource ();
+                resume.set_callback (verify_streamed_write.callback);
+                resume.attach (context);
+                return null;
+            });
+            yield;
+            if (failure != null) throw failure;
         }
 
         private static void copy_sync (int input, int output, uint64 bytes, MainContext context,
-            StorageJobManager jobs, StorageJob job, bool verify_output) throws Error {
+            StorageJobManager jobs, StorageJob job, bool verify_output, ImageWriteState? state) throws Error {
             var token = job.cancellable;
             var buffer = new uint8[1024 * 1024];
             uint64 copied = 0;
@@ -107,6 +191,7 @@ namespace MajorisDisks {
                 ssize_t written = 0;
                 while (written < count) {
                     token.set_error_if_cancelled ();
+                    if (state != null) state.phase = ImageWritePhase.WRITING;
                     ssize_t step = write_bytes (output, (uint8*) buffer + written, (size_t) (count - written));
                     if (step < 0 && Posix.errno == Posix.EINTR) continue;
                     if (step <= 0) throw new IOError.FAILED ("Image write failed: " + Posix.strerror (Posix.errno));
@@ -128,11 +213,25 @@ namespace MajorisDisks {
                     last = now;
                 }
             }
-            if (Posix.fsync (output) != 0)
-                throw new IOError.FAILED ("Could not flush the image: " + Posix.strerror (Posix.errno));
+            flush_output (output, state);
             token.set_error_if_cancelled ();
             if (checksum == null) return;
+            if (state != null) state.phase = ImageWritePhase.VERIFYING;
+            verify_readback (output, bytes, checksum.get_string (), context, jobs, job);
+            if (state != null) state.phase = ImageWritePhase.WRITTEN_VERIFIED;
+        }
 
+        private static void flush_output (int output, ImageWriteState? state) throws Error {
+            if (state != null) state.phase = ImageWritePhase.FLUSHING;
+            if (Posix.fsync (output) != 0)
+                throw new IOError.FAILED ("Could not flush the image: " + Posix.strerror (Posix.errno));
+            if (state != null) state.phase = ImageWritePhase.VERIFYING;
+        }
+
+        private static void verify_readback (int output, uint64 bytes, string digest,
+            MainContext context, StorageJobManager jobs, StorageJob job) throws Error {
+            var token = job.cancellable;
+            var buffer = new uint8[1024 * 1024];
             var verifying = new IdleSource ();
             verifying.set_callback (() => {
                 if (!token.is_cancelled ()) jobs.progress (job, "Verifying the written data", 0, false);
@@ -143,6 +242,7 @@ namespace MajorisDisks {
                 throw new IOError.FAILED ("Could not seek to the start of the output for verification.");
             var readback = new Checksum (ChecksumType.SHA256);
             uint64 remaining = bytes;
+            int64 last_update = get_monotonic_time ();
             while (remaining > 0) {
                 token.set_error_if_cancelled ();
                 ssize_t got = read_bytes (output, buffer, (size_t) uint64.min (buffer.length, remaining));
@@ -150,10 +250,20 @@ namespace MajorisDisks {
                 if (got <= 0) throw new IOError.PARTIAL_INPUT ("Could not read the complete output for verification.");
                 readback.update (buffer, (size_t) got);
                 remaining -= got;
+                int64 now = get_monotonic_time ();
+                if (now - last_update >= 200000 || remaining == 0) {
+                    double fraction = (double) (bytes - remaining) / bytes;
+                    var update = new IdleSource ();
+                    update.set_callback (() => {
+                        if (!token.is_cancelled ()) jobs.progress (job, "Verifying the written data", fraction, true);
+                        return Source.REMOVE;
+                    });
+                    update.attach (context);
+                    last_update = now;
+                }
             }
-            if (checksum.get_string () != readback.get_string ())
+            if (digest != readback.get_string ())
                 throw new IOError.INVALID_DATA ("Readback verification did not match the source image.");
-            token.set_error_if_cancelled ();
         }
     }
 

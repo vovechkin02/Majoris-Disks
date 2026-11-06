@@ -513,12 +513,15 @@ namespace MajorisDisks {
             });
         }
 
-        private void attach_image (File file, bool read_only) {
+        private void attach_image (File file, bool read_only, string? completed = null) {
             backend.attach_disk_image.begin (file, read_only, (object, result) => {
                 try {
                     select_drive ("session:" + backend.attach_disk_image.end (result));
                     notifications.add_toast (new Adw.Toast ("Disk image attached"));
-                } catch (Error error) { show_check_message ("Could not attach disk image", error.message); }
+                } catch (Error error) {
+                    show_check_message (completed == null ? "Could not attach disk image" :
+                        completed + ", but attachment failed", error.message);
+                }
             });
         }
 
@@ -561,14 +564,15 @@ namespace MajorisDisks {
                 destination.get_parse_name (), {});
             job.cancelable = true;
             backend.jobs.phase (job, StorageJobState.RUNNING, source == null ? "Creating image" : "Converting image");
-            VirtualDisk.write_image.begin (source, destination, format, size, job.cancellable, (object, result) => {
+            VirtualDisk.write_image.begin (source, destination, format, size, job.cancellable,
+                (fraction) => backend.jobs.progress (job, "Converting image", fraction, true), (object, result) => {
                 var outcome = new StorageOperationResult ();
                 try {
                     VirtualDisk.write_image.end (result);
                     outcome.successful = true;
                     outcome.summary = source == null ? "Virtual disk created" : "Disk image converted";
                     notifications.add_toast (new Adw.Toast (outcome.summary));
-                    if (attach && format == "raw") attach_image (destination, true);
+                    if (attach && format == "raw") attach_image (destination, true, outcome.summary);
                 } catch (Error error) {
                     outcome.fail ("Could not write the virtual image", error);
                     show_check_message (outcome.summary, error.message);
@@ -596,7 +600,7 @@ namespace MajorisDisks {
                         try {
                             DiskImageCopy.create_blank.end (outcome);
                             notifications.add_toast (new Adw.Toast ("Blank disk image created"));
-                            if (attach) attach_image (file, false);
+                            if (attach) attach_image (file, false, "Blank image created");
                         } catch (Error error) { show_check_message ("Could not create blank image", error.message); }
                     });
                 });
@@ -627,13 +631,15 @@ namespace MajorisDisks {
                     body = "%s · %s\n%s\n\nIf the source is in use, files can change while the image is copied.".printf (
                         block.preferred, format_size (block.size), destination.get_parse_name ())
                 };
+                confirmation.enable_backup_verification ();
                 confirmation.set_response_label ("proceed", "Create Image");
                 confirmation.response.connect ((response) => {
                     if (response != "proceed") return;
-                    backend.create_disk_image.begin (block, destination, identity, (object, outcome) => {
+                    bool verify = confirmation.verify_backup;
+                    backend.create_disk_image.begin (block, destination, identity, verify, (object, outcome) => {
                         try {
                             backend.create_disk_image.end (outcome);
-                            notifications.add_toast (new Adw.Toast ("Disk image created"));
+                            notifications.add_toast (new Adw.Toast (verify ? "Disk image created and verified" : "Disk image created without readback verification"));
                         } catch (Error error) { show_check_message ("Could not create disk image", error.message); }
                     });
                 });
@@ -809,7 +815,10 @@ namespace MajorisDisks {
         public bool attach_copy { get { return format_choice.selected == 0 && attach.active; } }
 
         construct {
-            format_choice.notify["selected"].connect (() => { attach.sensitive = format_choice.selected == 0; });
+            format_choice.notify["selected"].connect (() => {
+                attach.sensitive = format_choice.selected == 0;
+                attach.subtitle = attach.sensitive ? "" : "Direct virtual-image attachment is unavailable. Choose Raw to attach the output.";
+            });
         }
     }
 
@@ -834,12 +843,19 @@ namespace MajorisDisks {
 
         construct {
             format_choice.sensitive = VirtualDisk.available ();
-            format_choice.notify["selected"].connect (() => { attach.sensitive = format_choice.selected == 0; });
+            format_choice.notify["selected"].connect (() => {
+                attach.sensitive = format_choice.selected == 0;
+                attach.subtitle = attach.sensitive ? "" : "Direct virtual-image attachment is unavailable. Choose Raw to attach the output.";
+            });
         }
     }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/disk-image-confirmation.ui")]
-    internal class DiskImageConfirmation : Adw.AlertDialog {}
+    internal class DiskImageConfirmation : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.SwitchRow verify;
+        public bool verify_backup { get { return verify.active; } }
+        public void enable_backup_verification () { verify.visible = true; }
+    }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/unlock-volume-dialog.ui")]
     public class UnlockVolumeDialog : Adw.AlertDialog {

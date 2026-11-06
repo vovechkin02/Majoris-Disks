@@ -531,7 +531,7 @@ namespace MajorisDisks {
             } catch (Error error) { Posix.close (fd); throw error; }
         }
 
-        internal async BenchmarkResult benchmark (StorageBlock block, int samples, uint64 bytes) throws Error {
+        internal async BenchmarkResult benchmark (StorageBlock block, int samples, uint64 bytes, bool buffered = false) throws Error {
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("Benchmark disk", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
@@ -542,7 +542,7 @@ namespace MajorisDisks {
                 jobs.phase (job, StorageJobState.PREPARING, "Authorizing read-only device access");
                 uint64 size = block.size;
                 string identity = modification_identity (block);
-                fd = yield open_block (block, "r", Posix.O_CLOEXEC | DIRECT_IO, job.cancellable);
+                fd = yield open_block (block, "r", Posix.O_CLOEXEC | (buffered ? 0 : DIRECT_IO), job.cancellable);
                 job.cancelable = true;
                 var result = yield DiskBenchmark.measure (fd, size,
                     uint64.max (block.logical_sector_size, block.physical_sector_size), samples, bytes, jobs, job);
@@ -551,7 +551,7 @@ namespace MajorisDisks {
                     modification_identity (block) != identity)
                     throw new IOError.NOT_FOUND ("The device changed during measurement.");
                 outcome.successful = true;
-                outcome.summary = "Benchmark complete";
+                outcome.summary = buffered ? "Buffered benchmark complete" : "Direct-I/O benchmark complete";
                 jobs.finish (job, outcome);
                 return result;
             } catch (Error error) {
@@ -565,7 +565,7 @@ namespace MajorisDisks {
             }
         }
 
-        internal async void create_disk_image (StorageBlock block, File destination, string confirmed_identity) throws Error {
+        internal async void create_disk_image (StorageBlock block, File destination, string confirmed_identity, bool verify = false) throws Error {
             string? path = destination.get_path ();
             var directory = destination.get_parent ();
             if (path == null || directory == null || block.size == 0)
@@ -601,7 +601,7 @@ namespace MajorisDisks {
                 }
                 if (destination.query_exists (token))
                     throw new IOError.EXISTS ("An image already exists at the selected destination.");
-                output = Posix.open (temporary, Posix.O_WRONLY | Posix.O_CREAT | Posix.O_EXCL | Posix.O_CLOEXEC, 0600);
+                output = Posix.open (temporary, (verify ? Posix.O_RDWR : Posix.O_WRONLY) | Posix.O_CREAT | Posix.O_EXCL | Posix.O_CLOEXEC, 0600);
                 if (output < 0) throw new IOError.FAILED ("Could not create a temporary image: " + Posix.strerror (Posix.errno));
                 temporary_created = true;
                 if (Posix.fstat (output, out info) != 0)
@@ -614,7 +614,13 @@ namespace MajorisDisks {
                 input = yield open_block (block, "r", Posix.O_CLOEXEC, token);
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.RUNNING, "Copying the raw image");
-                yield DiskImageCopy.copy (input, output, size, jobs, job);
+                var copy_state = new ImageWriteState ();
+                try { yield DiskImageCopy.copy (input, output, size, jobs, job, verify, copy_state); }
+                catch (Error error) {
+                    if (verify && copy_state.phase == ImageWritePhase.VERIFYING && !(error is IOError.CANCELLED))
+                        throw new IOError.INVALID_DATA ("The copy finished but failed readback verification. " + error.message);
+                    throw error;
+                }
                 synchronize ();
                 if (!block.available || snapshot.blocks.lookup (block.path) != block ||
                     modification_identity (block) != identity || Posix.fstat (output, out info) != 0 ||
@@ -627,7 +633,7 @@ namespace MajorisDisks {
                     throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));
                 temporary_created = false;
                 outcome.successful = true;
-                outcome.summary = "Disk image created";
+                outcome.summary = verify ? "Disk image created and verified" : "Disk image created without readback verification";
                 jobs.finish (job, outcome);
             } catch (Error error) {
                 outcome.fail ("Disk image was not created", error);
@@ -672,9 +678,8 @@ namespace MajorisDisks {
             StoragePreparationJournal? preparation = null;
             int input = -1;
             int target = -1;
-            File? expanded = null;
-            FileIOStream? expanded_stream = null;
-            bool writing = false;
+            var state = new ImageWriteState ();
+            XzImage? preflight = null;
             try {
                 var token = job.cancellable;
                 uint64 capacity = block.size;
@@ -688,17 +693,14 @@ namespace MajorisDisks {
                     throw new IOError.INVALID_DATA ("The source must be a nonempty regular image file.");
                 check_image_filesystem (block, info);
                 uint64 bytes = (uint64) info.st_size;
-                int image_fd = input;
+                string? source_identity = image_identity (input);
+                if (source_identity == null) throw new IOError.FAILED ("Could not record the source identity.");
                 if (path.has_suffix (".img.xz")) {
-                    expanded = File.new_tmp ("majoris-image-XXXXXX", out expanded_stream);
-                    var descriptor = expanded_stream.output_stream as FileDescriptorBased;
-                    if (descriptor == null || Posix.fstat (descriptor.get_fd (), out info) != 0)
-                        throw new IOError.FAILED ("Could not inspect the temporary image file.");
-                    check_image_filesystem (block, info);
-                    bytes = yield DiskImageCopy.expand_xz (input, expanded_stream.output_stream, capacity, token);
-                    image_fd = descriptor.get_fd ();
-                    if (Posix.lseek (image_fd, 0, Posix.SEEK_SET) < 0)
-                        throw new IOError.FAILED ("Could not rewind the verified image.");
+                    jobs.phase (job, StorageJobState.RUNNING, "Validating the compressed image stream");
+                    preflight = yield DiskImageCopy.decode_xz (input, null, capacity, token, jobs, job);
+                    bytes = preflight.size;
+                    if (source_identity != image_identity (input) || Posix.lseek (input, 0, Posix.SEEK_SET) < 0)
+                        throw new IOError.INVALID_DATA ("The compressed image changed during preflight.");
                 }
                 if (bytes == 0 || bytes > capacity)
                     throw new IOError.NO_SPACE ("The image does not fit the selected device.");
@@ -706,6 +708,7 @@ namespace MajorisDisks {
                 synchronize ();
                 if (modification_identity (block) != confirmed_identity)
                     throw new IOError.NOT_FOUND ("The selected device changed while validating the image.");
+                state.phase = ImageWritePhase.PREPARING;
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.PREPARING, "Preparing the target device");
                 preparation = yield prepare_for_modification (block, lifetime);
@@ -721,41 +724,45 @@ namespace MajorisDisks {
                 }
                 target = yield open_block (block, "rw", Posix.O_EXCL | Posix.O_CLOEXEC | Posix.O_SYNC, token);
                 token.set_error_if_cancelled ();
-                writing = true;
+                if (source_identity != image_identity (input))
+                    throw new IOError.INVALID_DATA ("The source image changed before writing could begin.");
                 preparation.backend_invoked = true;
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.RUNNING, "Writing the verified image");
-                yield DiskImageCopy.copy (image_fd, target, bytes, jobs, job, true);
+                if (preflight != null) {
+                    state.phase = ImageWritePhase.WRITING;
+                    var output = new UnixOutputStream (target, false);
+                    var decoded = yield DiskImageCopy.decode_xz (input, output, bytes, token, jobs, job);
+                    yield DiskImageCopy.verify_streamed_write (target, decoded, preflight, jobs, job, state);
+                } else {
+                    yield DiskImageCopy.copy (input, target, bytes, jobs, job, true, state);
+                }
                 result.completed ("%s written, flushed, and verified by readback".printf (format_size (bytes)));
                 int closed = Posix.close (target);
                 target = -1;
                 if (closed != 0) throw new IOError.FAILED ("Could not close the target device.");
+                state.descriptor_closed = true;
+                state.phase = ImageWritePhase.RESCANNING;
+                job.cancelable = false;
                 jobs.phase (job, StorageJobState.FINALIZING, "Refreshing the partition table");
                 var proxy = require_volume (block, "Block");
-                yield proxy.call ("Rescan", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
-                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
+                yield state.rescan (proxy, lifetime);
                 synchronize ();
                 require_volume (block, "Block");
+                state.model_refreshed = true;
+                state.phase = ImageWritePhase.COMPLETED;
                 result.successful = true;
                 result.summary = "Disk image restored";
             } catch (Error error) {
                 if (target >= 0) { Posix.close (target); target = -1; }
-                result.fail (writing ? "Restoration did not complete. The target may be partially overwritten." :
-                    "Restoration stopped before writing to the target.", error);
-                if (writing) {
-                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
-                    result.partial = true;
-                } else if (preparation != null && !preparation.fully_restored ()) {
+                state.describe_failure (result, error);
+                if (state.phase < ImageWritePhase.WRITING && preparation != null && !preparation.fully_restored ()) {
                     try { yield restore_preparation (preparation, lifetime); }
                     catch (Error restore_error) { result.technical_error += "\n" + restore_error.message; }
                 }
             } finally {
                 if (input >= 0) Posix.close (input);
                 if (target >= 0) Posix.close (target);
-                try { if (expanded_stream != null) expanded_stream.close (); }
-                catch (Error error) { warning ("Could not close decompression scratch file: %s", error.message); }
-                try { if (expanded != null) expanded.delete (); }
-                catch (Error error) { warning ("Could not remove decompression scratch file: %s", error.message); }
                 lifetime.disconnect (disconnected);
                 locks.release (block);
                 jobs.finish (job, result);

@@ -5,6 +5,8 @@ namespace MajorisDisks {
         public uint64 file_size;
     }
 
+    internal delegate void ConversionProgress (double fraction);
+
     internal class VirtualDisk {
         public static bool available () {
             return FileUtils.test ("/usr/bin/qemu-img", FileTest.IS_EXECUTABLE) &&
@@ -16,7 +18,7 @@ namespace MajorisDisks {
         }
 
         private static async string run (int input, string? output_directory, string[] arguments,
-            Cancellable token) throws Error {
+            Cancellable token, ConversionProgress? progress = null) throws Error {
             if (!available ()) throw new IOError.NOT_SUPPORTED ("Install qemu-utils and bubblewrap for virtual images.");
             string[] argv = { "/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session",
                 "--clearenv", "--setenv", "LC_ALL", "C", "--ro-bind", "/usr", "/usr",
@@ -35,10 +37,30 @@ namespace MajorisDisks {
             argv += "--";
             argv += "/usr/bin/qemu-img";
             foreach (var argument in arguments) argv += argument;
-            var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+            var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE |
+                (progress == null ? SubprocessFlags.STDERR_PIPE : SubprocessFlags.STDERR_MERGE));
             string? output, diagnostic;
             try {
-                yield process.communicate_utf8_async (null, token, out output, out diagnostic);
+                if (progress == null)
+                    yield process.communicate_utf8_async (null, token, out output, out diagnostic);
+                else {
+                    output = null;
+                    diagnostic = null;
+                    var stream = new DataInputStream (process.get_stdout_pipe ());
+                    stream.set_newline_type (DataStreamNewlineType.ANY);
+                    double last = -1;
+                    string? line;
+                    while ((line = yield stream.read_line_async (Priority.DEFAULT, token)) != null) {
+                        double fraction;
+                        if (parse_progress (line, out fraction)) {
+                            if (fraction > last) {
+                                last = fraction;
+                                progress (fraction);
+                            }
+                        } else if (line.strip () != "") diagnostic = line;
+                    }
+                    yield process.wait_async (token);
+                }
             } catch (Error error) {
                 process.force_exit ();
                 yield process.wait_async (null);
@@ -47,6 +69,18 @@ namespace MajorisDisks {
             if (!process.get_successful ())
                 throw new IOError.FAILED ((diagnostic ?? "The virtual image backend failed.").strip ());
             return output ?? "";
+        }
+
+        internal static bool parse_progress (string line, out double fraction) {
+            fraction = 0;
+            string text = line.strip ();
+            if (!text.has_prefix ("(") || !text.has_suffix ("/100%)")) return false;
+            string number = text.substring (1, text.length - 7);
+            double percent;
+            if (!double.try_parse (number, out percent) || !percent.is_finite () || percent < 0 || percent > 100)
+                return false;
+            fraction = percent / 100;
+            return true;
         }
 
         private static async VirtualDiskInfo inspect_fd (int input, Cancellable token) throws Error {
@@ -75,6 +109,25 @@ namespace MajorisDisks {
             return result;
         }
 
+        private static async void check_conversion_space (int fd, string source_format, string target_format,
+            File destination, Cancellable token) throws Error {
+            // QEMU's measurement support depends on the output driver.
+            if (target_format != "raw" && target_format != "qcow2") return;
+            var parser = new Json.Parser ();
+            parser.load_from_data (yield run (fd, null, { "measure", "--output=json", "-f", source_format,
+                "-O", target_format, "/source" }, token));
+            var result = parser.get_root ()?.get_object ();
+            if (result == null || !result.has_member ("required")) return;
+            int64 required = result.get_int_member ("required");
+            if (required <= 0) return;
+            var parent = destination.get_parent ();
+            if (parent == null) return;
+            var info = yield parent.query_filesystem_info_async (FileAttribute.FILESYSTEM_FREE, Priority.DEFAULT, token);
+            if (info.has_attribute (FileAttribute.FILESYSTEM_FREE) &&
+                info.get_attribute_uint64 (FileAttribute.FILESYSTEM_FREE) < (uint64) required)
+                throw new IOError.NO_SPACE ("QEMU estimates that the converted image needs more free space than is available.");
+        }
+
         private static int open_image (File file) throws Error {
             string? path = file.get_path ();
             if (path == null) throw new IOError.INVALID_ARGUMENT ("Choose a local disk image.");
@@ -90,7 +143,7 @@ namespace MajorisDisks {
         }
 
         public static async void write_image (File? source, File destination, string format, uint64 capacity,
-            Cancellable token) throws Error {
+            Cancellable token, ConversionProgress? progress = null) throws Error {
             string? path = destination.get_path ();
             string? parent = destination.get_parent ()?.get_path ();
             if (path == null || parent == null || !supported (format))
@@ -113,13 +166,20 @@ namespace MajorisDisks {
                     yield run (-1, directory, create, token);
                 } else {
                     fd = open_image (source);
+                    string? original = image_identity (fd);
+                    if (original == null) throw new IOError.INVALID_DATA ("Could not identify the selected source image.");
                     var information = yield inspect_fd (fd, token);
+                    yield check_conversion_space (fd, information.format, format, destination, token);
                     capacity = information.capacity;
-                    string[] convert = { "convert", "-f", information.format, "-O", format };
+                    if (original != image_identity (fd))
+                        throw new IOError.INVALID_DATA ("The image changed before conversion.");
+                    string[] convert = { "convert", "-p", "-f", information.format, "-O", format };
                     if (format == "vpc") { convert += "-o"; convert += "force_size=on"; }
                     convert += "/source";
                     convert += "/output/disk";
-                    yield run (fd, directory, convert, token);
+                    yield run (fd, directory, convert, token, progress);
+                    if (original != image_identity (fd))
+                        throw new IOError.INVALID_DATA ("The source image changed during conversion.");
                 }
                 int output = open_image (File.new_for_path (temporary));
                 try {

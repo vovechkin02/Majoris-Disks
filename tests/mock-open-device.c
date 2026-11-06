@@ -8,6 +8,17 @@ mock_open_device (GDBusConnection *connection, const char *sender, const char *p
                   const char *interface, const char *method, GVariant *parameters,
                   GDBusMethodInvocation *invocation, gpointer user_data)
 {
+    if (g_str_equal (method, "Rescan")) {
+        g_assert_true (g_variant_is_of_type (parameters, G_VARIANT_TYPE ("(a{sv})")));
+        g_autoptr(GVariant) options = g_variant_get_child_value (parameters, 0);
+        g_assert_cmpuint (g_variant_n_children (options), ==, 0);
+        if (g_str_equal (path, "/test/rescan_failure"))
+            g_dbus_method_invocation_return_dbus_error (invocation,
+                "org.freedesktop.UDisks2.Error.Failed", "Rescan rejected");
+        else
+            g_dbus_method_invocation_return_value (invocation, NULL);
+        return;
+    }
     const char *mode;
     g_autoptr(GVariant) options = NULL;
     g_assert_cmpstr (method, ==, "OpenDevice");

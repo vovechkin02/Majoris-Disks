@@ -889,6 +889,11 @@ private void test_health_problem_assessment () {
     assert (DriveHealth.problem (drive, false, true, false, out urgent).contains ("spare, temperature") && urgent);
     drive.wwn = "test-wwn";
     assert (DriveHealth.identity (drive) == "wwn:test-wwn");
+    drive.nvme_state = "resetting";
+    assert (!DriveHealth.has_current_data (drive));
+    drive.nvme_state = "";
+    drive.smart_enabled = false;
+    assert (!DriveHealth.has_current_data (drive));
 }
 
 private async void exercise_image_workflows () throws Error {
@@ -943,6 +948,81 @@ private async void exercise_image_workflows () throws Error {
     }
 }
 
+private async void exercise_mock_rescan () throws Error {
+    var bus = new TestDBus (TestDBusFlags.NONE);
+    bus.up ();
+    try {
+        var flags = DBusConnectionFlags.AUTHENTICATION_CLIENT | DBusConnectionFlags.MESSAGE_BUS_CONNECTION;
+        var server = yield new DBusConnection.for_address (bus.get_bus_address (), flags);
+        var client = yield new DBusConnection.for_address (bus.get_bus_address (), flags);
+        string iface = "org.freedesktop.UDisks2.Block";
+        var node = new DBusNodeInfo.for_xml ("<node><interface name='org.freedesktop.UDisks2.Block'>" +
+            "<method name='Rescan'><arg type='a{sv}' direction='in'/></method></interface></node>");
+        foreach (var path in new string[] { "/test/rescan_success", "/test/rescan_failure", "/test/missing" }) {
+            uint registration = 0;
+            if (path != "/test/missing")
+                registration = register_mock_open_device (server, path, node.lookup_interface (iface));
+            var proxy = yield new DBusProxy (client, DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, null,
+                server.unique_name, path, iface, null);
+            var state = new ImageWriteState () { phase = ImageWritePhase.WRITTEN_VERIFIED, descriptor_closed = true };
+            try {
+                yield state.rescan (proxy, new Cancellable ());
+                assert (path == "/test/rescan_success" && state.rescan_completed);
+            } catch (Error error) {
+                assert (path != "/test/rescan_success" && !state.rescan_completed);
+                var result = new StorageOperationResult ();
+                state.describe_failure (result, error);
+                assert (result.status == StorageOperationStatus.NEEDS_ATTENTION && !result.partial &&
+                    result.summary.contains ("written and verified"));
+            }
+            assert (state.rescan_requested);
+            if (registration != 0) server.unregister_object (registration);
+        }
+        yield client.close ();
+        yield server.close ();
+    } finally { bus.down (); }
+}
+
+private void test_mock_rescan () {
+    var loop = new MainLoop ();
+    exercise_mock_rescan.begin ((object, result) => {
+        try { exercise_mock_rescan.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
+        loop.quit ();
+    });
+    loop.run ();
+}
+
+private void test_restore_failure_classification () {
+    var state = new ImageWriteState ();
+    var result = new StorageOperationResult ();
+    var failure = new IOError.FAILED ("Fixture failure");
+    state.describe_failure (result, failure);
+    assert (!result.partial && result.summary.contains ("before writing"));
+    state.phase = ImageWritePhase.WRITING;
+    state.describe_failure (result, failure);
+    assert (result.partial && result.status == StorageOperationStatus.NEEDS_ATTENTION);
+    state.phase = ImageWritePhase.FLUSHING;
+    state.describe_failure (result, failure);
+    assert (!result.partial && result.summary.contains ("durability"));
+    state.phase = ImageWritePhase.VERIFYING;
+    state.describe_failure (result, failure);
+    assert (!result.partial && result.summary.contains ("verification"));
+    state.phase = ImageWritePhase.RESCANNING;
+    state.rescan_requested = true;
+    state.describe_failure (result, failure);
+    assert (!result.partial && result.summary.contains ("written and verified") &&
+        result.summary.contains ("rescan failed") && result.status == StorageOperationStatus.NEEDS_ATTENTION);
+}
+
+private void test_conversion_progress () {
+    double fraction;
+    assert (VirtualDisk.parse_progress ("    (25.50/100%)\r", out fraction) && fraction == 0.255);
+    assert (VirtualDisk.parse_progress ("(100.00/100%)", out fraction) && fraction == 1);
+    assert (!VirtualDisk.parse_progress ("qemu-img: conversion failed", out fraction));
+    assert (!VirtualDisk.parse_progress ("(101/100%)", out fraction));
+    assert (!VirtualDisk.parse_progress ("(NaN/100%)", out fraction));
+}
+
 private async void exercise_xz () throws Error {
     string? executable = Environment.find_program_in_path ("xz");
     if (executable == null) {
@@ -964,17 +1044,51 @@ private async void exercise_xz () throws Error {
         compressed.output_stream.write_all (archive.get_data (), out written);
         var input = compressed.input_stream as FileDescriptorBased;
         assert (input != null && Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
-        uint64 size = yield DiskImageCopy.expand_xz (input.get_fd (), expanded.output_stream, 1024, new Cancellable ());
+        string? source_identity = image_identity (input.get_fd ());
+        var token = new Cancellable ();
+        var preflight = yield DiskImageCopy.decode_xz (input.get_fd (), null, 1024, token);
+        assert (preflight.size == payload.get_size () && image_identity (input.get_fd ()) == source_identity);
+        assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
+        var written_image = yield DiskImageCopy.decode_xz (input.get_fd (), expanded.output_stream, preflight.size, token);
+        uint64 size = written_image.size;
         assert (size == payload.get_size ());
+        var output_fd = expanded.output_stream as FileDescriptorBased;
+        assert (output_fd != null);
+        var jobs = new StorageJobManager ();
+        var job = jobs.begin_named ("Restore XZ", "Fixture", {});
+        var write_state = new ImageWriteState ();
+        yield DiskImageCopy.verify_streamed_write (output_fd.get_fd (), written_image, preflight, jobs, job, write_state);
+        assert (write_state.phase == ImageWritePhase.WRITTEN_VERIFIED);
         assert (((Seekable) expanded).seek (0, SeekType.SET));
         var decoded = expanded.input_stream.read_bytes ((size_t) size);
         assert (decoded.compare (payload) == 0);
+        assert (Posix.lseek (output_fd.get_fd (), 0, Posix.SEEK_SET) == 0);
+        assert (Posix.write (output_fd.get_fd (), "X".data, 1) == 1);
+        try {
+            yield DiskImageCopy.verify_streamed_write (output_fd.get_fd (), written_image, preflight, jobs, job, write_state);
+            assert_not_reached ();
+        } catch (Error error) {
+            assert (error is IOError.INVALID_DATA && write_state.phase == ImageWritePhase.VERIFYING);
+        }
         assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
         try {
             yield DiskImageCopy.expand_xz (input.get_fd (), expanded.output_stream, 1, new Cancellable ());
             assert_not_reached ();
         } catch (Error error) { assert (error is IOError.NO_SPACE); }
+        assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_END) == (Posix.off_t) archive.get_size ());
+        compressed.output_stream.write_all (archive.get_data (), out written);
+        assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
+        var combined = yield DiskImageCopy.decode_xz (input.get_fd (), null, 1024, token);
+        assert (combined.size == payload.get_size () * 2);
+        assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
+        var cancelled = new Cancellable ();
+        cancelled.cancel ();
+        try {
+            yield DiskImageCopy.decode_xz (input.get_fd (), null, 1024, cancelled);
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.CANCELLED); }
         assert (Posix.ftruncate (input.get_fd (), (Posix.off_t) (archive.get_size () - 4)) == 0);
+        assert (image_identity (input.get_fd ()) != source_identity);
         assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
         try {
             yield DiskImageCopy.expand_xz (input.get_fd (), expanded.output_stream, 1024, new Cancellable ());
@@ -1099,6 +1213,9 @@ public static int main (string[] args) {
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     Test.add_func ("/features/drive-health", test_health_problem_assessment);
     Test.add_func ("/features/virtual-images", test_virtual_workflows);
+    Test.add_func ("/features/mock-restore-rescan", test_mock_rescan);
+    Test.add_func ("/features/restore-failure-classification", test_restore_failure_classification);
+    Test.add_func ("/features/conversion-progress", test_conversion_progress);
     Test.add_func ("/features/xz-restore-preflight", test_xz_workflow);
     Test.add_func ("/features/raw-image-and-benchmark", test_image_workflows);
     Test.add_func ("/operations/mock-open-device", test_mock_open_device);

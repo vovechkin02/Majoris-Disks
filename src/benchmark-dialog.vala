@@ -4,6 +4,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.SpinButton samples;
         [GtkChild] private unowned Gtk.SpinButton sample_mib;
         [GtkChild] private unowned Gtk.Button start;
+        [GtkChild] private unowned Adw.SwitchRow buffered;
         [GtkChild] private unowned Gtk.Button scratch;
         [GtkChild] private unowned Gtk.Label scratch_result;
         [GtkChild] private unowned Gtk.Label summary;
@@ -28,7 +29,8 @@ namespace MajorisDisks {
                     var previous = new BenchmarkResult ();
                     previous.throughput = keyfile.get_double_list ("result", "throughput");
                     previous.latency = keyfile.get_double_list ("result", "latency");
-                    show_result (previous, "Saved " + keyfile.get_string ("result", "date"));
+                    string mode = keyfile.has_key ("result", "mode") ? keyfile.get_string ("result", "mode") : "Direct I/O";
+                    show_result (previous, "Saved " + keyfile.get_string ("result", "date") + " · " + mode);
                 } catch (Error error) {}
             }
             scratch.clicked.connect (() => {
@@ -51,22 +53,29 @@ namespace MajorisDisks {
                 if (block == null) return;
                 start.sensitive = false;
                 summary.label = "Measurement in progress. Follow progress or cancel in Jobs.";
+                bool use_buffered = buffered.active;
+                string mode = use_buffered ? "Buffered I/O (may include cached data)" : "Direct I/O";
                 backend.benchmark.begin (block, samples.get_value_as_int (),
-                    (uint64) sample_mib.get_value_as_int () * 1024 * 1024, (object, result) => {
+                    (uint64) sample_mib.get_value_as_int () * 1024 * 1024, use_buffered, (object, result) => {
                         start.sensitive = true;
                         try {
                             var current = backend.benchmark.end (result);
-                            show_result (current, "Current measurement");
+                            show_result (current, "Current measurement · " + mode);
                             if (saved != null && DirUtils.create_with_parents (Path.get_dirname (saved), 0700) == 0) {
                                 var keyfile = new KeyFile ();
                                 keyfile.set_double_list ("result", "throughput", current.throughput);
                                 keyfile.set_double_list ("result", "latency", current.latency);
+                                keyfile.set_string ("result", "mode", mode);
                                 keyfile.set_string ("result", "date", new DateTime.now_local ().format ("%F %R"));
                                 try { keyfile.save_to_file (saved); } catch (Error error) {
                                     summary.label += "\nCould not save results: " + error.message;
                                 }
                             }
-                        } catch (Error error) { summary.label = error.message; }
+                        } catch (Error error) {
+                            summary.label = error.message;
+                            if (!use_buffered && !(error is IOError.CANCELLED))
+                                summary.label += "\nIf this device does not support direct I/O, enable Buffered I/O and run a new measurement.";
+                        }
                     });
             });
         }
