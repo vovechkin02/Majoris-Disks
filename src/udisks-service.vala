@@ -401,8 +401,8 @@ namespace MajorisDisks {
                 if (drive.smart_selftest_status != "inprogress" || active_selftests.contains (drive.path)) continue;
                 string[] affected = { drive.path };
                 if (drive.medium != null) affected += drive.medium.path;
-                var job = jobs.begin_named ("Drive self-test", drive.name, affected);
-                var operation = new SelftestOperation (job, "Running");
+                var job = jobs.begin_named ("Discovered drive self-test", drive.name, affected);
+                var operation = new SelftestOperation (job, "Discovered");
                 operation.state = SelftestOperationState.RUNNING;
                 active_selftests.insert (drive.path, operation);
                 bool valid = drive.smart_selftest_remaining >= 0;
@@ -447,11 +447,24 @@ namespace MajorisDisks {
                             parameters.get_child_value (1).get_string ());
                     });
                 }
-                jobs.observe (path, operation, objects, progress, valid, cancelable, start);
+                var started_by = proxy.get_cached_property ("StartedByUID");
+                jobs.observe (path, operation, objects, progress, valid, cancelable, start,
+                    started_by == null ? -1 : (int64) started_by.get_uint32 ());
             }
             foreach (var path in observed_jobs.get_keys ()) if (!current.contains (path)) jobs.backend_removed (path);
             foreach (var path in connected_jobs.get_keys ()) if (!current.contains (path)) connected_jobs.remove (path);
             observed_jobs = current;
+        }
+
+        private async Variant call_tracked_method (StorageJob job, DBusProxy proxy, string method,
+            Variant parameters, Cancellable token) throws Error {
+            try {
+                return yield proxy.call (method, parameters, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
+                    int.MAX, token);
+            } finally {
+                synchronize_jobs ();
+                job.backend_expectation_open = false;
+            }
         }
 
         private DBusProxy require_volume (StorageBlock block, string iface) throws Error {
@@ -602,11 +615,10 @@ namespace MajorisDisks {
                     "Starting " + type + " self-test");
                 if (!stop) jobs.expect_backend (job, nvme ? "nvme-selftest" : "ata-smart-selftest", drive.path);
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
-                if (stop) yield proxy.call ("SmartSelftestAbort", new Variant.tuple ({ options.end () }),
-                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
-                else yield proxy.call ("SmartSelftestStart", new Variant.tuple ({
-                    new Variant.string (type), options.end () }), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
-                    int.MAX, backend_lifetime);
+                if (stop) yield call_tracked_method (job, proxy, "SmartSelftestAbort",
+                    new Variant.tuple ({ options.end () }), backend_lifetime);
+                else yield call_tracked_method (job, proxy, "SmartSelftestStart",
+                    new Variant.tuple ({ new Variant.string (type), options.end () }), backend_lifetime);
                 if (!active_selftests.contains (drive.path)) return;
                 if (!stop && operation.state == SelftestOperationState.STARTING)
                     operation.state = SelftestOperationState.START_CONFIRMED;
@@ -634,29 +646,27 @@ namespace MajorisDisks {
                 }
                 maintain_selftest_refresh ();
                 } catch (Error error) {
-                if (stop && drive.smart_selftest_status == "inprogress") {
-                    operation.state = SelftestOperationState.RUNNING;
-                    jobs.progress (job, operation.type + " self-test in progress",
-                        drive.smart_selftest_remaining >= 0 ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0,
-                        drive.smart_selftest_remaining >= 0);
-                } else {
-                    bool timed_out = error.matches (IOError.quark (), IOError.TIMED_OUT);
-                    if (timed_out && !stop) {
+                    synchronize ();
+                    if (active_selftests.lookup (drive.path) != operation) throw error;
+                    bool uncertain = error is IOError.TIMED_OUT || error is IOError.CANCELLED ||
+                        error is IOError.CLOSED || error is DBusError.NO_REPLY || error is DBusError.DISCONNECTED;
+                    if (drive.smart_selftest_status == "inprogress" && (stop || uncertain)) {
+                        operation.state = SelftestOperationState.RUNNING;
+                        jobs.progress (job, operation.type + " self-test in progress",
+                            drive.smart_selftest_remaining >= 0 ? (100.0 - drive.smart_selftest_remaining) / 100.0 : 0.0,
+                            drive.smart_selftest_remaining >= 0);
+                    } else if (uncertain) {
                         operation.state = SelftestOperationState.UNCERTAIN;
                         operation.observation_deadline = get_monotonic_time () + 30 * TimeSpan.SECOND;
-                        jobs.phase (job, StorageJobState.FINALIZING,
-                            "Self-test request accepted; status observation is delayed");
-                        maintain_selftest_refresh ();
-                        throw error;
+                        jobs.phase (job, StorageJobState.FINALIZING, "Waiting to verify the self-test outcome");
+                    } else {
+                        active_selftests.remove (drive.path);
+                        result.fail (stop ? "The self-test could not be stopped" :
+                            "The self-test could not be started", error);
+                        jobs.finish (job, result);
                     }
-                    active_selftests.remove (drive.path);
-                    string failure = stop ? "The self-test could not be stopped" :
-                        (timed_out ? "Self-test result is unknown" : "The self-test could not be started");
-                    result.fail (failure, error);
-                    if (timed_out) result.status = StorageOperationStatus.NEEDS_ATTENTION;
-                    jobs.finish (job, result);
-                }
-                maintain_selftest_refresh (); throw error;
+                    maintain_selftest_refresh ();
+                    throw error;
                 }
             } finally { locks.release (target); }
         }
@@ -693,8 +703,7 @@ namespace MajorisDisks {
                 if (eject) jobs.expect_backend (job, "drive-eject", drive.path);
                 else if (power_off) jobs.expect_backend (job, "drive-power-off", drive.path);
                 var proxy = require_drive (drive, standby || wake ? "Drive.Ata" : "Drive");
-                yield proxy.call (action, new Variant.tuple ({ options.end () }),
-                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                yield call_tracked_method (job, proxy, action, new Variant.tuple ({ options.end () }), backend_lifetime);
                 bool verified = false;
                 if (standby || wake) {
                     var state_options = new VariantBuilder (new VariantType ("a{sv}"));
@@ -1017,8 +1026,9 @@ namespace MajorisDisks {
                 preparation.operation_started = true;
                 preparation.backend_invoked = true;
                 preparation.destructive_result = "dispatched-result-unknown";
-                yield proxy.call (ownership ? "TakeOwnership" : rename ? "SetLabel" : deleting ? "Delete" : "Format", parameters,
-                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
+                yield call_tracked_method (job, proxy,
+                    ownership ? "TakeOwnership" : rename ? "SetLabel" : deleting ? "Delete" : "Format",
+                    parameters, lifetime);
                 preparation.backend_returned = true;
                 preparation.destructive_result = "backend-returned-success";
                 synchronize ();
@@ -1264,6 +1274,7 @@ namespace MajorisDisks {
         }
 
         private void capture_mount_state (StorageBlock block, StoragePreparationEntry entry) {
+            entry.device_identity = StoragePreparationJournal.device_identity (block);
             foreach (var configuration in block.mount_configurations) {
                 for (uint i = 0; i < entry.mount_point_count (); i++) {
                     string mount = entry.mount_point_at (i);
@@ -1288,7 +1299,8 @@ namespace MajorisDisks {
                 }
                 if (entry.kind == StoragePreparationKind.MOUNT) {
                     if (entry.state_length () < 2 || block.uuid != entry.state_at (0) ||
-                        block.type_id != entry.state_at (1)) {
+                        block.type_id != entry.state_at (1) ||
+                        entry.device_identity != StoragePreparationJournal.device_identity (block)) {
                         entry.restoration_allowed = false;
                         entry.actual_state = "filesystem identity changed";
                         entry.record_mount_restoration (null);
@@ -1377,8 +1389,9 @@ namespace MajorisDisks {
             synchronize ();
             reconcile_preparation (journal);
             foreach (var entry in journal.entries ()) {
-                if (!entry.prepared || !entry.restoration_allowed || entry.restored || entry.error != "") continue;
-                entry.error = entry.kind == StoragePreparationKind.MOUNT ?
+                if (!entry.prepared || entry.restored || entry.error != "") continue;
+                entry.error = !entry.restoration_allowed ? "Automatic restoration was withheld because the original identity or configuration could not be verified." :
+                    entry.kind == StoragePreparationKind.MOUNT ?
                     "Not every original mount point was restored." : "The original active state was not restored.";
                 failures += entry.object_path + ": " + entry.error;
             }
@@ -1609,7 +1622,19 @@ namespace MajorisDisks {
                     validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                     jobs.phase (job, StorageJobState.FINALIZING, "Verifying filesystem metadata");
                     try {
-                        offline_measurement = yield capacity_probes.query (block, backend_lifetime);
+                        var probe_lifetime = backend_lifetime;
+                        var probe_target = require_volume (block, "Block");
+                        uint64 probe_size = block.size;
+                        string probe_type = block.type_id;
+                        var measurement = yield capacity_probes.query (block, probe_lifetime, probe_target);
+                        synchronize ();
+                        probe_lifetime.set_error_if_cancelled ();
+                        validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
+                        if (probe_target != require_volume (block, "Block") ||
+                            block.size != probe_size || block.type_id != probe_type)
+                            throw new IOError.NOT_FOUND ("The filesystem changed during capacity verification.");
+                        FilesystemCapacityProbeService.verify_uuid (block.uuid, measurement.filesystem_uuid);
+                        offline_measurement = measurement;
                     } catch (Error probe_error) {
                         offline_measurement_error = probe_error;
                     }
@@ -2008,51 +2033,18 @@ namespace MajorisDisks {
                 throw new IOError.NOT_SUPPORTED ("The selected volume is not exposed as encrypted storage by UDisks.");
             if (block.encrypted.mapping != null)
                 throw new IOError.EXISTS ("The encrypted volume is already unlocked.");
-            bool veracrypt = block.type_id == "crypto_TCRYPT" || block.type_id == "crypto_unknown";
             if (passphrase != "" && keyfile_paths.length != 0)
                 throw new IOError.INVALID_ARGUMENT ("Choose either a passphrase or a single keyfile.");
             if (passphrase == "" && keyfile_paths.length == 0)
                 throw new IOError.INVALID_ARGUMENT ("Enter a passphrase or select a supported keyfile.");
             bool luks = block.type_id == "crypto_LUKS";
-            if (!veracrypt && !luks && keyfile_paths.length != 0)
-                throw new IOError.NOT_SUPPORTED ("This encrypted volume does not support keyfile unlocking.");
             if (pim != 0 || hidden || system || keyfile_paths.length > 1)
-                throw new IOError.NOT_SUPPORTED (
-                    "The installed UDisks backend supports password or one keyfile, but not advanced VeraCrypt modes.");
+                throw new IOError.NOT_SUPPORTED ("Advanced VeraCrypt credentials require a cryptsetup backend.");
+            if (!luks && keyfile_paths.length != 0)
+                throw new IOError.NOT_SUPPORTED ("Keyfile unlocking through UDisks is available for LUKS.");
+
             uint8[] keyfile_contents = {};
-            FileInputStream? keyfile_stream = null;
-            string? veracrypt_keyfile = null;
-            if (keyfile_paths.length == 1) {
-                string keyfile_path = keyfile_paths[0];
-                if (!Path.is_absolute (keyfile_path))
-                    throw new IOError.INVALID_ARGUMENT ("The keyfile must be an absolute local path.");
-                var keyfile = File.new_for_path (keyfile_path);
-                var info = yield keyfile.query_info_async (FileAttribute.STANDARD_TYPE + "," +
-                    FileAttribute.STANDARD_SIZE, FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
-                    Priority.DEFAULT, backend_lifetime);
-                if (info.get_file_type () != FileType.REGULAR || info.get_size () <= 0 || info.get_size () > 8 * 1024 * 1024)
-                    throw new IOError.INVALID_ARGUMENT ("The keyfile must be a readable regular file no larger than 8 MiB.");
-                keyfile_stream = yield keyfile.read_async (Priority.DEFAULT, backend_lifetime);
-                var opened = yield keyfile_stream.query_info_async (FileAttribute.STANDARD_TYPE,
-                    Priority.DEFAULT, backend_lifetime);
-                if (opened.get_file_type () != FileType.REGULAR)
-                    throw new IOError.INVALID_ARGUMENT ("The keyfile changed before it could be opened.");
-                if (veracrypt) {
-                    // Bind the daemon's keyfile path to the already opened file.
-                    var descriptor = keyfile_stream as FileDescriptorBased;
-                    if (descriptor == null)
-                        throw new IOError.NOT_SUPPORTED ("The selected keyfile has no local file descriptor.");
-                    veracrypt_keyfile = "/proc/%d/fd/%d".printf (
-                        new Credentials ().get_unix_pid (), descriptor.get_fd ());
-                } else {
-                    keyfile_contents = new uint8[8 * 1024 * 1024 + 1];
-                    size_t count;
-                    yield keyfile_stream.read_all_async (keyfile_contents, Priority.DEFAULT, backend_lifetime, out count);
-                    if (count == 0 || count == keyfile_contents.length)
-                        throw new IOError.INVALID_ARGUMENT ("The keyfile is empty or too large.");
-                    keyfile_contents.length = (int) count;
-                }
-            }
+            size_t keyfile_size = 0;
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The encrypted volume changed before it could be unlocked.");
             var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.MOUNT,
@@ -2063,6 +2055,29 @@ namespace MajorisDisks {
             var job = jobs.begin ("Unlock encrypted volume", block, snapshot.dependencies);
             var result = new StorageOperationResult ();
             try {
+                var lifetime = backend_lifetime;
+                if (keyfile_paths.length == 1) {
+                    string keyfile_path = keyfile_paths[0];
+                    if (!Path.is_absolute (keyfile_path))
+                        throw new IOError.INVALID_ARGUMENT ("The keyfile must be an absolute local path.");
+                    const int max_keyfile_size = 8 * 1024 * 1024;
+                    int fd = Posix.open (keyfile_path, Posix.O_RDONLY | Posix.O_CLOEXEC |
+                        Posix.O_NOFOLLOW | Posix.O_NONBLOCK);
+                    if (fd < 0)
+                        throw new IOError.FAILED ("Could not open the keyfile: " + Posix.strerror (Posix.errno));
+                    var stream = new UnixInputStream (fd, true);
+                    try {
+                        Posix.Stat info;
+                        if (Posix.fstat (fd, out info) != 0 || !Posix.S_ISREG (info.st_mode) ||
+                            info.st_size <= 0 || info.st_size > max_keyfile_size)
+                            throw new IOError.INVALID_ARGUMENT ("Choose a nonempty regular keyfile no larger than 8 MiB.");
+                        keyfile_contents = new uint8[(int) info.st_size + 1];
+                        yield stream.read_all_async (keyfile_contents, Priority.DEFAULT, lifetime, out keyfile_size);
+                        if (keyfile_size != info.st_size)
+                            throw new IOError.INVALID_DATA ("The keyfile size changed while it was being read.");
+                    } finally { stream = null; }
+                }
+                lifetime.set_error_if_cancelled ();
                 jobs.phase (job, StorageJobState.RUNNING, "Authorizing and unlocking encrypted storage");
                 if (modification_identity (block) != confirmed_identity || block.encrypted?.mapping != null)
                     throw new IOError.NOT_FOUND ("The encrypted volume changed before the unlock request was sent.");
@@ -2071,15 +2086,11 @@ namespace MajorisDisks {
                     options.add ("{sv}", "read-only", new Variant.boolean (true));
                 if (keyfile_contents.length != 0)
                     options.add ("{sv}", "keyfile_contents", new Variant.from_bytes (
-                        new VariantType ("ay"), new Bytes (keyfile_contents), true));
-                if (veracrypt_keyfile != null)
-                    options.add ("{sv}", "keyfiles", new Variant.strv ({ veracrypt_keyfile }));
+                        new VariantType ("ay"), new Bytes (keyfile_contents[0:(int) keyfile_size]), true));
                 var encrypted = require_volume (block, "Encrypted");
                 jobs.expect_backend (job, "encrypted-unlock", block.path);
-                var reply = yield encrypted.call ("Unlock",
-                    new Variant ("(s@a{sv})", passphrase, options.end ()),
-                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
-                keyfile_stream = null;
+                var reply = yield call_tracked_method (job, encrypted, "Unlock",
+                    new Variant ("(s@a{sv})", passphrase, options.end ()), lifetime);
                 passphrase = "";
                 if (keyfile_contents.length != 0)
                     Memory.set (keyfile_contents, 0, keyfile_contents.length);

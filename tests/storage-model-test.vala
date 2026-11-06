@@ -629,11 +629,14 @@ private void test_job_correlation () {
         0);
     assert (manager.jobs.get_n_items () == 2 && local.backend_path == "");
     manager.observe ("/backend/stale", "partition-modify", { "/target" }, 0, false, false,
-        (uint64) (local.backend_dispatch_time - 1));
+        (uint64) (local.backend_dispatch_time - 1), Posix.getuid ());
     assert (manager.jobs.get_n_items () == 3 && local.backend_path == "");
+    manager.observe ("/backend/other-user", "partition-modify", { "/target" }, 0, false, false,
+        (uint64) local.backend_dispatch_time, (int64) Posix.getuid () + 1);
+    assert (manager.jobs.get_n_items () == 4 && local.backend_path == "");
     manager.observe ("/backend/related", "partition-modify", { "/target" }, 0.25, true, true,
-        (uint64) local.backend_dispatch_time);
-    assert (manager.jobs.get_n_items () == 3 && local.backend_path == "/backend/related" && local.progress == 0.25);
+        (uint64) local.backend_dispatch_time, Posix.getuid ());
+    assert (manager.jobs.get_n_items () == 4 && local.backend_path == "/backend/related" && local.progress == 0.25);
     manager.backend_completed ("/backend/related", true, "Done");
     assert (local.state == StorageJobState.FINALIZING);
     var result = new StorageOperationResult (); result.successful = true;
@@ -651,13 +654,13 @@ private void test_job_correlation_ambiguity () {
     manager.phase (second, StorageJobState.RUNNING, "Second");
     manager.expect_backend (first, "filesystem-resize", block.path);
     manager.expect_backend (second, "filesystem-resize", block.path);
-    manager.observe ("/backend/ambiguous", "filesystem-resize", { block.path }, 0.1, true, true, (uint64) second.backend_dispatch_time);
+    manager.observe ("/backend/ambiguous", "filesystem-resize", { block.path }, 0.1, true, true, (uint64) second.backend_dispatch_time, Posix.getuid ());
     assert (manager.jobs.get_n_items () == 3);
     assert (first.backend_path == "" && second.backend_path == "");
     var independent = manager.jobs.get_item (2) as StorageJob;
     assert (!independent.local && independent.backend_path == "/backend/ambiguous");
     var failed = new StorageOperationResult (); failed.fail ("First failed"); manager.finish (first, failed);
-    manager.observe ("/backend/second", "filesystem-resize", { block.path }, 0.2, true, true, (uint64) second.backend_dispatch_time);
+    manager.observe ("/backend/second", "filesystem-resize", { block.path }, 0.2, true, true, (uint64) second.backend_dispatch_time, Posix.getuid ());
     assert (second.backend_path == "/backend/second");
 }
 
@@ -700,8 +703,70 @@ private void test_mock_capability_query () {
     loop.run ();
     if (failure != null) error ("Mock D-Bus capability query failed: %s", failure.message);
 }
+[CCode (cname = "majoris_register_mock_open_device", cheader_filename = "mock-open-device.h")]
+private extern uint register_mock_open_device (DBusConnection connection, string path, DBusInterfaceInfo info) throws Error;
+
+private async void run_mock_open_device () throws Error {
+    var bus = new TestDBus (TestDBusFlags.NONE);
+    bus.up ();
+    try {
+        var flags = DBusConnectionFlags.AUTHENTICATION_CLIENT | DBusConnectionFlags.MESSAGE_BUS_CONNECTION;
+        var server = yield new DBusConnection.for_address (bus.get_bus_address (), flags);
+        var client = yield new DBusConnection.for_address (bus.get_bus_address (), flags);
+        string iface = "org.freedesktop.UDisks2.Block";
+        var node = new DBusNodeInfo.for_xml ("<node><interface name='org.freedesktop.UDisks2.Block'>" +
+            "<method name='OpenDevice'><arg type='s' direction='in'/><arg type='a{sv}' direction='in'/>" +
+            "<arg type='h' direction='out'/></method></interface></node>");
+        foreach (var path in new string[] { "/test/denied", "/test/missing", "/test/not_block" }) {
+            uint registration = register_mock_open_device (server, path, node.lookup_interface (iface));
+            var proxy = yield new DBusProxy (client, DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, null,
+                server.unique_name, path, iface, null);
+            try {
+                yield FilesystemCapacityProbeService.probe_authorized (proxy, 0, new Cancellable ());
+                assert_not_reached ();
+            } catch (Error error) {
+                if (path == "/test/denied")
+                    assert (DBusError.get_remote_error (error) == "org.freedesktop.UDisks2.Error.NotAuthorized");
+                else assert (error is IOError.INVALID_DATA);
+            }
+            server.unregister_object (registration);
+        }
+        yield client.close ();
+        yield server.close ();
+    } finally { bus.down (); }
+}
+
+private void test_mock_open_device () {
+    var loop = new MainLoop ();
+    run_mock_open_device.begin ((object, result) => {
+        try { run_mock_open_device.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
+        loop.quit ();
+    });
+    loop.run ();
+}
+
+private void test_capacity_descriptor_fixture () {
+    string fixture = Environment.get_variable ("MAJORIS_CAPACITY_FIXTURE") ?? "";
+    int fd = Posix.open (fixture, Posix.O_RDONLY | Posix.O_CLOEXEC);
+    assert (fd >= 0);
+    var loop = new MainLoop ();
+    FilesystemCapacityProbeService.probe_descriptor.begin (fd, new Cancellable (), (object, result) => {
+        try {
+            var fields = FilesystemCapacityProbeService.probe_descriptor.end (result);
+            assert (fields.lookup ("TYPE") == "ext4");
+            assert (FilesystemCapacityProbeService.capacity_from_metadata (fields) == 67108864);
+            assert (fields.lookup ("UUID") == Environment.get_variable ("MAJORIS_CAPACITY_UUID"));
+        } catch (Error error) { GLib.error ("%s", error.message); }
+        loop.quit ();
+    });
+    loop.run ();
+    Posix.close (fd);
+}
+
 public static int main (string[] args) {
     Test.init (ref args);
+    if (Environment.get_variable ("MAJORIS_CAPACITY_FIXTURE") != null)
+        Test.add_func ("/operations/capacity-descriptor-fixture", test_capacity_descriptor_fixture);
     Test.add_func ("/layout/gaps", test_gaps);
     Test.add_func ("/layout/normalization", test_normalization);
     Test.add_func ("/layout/resize-geometry", test_resize_geometry);
@@ -740,5 +805,6 @@ public static int main (string[] args) {
     Test.add_func ("/operations/job-progress-notifications", test_job_progress_notifications);
     Test.add_func ("/operations/mount-option-normalization", test_mount_option_normalization);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
+    Test.add_func ("/operations/mock-open-device", test_mock_open_device);
     return Test.run ();
 }

@@ -137,6 +137,7 @@ namespace MajorisDisks {
         public bool persistent_mount { get; set; }
         public string persistent_mount_options { get; set; default = ""; }
         public Variant? persistent_mount_configuration { get; set; }
+        public string device_identity = "";
         public string[] observed_mount_points = {};
         public MountRestorationStatus mount_restoration = MountRestorationStatus.UNKNOWN;
         public string error { get; set; default = ""; }
@@ -233,14 +234,28 @@ namespace MajorisDisks {
                     (entry.restoration_allowed ? "restoration has not completed" : "automatic restoration was withheld") : entry.error;
                 details += "%s was previously %s; current state: %s; %s".printf (
                     entry.object_path, previous, entry.actual_state, reason);
+                if (entry.kind == StoragePreparationKind.MOUNT &&
+                    (entry.mount_restoration == MountRestorationStatus.PARTIALLY_RESTORED ||
+                     entry.mount_restoration == MountRestorationStatus.NOT_RESTORED)) {
+                    string[] missing = {};
+                    for (uint i = 0; i < entry.mount_point_count (); i++) {
+                        string point = entry.mount_point_at (i);
+                        if (!(point in entry.observed_mount_points)) missing += point;
+                    }
+                    if (missing.length != 0) details += "Missing mount locations: " + string.joinv (", ", missing);
+                }
             }
             return string.joinv ("\n", details);
         }
 
+        internal static string device_identity (StorageBlock block) {
+            return new Variant ("(ssssssst)", block.path, block.device, block.preferred,
+                block.physical_drive?.serial ?? "", block.physical_drive?.wwn ?? "",
+                block.backing_path, block.partition?.table_path ?? "", block.number).print (false);
+        }
+
         public void capture (StorageBlock block) {
-            original_device_identity = new Variant ("(ssssst)", block.path, block.device,
-                block.preferred, block.physical_drive?.serial ?? "", block.physical_drive?.wwn ?? "",
-                block.number).print (false);
+            original_device_identity = device_identity (block);
             original_filesystem_identity = new Variant ("(sss)", block.path, block.uuid, block.type_id).print (false);
             original_partition_geometry = block.partition == null ? "" :
                 new Variant ("(sttt)", block.partition.table_path, block.partition.offset,
@@ -574,7 +589,7 @@ namespace MajorisDisks {
         }
 
         public void observe (string path, string operation, string[] objects, double progress,
-            bool valid, bool cancelable, uint64 start_time) {
+            bool valid, bool cancelable, uint64 start_time, int64 started_by_uid = -1) {
             StorageJob? match = null;
             for (uint i = 0; i < jobs.get_n_items (); i++) {
                 var candidate = jobs.get_item (i) as StorageJob;
@@ -589,7 +604,8 @@ namespace MajorisDisks {
                     var candidate = jobs.get_item (i) as StorageJob;
                     if (!candidate.local || terminal (candidate.state) || candidate.backend_path != "" ||
                         !candidate.backend_expectation_open || candidate.expected_backend_operation != operation ||
-                        start_time == 0 || start_time < (uint64) candidate.backend_dispatch_time ||
+                        started_by_uid != Posix.getuid () || start_time == 0 ||
+                        start_time < (uint64) candidate.backend_dispatch_time ||
                         !expected_object_present (candidate, objects) || !objects_match (candidate, objects)) continue;
                     if (candidate_match != null) { candidate_match = null; break; }
                     candidate_match = candidate;

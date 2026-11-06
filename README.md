@@ -4,7 +4,7 @@ Disks is the native GTK4 and libadwaita storage inspector for Majoris. It uses t
 
 ## Build and test
 
-On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, and `udisks2`. The build requires libadwaita 1.5 or later.
+On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, `libblkid-dev`, and `udisks2`. The build requires libadwaita 1.5 or later.
 
 ```sh
 meson setup build
@@ -14,6 +14,10 @@ meson test -C build --print-errorlogs
 ```
 
 Run as your desktop user with UDisks2 and a session Polkit agent. Discovery reads UDisks properties without interactive authorization. Mounting, unmounting and swap activation request authorization through UDisks. Unmount capability consults the storage dependency graph for system-critical filesystems and active dependents. UDisks performs authorization and checks whether the mount is busy. Open in Files uses the desktop's configured file manager.
+
+Offline resize verification uses libblkid metadata and can request a read-only block descriptor through UDisks for protected devices. The local ext fallback uses `dumpe2fs` from `e2fsprogs`. When authoritative capacity or a known filesystem UUID cannot be verified, resize reports the unverified result.
+
+UDisks unlock supports passphrases, read-only access, and single LUKS keyfiles. VeraCrypt keyfiles and advanced credential options require a separate authorized cryptsetup backend.
 
 ## Architecture
 

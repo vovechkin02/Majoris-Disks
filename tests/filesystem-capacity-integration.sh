@@ -37,3 +37,8 @@ ext_block_size=$(printf '%s\n' "$header" | sed -n 's/^Block size:[[:space:]]*//p
 [ -n "$ext_uuid" ] && [ "$ext_uuid" = "$blkid_uuid" ]
 [ "$ext_block_size" -eq "$block_size" ]
 [ "$((blocks * ext_block_size))" -eq "$size" ]
+
+if [ "$#" -gt 0 ]; then
+  MAJORIS_CAPACITY_FIXTURE="$fixture" MAJORIS_CAPACITY_UUID="$blkid_uuid" \
+    "$1" -p /operations/capacity-descriptor-fixture
+fi

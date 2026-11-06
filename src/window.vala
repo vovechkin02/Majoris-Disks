@@ -615,8 +615,7 @@ namespace MajorisDisks {
 
         public UnlockVolumeDialog (StorageBlock block) {
             body = "%s · %s".printf (block.preferred, format_size (block.size));
-            use_keyfile.visible = block.type_id == "crypto_LUKS" || block.type_id == "crypto_TCRYPT" ||
-                block.type_id == "crypto_unknown";
+            use_keyfile.visible = block.type_id == "crypto_LUKS";
             read_only_row.active = block.read_only;
             read_only_row.sensitive = !block.read_only;
             secret.changed.connect (validate);
@@ -636,7 +635,7 @@ namespace MajorisDisks {
                 use_keyfile.active ? selected_keyfiles.length == 1 : secret.text.length > 0);
         }
         private void select_keyfile () {
-            var chooser = new Gtk.FileDialog (); chooser.title = "Select a VeraCrypt keyfile";
+            var chooser = new Gtk.FileDialog (); chooser.title = "Select a LUKS keyfile";
             chooser.open.begin (null, null, (object, result) => {
                 try {
                     var file = chooser.open.end (result); string? path = file.get_path ();

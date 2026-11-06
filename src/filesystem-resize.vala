@@ -130,7 +130,7 @@ namespace MajorisDisks {
     }
 
     public class FilesystemCapacityProbeService : Object {
-        public async FilesystemCapacityMeasurement query (StorageBlock block, Cancellable token) throws Error {
+        public async FilesystemCapacityMeasurement query (StorageBlock block, Cancellable token, DBusProxy? block_proxy = null) throws Error {
             string path = block.path;
             string device = block.preferred;
             string expected_type = normalize_type (block.type_id);
@@ -142,16 +142,27 @@ namespace MajorisDisks {
             if (device == "" || expected_type == "")
                 throw new IOError.NOT_SUPPORTED ("The filesystem does not expose a probeable device and type.");
 
-            string output = yield run ({ "blkid", "--probe", "--output", "export", device }, token);
-            var fields = parse_export (output);
+            HashTable<string, string> fields;
+            bool authorized_probe = false;
+            try {
+                if (Posix.access (device, Posix.R_OK) != 0 &&
+                    (Posix.errno == Posix.EACCES || Posix.errno == Posix.EPERM))
+                    throw new IOError.PERMISSION_DENIED ("The filesystem device is not readable by this user.");
+                string output = yield run ({ "blkid", "--probe", "--output", "export", device }, token);
+                fields = parse_export (output);
+            } catch (IOError error) {
+                if (!(error is IOError.PERMISSION_DENIED) || block_proxy == null) throw error;
+                fields = yield probe_authorized (block_proxy, number, token);
+                authorized_probe = true;
+            }
             string actual_type = normalize_type (fields.lookup ("TYPE") ?? "");
             string actual_uuid = fields.lookup ("UUID") ?? "";
             if (actual_type == "" || actual_type != expected_type)
                 throw new IOError.INVALID_DATA ("The capacity probe identified a different filesystem type.");
-            string source = "libblkid filesystem metadata";
+            string source = authorized_probe ? "libblkid metadata through UDisks" : "libblkid filesystem metadata";
             uint64 block_size;
             uint64 capacity;
-            if ((actual_type == "ext2" || actual_type == "ext3" || actual_type == "ext4") &&
+            if (!authorized_probe && (actual_type == "ext2" || actual_type == "ext3" || actual_type == "ext4") &&
                 (!fields.contains ("FSSIZE") || (expected_uuid != "" && actual_uuid == ""))) {
                 string header = yield run ({ "dumpe2fs", "-h", device }, token);
                 var ext = parse_ext_header (header);
@@ -182,6 +193,58 @@ namespace MajorisDisks {
             measurement.filesystem_uuid = actual_uuid;
             measurement.source = source;
             return measurement;
+        }
+
+        internal static async HashTable<string, string> probe_authorized (DBusProxy proxy, uint64 device_number,
+            Cancellable token) throws Error {
+            UnixFDList? descriptors;
+            var reply = yield proxy.call_with_unix_fd_list ("OpenDevice",
+                new Variant ("(s@a{sv})", "r", new Variant ("a{sv}", null)),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, -1, null, token, out descriptors);
+            if (descriptors == null || !reply.is_of_type (new VariantType ("(h)")))
+                throw new IOError.INVALID_DATA ("UDisks did not return a read-only block descriptor.");
+            int fd = descriptors.get (reply.get_child_value (0).get_handle ());
+            try {
+                Posix.Stat info;
+                if (Posix.fstat (fd, out info) != 0)
+                    throw new IOError.INVALID_DATA ("Could not inspect the returned block descriptor.");
+                int flags = Posix.fcntl (fd, Posix.F_GETFL);
+                if (flags < 0 || (flags & Posix.O_ACCMODE) != Posix.O_RDONLY ||
+                    !Posix.S_ISBLK (info.st_mode) ||
+                    (uint64) info.st_rdev != device_number)
+                    throw new IOError.INVALID_DATA ("The returned block descriptor did not match the selected device.");
+
+                return yield probe_descriptor (fd, token);
+            } finally { Posix.close (fd); }
+        }
+
+        internal static async HashTable<string, string> probe_descriptor (int fd, Cancellable token) throws Error {
+            token.set_error_if_cancelled ();
+            var context = MainContext.ref_thread_default ();
+            var fields = new HashTable<string, string> (str_hash, str_equal);
+            int status = -1;
+            new Thread<void*> ("filesystem-capacity", () => {
+                var probe = new BlkidProbe ();
+                if (probe != null && probe.set_device (fd, 0, 0) == 0 &&
+                    probe.set_superblocks_flags (BLKID_DEFAULT_FIELDS | BLKID_FILESYSTEM_FIELDS) == 0) {
+                    status = probe.safe_probe ();
+                    if (status == 0) {
+                        foreach (var key in new string[] { "TYPE", "UUID", "FSSIZE", "FSBLOCKSIZE" }) {
+                            unowned string value;
+                            if (probe.lookup_value (key, out value) == 0) fields.insert (key, value);
+                        }
+                    }
+                }
+                var resume = new IdleSource ();
+                resume.set_callback (probe_descriptor.callback);
+                resume.attach (context);
+                return null;
+            });
+            yield;
+            token.set_error_if_cancelled ();
+            if (status != 0)
+                throw new IOError.INVALID_DATA ("libblkid could not establish unambiguous filesystem metadata.");
+            return fields;
         }
 
         public static FilesystemCapacityMeasurement parse_ext_header (string output) throws Error {
@@ -267,9 +330,17 @@ namespace MajorisDisks {
                 throw new IOError.NOT_SUPPORTED ("The read-only filesystem capacity probe is unavailable: " + error.message);
             }
             string? output; string? errors;
-            yield process.communicate_utf8_async (null, token, out output, out errors);
-            if (!process.get_successful ())
-                throw new IOError.PERMISSION_DENIED ((errors ?? "The filesystem metadata could not be read.").strip ());
+            try { yield process.communicate_utf8_async (null, token, out output, out errors); }
+            catch (IOError error) {
+                if (error is IOError.CANCELLED) process.force_exit ();
+                throw error;
+            }
+            if (!process.get_successful ()) {
+                string message = (errors ?? "").strip ();
+                if (message.contains ("Permission denied") || message.contains ("Operation not permitted"))
+                    throw new IOError.PERMISSION_DENIED (message);
+                throw new IOError.INVALID_DATA (message == "" ? "The filesystem metadata could not be read." : message);
+            }
             return output ?? "";
         }
     }
