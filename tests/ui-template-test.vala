@@ -33,7 +33,7 @@ public static int main (string[] args) {
         new LockVolumeConfirmationDialog (), new ChangePassphraseDialog (block),
         new HardwareActionConfirmationDialog (),
         new EncryptionOptionsDialog (block, "identity"), new SmartDialog (backend, drive, health_report),
-        new DriveSettingsDialog (drive)
+        new DriveSettingsDialog (drive), new HealthPreferences (), new BenchmarkDialog (backend, drive), new DiskImageConfirmation (), new BlankDiskImageDialog (), new VirtualImageDialog ()
     };
     string[] resources = {
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
@@ -44,7 +44,7 @@ public static int main (string[] args) {
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
         "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui",
         "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui", "encryption-options-dialog.ui",
-        "smart-dialog.ui", "hardware-action-confirmation-dialog.ui", "drive-settings-dialog.ui"
+        "smart-dialog.ui", "hardware-action-confirmation-dialog.ui", "drive-settings-dialog.ui", "health-preferences.ui", "benchmark-dialog.ui", "disk-image-confirmation.ui", "create-blank-image-dialog.ui", "virtual-image-dialog.ui"
     };
     foreach (var name in resources) {
         try { resources_lookup_data ("/com/majoris/disks/ui/" + name, ResourceLookupFlags.NONE); }

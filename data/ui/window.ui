@@ -1,11 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
+  <menu id="application_menu">
+    <item><attribute name="label">Inspect or Convert Image…</attribute><attribute name="action">app.virtual-image</attribute></item>
+    <item><attribute name="label">Attach Disk Image…</attribute><attribute name="action">app.attach-image</attribute></item>
+    <item><attribute name="label">Create Blank Disk Image…</attribute><attribute name="action">app.blank-image</attribute></item>
+    <item><attribute name="label">Preferences</attribute><attribute name="action">app.preferences</attribute></item>
+    <item><attribute name="label">About Disks</attribute><attribute name="action">app.about</attribute></item>
+    <item><attribute name="label">Quit</attribute><attribute name="action">app.quit</attribute></item>
+  </menu>
   <template class="MajorisDisksDisksWindow" parent="AdwApplicationWindow">
 <property name="title">Disks</property>
 <property name="default-width">900</property><property name="default-height">650</property>
 <property name="content"><object class="AdwNavigationSplitView" id="split">
 <property name="sidebar"><object class="AdwNavigationPage"><property name="title">Devices</property><property name="child">
-<object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar"><child type="end"><object class="GtkButton" id="refresh_button"><property name="label">Refresh</property></object></child></object></child>
+<object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar"><child type="start"><object class="GtkMenuButton"><property name="icon-name">open-menu-symbolic</property><property name="menu-model">application_menu</property></object></child><child type="end"><object class="GtkButton" id="refresh_button"><property name="label">Refresh</property></object></child></object></child>
 <property name="content"><object class="GtkScrolledWindow"><property name="child"><object class="GtkListBox" id="sidebar"><style><class name="navigation-sidebar"/></style></object></property></object></property>
 </object></property></object></property>
 <property name="content"><object class="AdwNavigationPage"><property name="title">Storage</property><property name="child">

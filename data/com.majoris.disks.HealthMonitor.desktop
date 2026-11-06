@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Disks Health Monitor
+Exec=majoris-disks-health-monitor
+Icon=com.majoris.disks
+NoDisplay=true
+Terminal=false

@@ -867,6 +867,190 @@ private void test_capacity_udisks_fixture () {
     loop.run ();
 }
 
+private void test_health_problem_assessment () {
+    var drive = new StorageDrive ("/example");
+    drive.smart = true;
+    drive.smart_enabled = true;
+    drive.smart_failing = true;
+    bool urgent;
+    assert (DriveHealth.problem (drive, true, true, true, out urgent) == "");
+    drive.smart_updated = 1;
+    assert (DriveHealth.problem (drive, true, true, true, out urgent) != "" && urgent);
+    drive.smart_failing = false;
+    assert (DriveHealth.problem (drive, true, true, true, out urgent) == "" && !urgent);
+    drive.smart_bad_sectors = 9;
+    string problem = DriveHealth.problem (drive, true, true, true, out urgent);
+    drive.smart_bad_sectors++;
+    assert (problem != "" && problem == DriveHealth.problem (drive, true, true, true, out urgent));
+    drive.smart_selftest_status = "error_read";
+    assert (DriveHealth.problem (drive, false, false, true, out urgent).contains ("self-test"));
+    drive.nvme_state = "live";
+    drive.nvme_warnings = { "temperature", "spare" };
+    assert (DriveHealth.problem (drive, false, true, false, out urgent).contains ("spare, temperature") && urgent);
+    drive.wwn = "test-wwn";
+    assert (DriveHealth.identity (drive) == "wwn:test-wwn");
+}
+
+private async void exercise_image_workflows () throws Error {
+    string directory = DirUtils.make_tmp ("majoris-image-tests-XXXXXX");
+    var source = File.new_for_path (Path.build_filename (directory, "source.img"));
+    var target = File.new_for_path (Path.build_filename (directory, "target.img"));
+    int input = -1;
+    int output = -1;
+    try {
+        try {
+            yield DiskImageCopy.create_blank (source, 0);
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.INVALID_ARGUMENT); }
+        yield DiskImageCopy.create_blank (source, 2 * 1024 * 1024);
+        try {
+            yield DiskImageCopy.create_blank (source, 1024);
+            assert_not_reached ();
+        } catch (Error error) { assert (source.query_info (FileAttribute.STANDARD_SIZE, 0).get_size () == 2097152); }
+        input = Posix.open (source.get_path (), Posix.O_RDWR | Posix.O_CLOEXEC);
+        output = Posix.open (target.get_path (), Posix.O_RDWR | Posix.O_CREAT | Posix.O_EXCL | Posix.O_CLOEXEC, 0600);
+        assert (input >= 0 && output >= 0);
+        assert (Posix.write (input, "Majoris".data, 7) == 7);
+        assert (Posix.lseek (input, 0, Posix.SEEK_SET) == 0);
+        var jobs = new StorageJobManager ();
+        var job = jobs.begin_named ("Copy image", "Fixture", {});
+        yield DiskImageCopy.copy (input, output, 2097152, jobs, job, true);
+        var bytes = new uint8[7];
+        assert (Posix.lseek (output, 0, Posix.SEEK_SET) == 0 && Posix.read (output, bytes, bytes.length) == 7);
+        for (int i = 0; i < bytes.length; i++) assert (bytes[i] == "Majoris"[i]);
+        assert (target.query_info (FileAttribute.STANDARD_SIZE, 0).get_size () == 2097152);
+        try {
+            yield DiskImageCopy.copy (input, output, 1, jobs, job);
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.PARTIAL_INPUT); }
+
+        var measured = yield DiskBenchmark.measure (input, 2097152, 512, 4, 4096, jobs, job);
+        assert (measured.throughput.length == 4 && measured.latency.length == 4);
+        assert (BenchmarkResult.average (measured.throughput) > 0);
+        assert (DiskBenchmark.position (2097152, 4096, 512, 0, 4) == 0);
+        assert (DiskBenchmark.position (2097152, 4096, 512, 3, 4) == 2097152 - 4096);
+        job.cancellable.cancel ();
+        try {
+            yield DiskImageCopy.copy (input, output, 1, jobs, job);
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.CANCELLED); }
+    } finally {
+        if (input >= 0) Posix.close (input);
+        if (output >= 0) Posix.close (output);
+        FileUtils.unlink (source.get_path ());
+        FileUtils.unlink (target.get_path ());
+        DirUtils.remove (directory);
+    }
+}
+
+private async void exercise_xz () throws Error {
+    string? executable = Environment.find_program_in_path ("xz");
+    if (executable == null) {
+        Test.skip ("xz-utils is unavailable");
+        return;
+    }
+    FileIOStream compressed;
+    var file = File.new_tmp ("majoris-xz-test-XXXXXX", out compressed);
+    FileIOStream expanded;
+    var output = File.new_tmp ("majoris-expanded-test-XXXXXX", out expanded);
+    try {
+        var compressor = new Subprocess.newv ({ executable, "--stdout", "--compress" },
+            SubprocessFlags.STDIN_PIPE | SubprocessFlags.STDOUT_PIPE);
+        var payload = new Bytes ("Majoris image fixture".data);
+        Bytes? archive;
+        yield compressor.communicate_async (payload, null, out archive, null);
+        assert (compressor.get_successful () && archive != null);
+        size_t written;
+        compressed.output_stream.write_all (archive.get_data (), out written);
+        var input = compressed.input_stream as FileDescriptorBased;
+        assert (input != null && Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
+        uint64 size = yield DiskImageCopy.expand_xz (input.get_fd (), expanded.output_stream, 1024, new Cancellable ());
+        assert (size == payload.get_size ());
+        assert (((Seekable) expanded).seek (0, SeekType.SET));
+        var decoded = expanded.input_stream.read_bytes ((size_t) size);
+        assert (decoded.compare (payload) == 0);
+        assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
+        try {
+            yield DiskImageCopy.expand_xz (input.get_fd (), expanded.output_stream, 1, new Cancellable ());
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.NO_SPACE); }
+        assert (Posix.ftruncate (input.get_fd (), (Posix.off_t) (archive.get_size () - 4)) == 0);
+        assert (Posix.lseek (input.get_fd (), 0, Posix.SEEK_SET) == 0);
+        try {
+            yield DiskImageCopy.expand_xz (input.get_fd (), expanded.output_stream, 1024, new Cancellable ());
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.INVALID_DATA); }
+    } finally {
+        try { compressed.close (); file.delete (); }
+        catch (Error error) { warning ("%s", error.message); }
+        try { expanded.close (); output.delete (); }
+        catch (Error error) { warning ("%s", error.message); }
+    }
+}
+
+private void test_xz_workflow () {
+    var loop = new MainLoop ();
+    bool finished = false;
+    exercise_xz.begin ((object, result) => {
+        try { exercise_xz.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
+        finished = true;
+        loop.quit ();
+    });
+    if (!finished) loop.run ();
+}
+
+private void test_image_workflows () {
+    var loop = new MainLoop ();
+    exercise_image_workflows.begin ((object, result) => {
+        try { exercise_image_workflows.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
+        loop.quit ();
+    });
+    loop.run ();
+}
+
+private async void exercise_virtual_images () throws Error {
+    if (!VirtualDisk.available ()) {
+        Test.skip ("qemu-utils or bubblewrap is unavailable");
+        return;
+    }
+    var check = new Subprocess.newv ({ "/usr/bin/bwrap", "--unshare-all", "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64", "/usr/bin/true" },
+        SubprocessFlags.STDERR_SILENCE);
+    if (!(yield check.wait_async ()) || !check.get_successful ()) {
+        Test.skip ("The virtual-image sandbox cannot start in this session");
+        return;
+    }
+    string path = DirUtils.make_tmp ("majoris-virtual-tests-XXXXXX");
+    var token = new Cancellable ();
+    foreach (var format in new string[] { "vpc", "vhdx", "qcow2" }) {
+        var virtual_image = File.new_for_path (Path.build_filename (path, format));
+        var raw = File.new_for_path (Path.build_filename (path, format + ".img"));
+        try {
+            yield VirtualDisk.write_image (null, virtual_image, format, 64 * 1024 * 1024, token);
+            var info = yield VirtualDisk.inspect (virtual_image, token);
+            assert (info.format == format && info.capacity == 64 * 1024 * 1024);
+            yield VirtualDisk.write_image (virtual_image, raw, "raw", 0, token);
+            var converted = yield VirtualDisk.inspect (raw, token);
+            assert (converted.format == "raw" && converted.capacity == info.capacity);
+        } finally {
+            FileUtils.unlink (raw.get_path ());
+            FileUtils.unlink (virtual_image.get_path ());
+        }
+    }
+    DirUtils.remove (path);
+}
+
+private void test_virtual_workflows () {
+    var loop = new MainLoop ();
+    bool finished = false;
+    exercise_virtual_images.begin ((object, result) => {
+        try { exercise_virtual_images.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
+        finished = true;
+        loop.quit ();
+    });
+    if (!finished) loop.run ();
+}
+
 public static int main (string[] args) {
     Test.init (ref args);
     if (Environment.get_variable ("MAJORIS_CAPACITY_LOOP") != null)
@@ -913,6 +1097,10 @@ public static int main (string[] args) {
     Test.add_func ("/operations/job-progress-notifications", test_job_progress_notifications);
     Test.add_func ("/operations/mount-option-normalization", test_mount_option_normalization);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
+    Test.add_func ("/features/drive-health", test_health_problem_assessment);
+    Test.add_func ("/features/virtual-images", test_virtual_workflows);
+    Test.add_func ("/features/xz-restore-preflight", test_xz_workflow);
+    Test.add_func ("/features/raw-image-and-benchmark", test_image_workflows);
     Test.add_func ("/operations/mock-open-device", test_mock_open_device);
     return Test.run ();
 }

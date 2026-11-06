@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksBenchmarkDialog" parent="AdwDialog">
+    <property name="content-width">520</property>
+    <property name="child">
+      <object class="AdwToolbarView">
+        <child type="top"><object class="AdwHeaderBar"/></child>
+        <property name="content">
+          <object class="AdwPreferencesPage">
+            <child>
+              <object class="AdwPreferencesGroup">
+                <property name="title">Read-only disk benchmark</property>
+                <child><object class="AdwActionRow"><property name="title">Samples per measurement</property>
+                  <child type="suffix"><object class="GtkSpinButton" id="samples"><property name="valign">center</property>
+                    <property name="adjustment"><object class="GtkAdjustment"><property name="lower">2</property><property name="upper">128</property><property name="step-increment">1</property><property name="value">16</property></object></property>
+                  </object></child>
+                </object></child>
+                <child><object class="AdwActionRow"><property name="title">Read sample size (MiB)</property>
+                  <child type="suffix"><object class="GtkSpinButton" id="sample_mib"><property name="valign">center</property>
+                    <property name="adjustment"><object class="GtkAdjustment"><property name="lower">1</property><property name="upper">16</property><property name="step-increment">1</property><property name="value">4</property></object></property>
+                  </object></child>
+                </object></child>
+                <child><object class="GtkButton" id="start"><property name="label">Start Benchmark</property></object></child>
+              </object>
+            </child>
+            <child><object class="AdwPreferencesGroup"><property name="title">Filesystem write test</property>
+              <child><object class="GtkButton" id="scratch"><property name="label">Choose Scratch Folder…</property></object></child>
+              <child><object class="GtkLabel" id="scratch_result"><property name="wrap">true</property><property name="xalign">0</property></object></child>
+            </object></child>
+            <child><object class="AdwPreferencesGroup"><property name="title">Results</property>
+              <child><object class="GtkLabel" id="summary"><property name="wrap">true</property><property name="xalign">0</property></object></child>
+              <child><object class="GtkLabel"><property name="label">Read throughput</property><property name="xalign">0</property></object></child>
+              <child><object class="GtkDrawingArea" id="throughput"><property name="content-height">85</property></object></child>
+              <child><object class="GtkLabel"><property name="label">Access time</property><property name="xalign">0</property></object></child>
+              <child><object class="GtkDrawingArea" id="latency"><property name="content-height">85</property></object></child>
+            </object></child>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>

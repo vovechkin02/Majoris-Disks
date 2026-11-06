@@ -497,6 +497,375 @@ namespace MajorisDisks {
             }
         }
 
+        private async int open_block (StorageBlock block, string mode, int flags, Cancellable token) throws Error {
+            uint64 number = block.number;
+            string identity = modification_identity (block);
+            var proxy = require_volume (block, "Block");
+            var options = new VariantBuilder (new VariantType ("a{sv}"));
+            options.add ("{sv}", "flags", new Variant.int32 (flags));
+            UnixFDList? descriptors;
+            var reply = yield proxy.call_with_unix_fd_list ("OpenDevice",
+                new Variant ("(s@a{sv})", mode, options.end ()),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, null, token, out descriptors);
+            if (descriptors == null || !reply.is_of_type (new VariantType ("(h)")))
+                throw new IOError.INVALID_DATA ("UDisks did not return a block descriptor.");
+            int handle = reply.get_child_value (0).get_handle ();
+            if (handle < 0 || handle >= descriptors.get_length ())
+                throw new IOError.INVALID_DATA ("UDisks returned an invalid descriptor index.");
+            int fd = descriptors.get (handle);
+            try {
+                Posix.Stat info = {};
+                if (Posix.fstat (fd, out info) != 0 || !Posix.S_ISBLK (info.st_mode) || (uint64) info.st_rdev != number)
+                    throw new IOError.INVALID_DATA ("The returned descriptor does not match the selected block device.");
+                uint64 capacity;
+                if (ioctl_capacity (fd, BLOCK_DEVICE_CAPACITY, out capacity) != 0 || capacity != block.size)
+                    throw new IOError.INVALID_DATA ("The block device capacity changed or could not be verified.");
+                int access = Posix.fcntl (fd, Posix.F_GETFL);
+                int expected = mode == "r" ? Posix.O_RDONLY : Posix.O_RDWR;
+                if (access < 0 || (access & Posix.O_ACCMODE) != expected)
+                    throw new IOError.INVALID_DATA ("The returned descriptor has unexpected access permissions.");
+                synchronize ();
+                if (require_volume (block, "Block") != proxy || modification_identity (block) != identity)
+                    throw new IOError.NOT_FOUND ("The selected block device changed.");
+                return fd;
+            } catch (Error error) { Posix.close (fd); throw error; }
+        }
+
+        internal async BenchmarkResult benchmark (StorageBlock block, int samples, uint64 bytes) throws Error {
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Benchmark disk", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            int fd = -1;
+            ulong disconnected = backend_lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            var lifetime = backend_lifetime;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Authorizing read-only device access");
+                uint64 size = block.size;
+                string identity = modification_identity (block);
+                fd = yield open_block (block, "r", Posix.O_CLOEXEC | DIRECT_IO, job.cancellable);
+                job.cancelable = true;
+                var result = yield DiskBenchmark.measure (fd, size,
+                    uint64.max (block.logical_sector_size, block.physical_sector_size), samples, bytes, jobs, job);
+                synchronize ();
+                if (!block.available || snapshot.blocks.lookup (block.path) != block ||
+                    modification_identity (block) != identity)
+                    throw new IOError.NOT_FOUND ("The device changed during measurement.");
+                outcome.successful = true;
+                outcome.summary = "Benchmark complete";
+                jobs.finish (job, outcome);
+                return result;
+            } catch (Error error) {
+                outcome.fail ("Benchmark stopped", error);
+                jobs.finish (job, outcome);
+                throw error;
+            } finally {
+                lifetime.disconnect (disconnected);
+                if (fd >= 0) Posix.close (fd);
+                locks.release (block);
+            }
+        }
+
+        internal async void create_disk_image (StorageBlock block, File destination, string confirmed_identity) throws Error {
+            string? path = destination.get_path ();
+            var directory = destination.get_parent ();
+            if (path == null || directory == null || block.size == 0)
+                throw new IOError.INVALID_ARGUMENT ("Choose a local destination for a source with known capacity.");
+            if (modification_identity (block) != confirmed_identity)
+                throw new IOError.NOT_FOUND ("The image source changed after confirmation.");
+            string temporary = Path.build_filename (directory.get_path (), ".majoris-" + Uuid.string_random ());
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Create disk image", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            int input = -1;
+            int output = -1;
+            bool temporary_created = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the destination");
+                var token = job.cancellable;
+                uint64 size = block.size;
+                string identity = modification_identity (block);
+                var space = yield directory.query_filesystem_info_async (FileAttribute.FILESYSTEM_FREE,
+                    Priority.DEFAULT, token);
+                if (space.has_attribute (FileAttribute.FILESYSTEM_FREE) &&
+                    space.get_attribute_uint64 (FileAttribute.FILESYSTEM_FREE) < size)
+                    throw new IOError.NO_SPACE ("The destination does not have enough free space for the image.");
+                Posix.Stat info = {};
+                if (Posix.stat (directory.get_path (), out info) != 0)
+                    throw new IOError.NOT_FOUND ("Could not inspect the destination directory.");
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var dependent = node as StorageBlock;
+                    if (dependent != null && dependent.number == (uint64) info.st_dev)
+                        throw new IOError.INVALID_ARGUMENT ("Choose a destination outside the source device.");
+                }
+                if (destination.query_exists (token))
+                    throw new IOError.EXISTS ("An image already exists at the selected destination.");
+                output = Posix.open (temporary, Posix.O_WRONLY | Posix.O_CREAT | Posix.O_EXCL | Posix.O_CLOEXEC, 0600);
+                if (output < 0) throw new IOError.FAILED ("Could not create a temporary image: " + Posix.strerror (Posix.errno));
+                temporary_created = true;
+                if (Posix.fstat (output, out info) != 0)
+                    throw new IOError.FAILED ("Could not verify the output filesystem.");
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var dependent = node as StorageBlock;
+                    if (dependent != null && dependent.number == (uint64) info.st_dev)
+                        throw new IOError.INVALID_ARGUMENT ("The output file is stored on the source device.");
+                }
+                input = yield open_block (block, "r", Posix.O_CLOEXEC, token);
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.RUNNING, "Copying the raw image");
+                yield DiskImageCopy.copy (input, output, size, jobs, job);
+                synchronize ();
+                if (!block.available || snapshot.blocks.lookup (block.path) != block ||
+                    modification_identity (block) != identity || Posix.fstat (output, out info) != 0 ||
+                    (uint64) info.st_size != size)
+                    throw new IOError.INVALID_DATA ("The source or resulting image size could not be verified.");
+                int close_status = Posix.close (output);
+                output = -1;
+                if (close_status != 0) throw new IOError.FAILED ("Could not close the image.");
+                if (rename_without_replacement (CURRENT_DIRECTORY, temporary, CURRENT_DIRECTORY, path, NO_REPLACEMENT) != 0)
+                    throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));
+                temporary_created = false;
+                outcome.successful = true;
+                outcome.summary = "Disk image created";
+                jobs.finish (job, outcome);
+            } catch (Error error) {
+                outcome.fail ("Disk image was not created", error);
+                jobs.finish (job, outcome);
+                throw error;
+            } finally {
+                if (input >= 0) Posix.close (input);
+                if (output >= 0) Posix.close (output);
+                if (temporary_created && FileUtils.unlink (temporary) != 0)
+                    warning ("Could not remove incomplete image %s", temporary);
+                lifetime.disconnect (disconnected);
+                locks.release (block);
+            }
+        }
+
+        private void check_image_filesystem (StorageBlock block, Posix.Stat info) throws Error {
+            Posix.Stat backing = {};
+            if (block.loop != null && Posix.stat (block.loop.backing_file, out backing) == 0 &&
+                backing.st_dev == info.st_dev && backing.st_ino == info.st_ino)
+                throw new IOError.INVALID_ARGUMENT ("The source is the selected loop device’s backing file.");
+            foreach (var node in snapshot.dependencies.descendants (block)) {
+                var dependent = node as StorageBlock;
+                if (dependent != null && dependent.number == (uint64) info.st_dev)
+                    throw new IOError.INVALID_ARGUMENT ("The image file must be stored outside the selected device.");
+            }
+        }
+
+        internal async StorageOperationResult restore_disk_image (StorageBlock block, File source,
+            string confirmed_identity) throws Error {
+            string? path = source.get_path ();
+            if (path == null || !(path.has_suffix (".img") || path.has_suffix (".iso") || path.has_suffix (".img.xz")))
+                throw new IOError.INVALID_ARGUMENT ("Choose a local .img, .iso or .img.xz file.");
+            if (modification_identity (block) != confirmed_identity)
+                throw new IOError.NOT_FOUND ("The selected device changed after confirmation.");
+            var eligible = StorageSafetyService.assess_operation (StorageOperationKind.IMAGE_RESTORE, block, snapshot.dependencies);
+            if (!eligible.allowed || eligible.unknown) throw new IOError.PERMISSION_DENIED (eligible.reason);
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Restore disk image", block, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            StoragePreparationJournal? preparation = null;
+            int input = -1;
+            int target = -1;
+            File? expanded = null;
+            FileIOStream? expanded_stream = null;
+            bool writing = false;
+            try {
+                var token = job.cancellable;
+                uint64 capacity = block.size;
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.PREPARING, "Validating image data");
+                input = Posix.open (path, Posix.O_RDONLY | Posix.O_CLOEXEC | Posix.O_NOFOLLOW | Posix.O_NONBLOCK);
+                Posix.Stat info = {};
+                if (input < 0 || Posix.fstat (input, out info) != 0)
+                    throw new IOError.NOT_FOUND ("Could not open the source image.");
+                if (!Posix.S_ISREG (info.st_mode) || info.st_size <= 0)
+                    throw new IOError.INVALID_DATA ("The source must be a nonempty regular image file.");
+                check_image_filesystem (block, info);
+                uint64 bytes = (uint64) info.st_size;
+                int image_fd = input;
+                if (path.has_suffix (".img.xz")) {
+                    expanded = File.new_tmp ("majoris-image-XXXXXX", out expanded_stream);
+                    var descriptor = expanded_stream.output_stream as FileDescriptorBased;
+                    if (descriptor == null || Posix.fstat (descriptor.get_fd (), out info) != 0)
+                        throw new IOError.FAILED ("Could not inspect the temporary image file.");
+                    check_image_filesystem (block, info);
+                    bytes = yield DiskImageCopy.expand_xz (input, expanded_stream.output_stream, capacity, token);
+                    image_fd = descriptor.get_fd ();
+                    if (Posix.lseek (image_fd, 0, Posix.SEEK_SET) < 0)
+                        throw new IOError.FAILED ("Could not rewind the verified image.");
+                }
+                if (bytes == 0 || bytes > capacity)
+                    throw new IOError.NO_SPACE ("The image does not fit the selected device.");
+
+                synchronize ();
+                if (modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The selected device changed while validating the image.");
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.PREPARING, "Preparing the target device");
+                preparation = yield prepare_for_modification (block, lifetime);
+                synchronize ();
+                if (modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The target device changed during preparation.");
+                var readiness = StorageSafetyService.assess_operation (StorageOperationKind.IMAGE_RESTORE, block, snapshot.dependencies);
+                if (!readiness.allowed || readiness.unknown || readiness.requires_preparation)
+                    throw new IOError.BUSY ("The target still has active or unresolved dependencies.");
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var dependent = node as StorageBlock;
+                    if (dependent != null) yield KernelStorageSafety.require_idle (dependent, lifetime);
+                }
+                target = yield open_block (block, "rw", Posix.O_EXCL | Posix.O_CLOEXEC | Posix.O_SYNC, token);
+                token.set_error_if_cancelled ();
+                writing = true;
+                preparation.backend_invoked = true;
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.RUNNING, "Writing the verified image");
+                yield DiskImageCopy.copy (image_fd, target, bytes, jobs, job, true);
+                result.completed ("%s written, flushed, and verified by readback".printf (format_size (bytes)));
+                int closed = Posix.close (target);
+                target = -1;
+                if (closed != 0) throw new IOError.FAILED ("Could not close the target device.");
+                jobs.phase (job, StorageJobState.FINALIZING, "Refreshing the partition table");
+                var proxy = require_volume (block, "Block");
+                yield proxy.call ("Rescan", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
+                synchronize ();
+                require_volume (block, "Block");
+                result.successful = true;
+                result.summary = "Disk image restored";
+            } catch (Error error) {
+                if (target >= 0) { Posix.close (target); target = -1; }
+                result.fail (writing ? "Restoration did not complete. The target may be partially overwritten." :
+                    "Restoration stopped before writing to the target.", error);
+                if (writing) {
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.partial = true;
+                } else if (preparation != null && !preparation.fully_restored ()) {
+                    try { yield restore_preparation (preparation, lifetime); }
+                    catch (Error restore_error) { result.technical_error += "\n" + restore_error.message; }
+                }
+            } finally {
+                if (input >= 0) Posix.close (input);
+                if (target >= 0) Posix.close (target);
+                try { if (expanded_stream != null) expanded_stream.close (); }
+                catch (Error error) { warning ("Could not close decompression scratch file: %s", error.message); }
+                try { if (expanded != null) expanded.delete (); }
+                catch (Error error) { warning ("Could not remove decompression scratch file: %s", error.message); }
+                lifetime.disconnect (disconnected);
+                locks.release (block);
+                jobs.finish (job, result);
+            }
+            return result;
+        }
+
+        internal async string attach_disk_image (File source, bool read_only) throws Error {
+            string? path = source.get_path ();
+            if (path == null || !(path.has_suffix (".img") || path.has_suffix (".iso") || path.has_suffix (".raw")))
+                throw new IOError.INVALID_ARGUMENT ("Choose a local raw .img, .iso or .raw image.");
+            var lifetime = backend_lifetime;
+            if (owner == null) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
+            var job = jobs.begin_named ("Attach disk image", source.get_parse_name (), {});
+            var outcome = new StorageOperationResult ();
+            int fd = -1;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Opening the image");
+                fd = Posix.open (path, (read_only ? Posix.O_RDONLY : Posix.O_RDWR) |
+                    Posix.O_CLOEXEC | Posix.O_NOFOLLOW | Posix.O_NONBLOCK);
+                Posix.Stat info = {};
+                if (fd < 0 || Posix.fstat (fd, out info) != 0)
+                    throw new IOError.FAILED ("Could not open the selected image.");
+                if (!Posix.S_ISREG (info.st_mode) || info.st_size < 512)
+                    throw new IOError.INVALID_DATA ("The selected image is not a usable regular file.");
+                string backing = FileUtils.read_link ("/proc/self/fd/%d".printf (fd));
+                synchronize ();
+                foreach (var existing in snapshot.blocks.get_values ()) {
+                    if (existing.loop == null) continue;
+                    Posix.Stat existing_file = {};
+                    if (existing.loop.backing_file == backing ||
+                        (Posix.stat (existing.loop.backing_file, out existing_file) == 0 &&
+                         existing_file.st_dev == info.st_dev && existing_file.st_ino == info.st_ino))
+                        throw new IOError.EXISTS ("This image is already attached.");
+                }
+                var manager_proxy = yield new DBusProxy.for_bus (BusType.SYSTEM, DBusProxyFlags.DO_NOT_AUTO_START,
+                    null, owner, "/org/freedesktop/UDisks2/Manager", PREFIX + "Manager", lifetime);
+                var descriptors = new UnixFDList ();
+                int handle = descriptors.append (fd);
+                var options = new VariantBuilder (new VariantType ("a{sv}"));
+                options.add ("{sv}", "read-only", new Variant.boolean (read_only));
+                jobs.phase (job, StorageJobState.RUNNING, "Attaching the image");
+                UnixFDList? returned;
+                var reply = yield manager_proxy.call_with_unix_fd_list ("LoopSetup",
+                    new Variant ("(h@a{sv})", handle, options.end ()), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
+                    int.MAX, descriptors, lifetime, out returned);
+                if (!reply.is_of_type (new VariantType ("(o)")))
+                    throw new IOError.INVALID_DATA ("UDisks did not return a loop object.");
+                string attached = reply.get_child_value (0).get_string ();
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    synchronize ();
+                    var block = snapshot.blocks.lookup (attached);
+                    if (block?.loop != null && block.loop.backing_file == backing && block.read_only == read_only) {
+                        outcome.successful = true;
+                        outcome.summary = "Disk image attached";
+                        jobs.finish (job, outcome);
+                        return attached;
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("The image may be attached, but the loop object could not be verified. Refresh before retrying.");
+            } catch (Error error) {
+                outcome.fail ("Could not verify attachment", error);
+                jobs.finish (job, outcome);
+                throw error;
+            } finally { if (fd >= 0) Posix.close (fd); }
+        }
+
+        internal async void detach_disk_image (StorageBlock block) throws Error {
+            if (block.loop == null)
+                throw new IOError.NOT_SUPPORTED ("The selected device is not an attached raw image.");
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Detach disk image", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            string backing = block.loop.backing_file;
+            var lifetime = backend_lifetime;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking active image volumes");
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || safety.mounted)
+                    throw new IOError.BUSY ("Unmount image volumes and close unlocked mappings before detaching.");
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var dependent = node as StorageBlock;
+                    if (dependent != null) yield KernelStorageSafety.require_idle (dependent, lifetime);
+                }
+                synchronize ();
+                if (block.loop?.backing_file != backing)
+                    throw new IOError.NOT_FOUND ("The backing image changed.");
+                var proxy = require_volume (block, "Loop");
+                jobs.phase (job, StorageJobState.RUNNING, "Detaching the image");
+                yield proxy.call ("Delete", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
+                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    synchronize ();
+                    if (snapshot.blocks.lookup (block.path) != block || block.loop == null || block.loop.backing_file == "") {
+                        outcome.successful = true;
+                        outcome.summary = "Disk image detached";
+                        jobs.finish (job, outcome);
+                        return;
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("The loop object is still present. Refresh before retrying.");
+            } catch (Error error) {
+                outcome.fail ("Could not detach the image", error);
+                jobs.finish (job, outcome);
+                throw error;
+            } finally { locks.release (block); }
+        }
+
         private DBusProxy require_volume (StorageBlock block, string iface) throws Error {
             if (!available ()) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
             if (snapshot.blocks.lookup (block.path) != block || !block.available)
@@ -1873,6 +2242,12 @@ namespace MajorisDisks {
         }
 
         public async void cancel_job (StorageJob job) throws Error {
+            if (job.local && job.cancelable && job.backend_path == "" && !StorageJobManager.terminal (job.state)) {
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.CANCELLING, "Cancelling");
+                job.cancellable.cancel ();
+                return;
+            }
             if (!job.cancelable || job.backend_path == "")
                 throw new IOError.NOT_SUPPORTED ("This operation cannot be cancelled by UDisks.");
             var proxy = manager?.get_interface (job.backend_path, PREFIX + "Job") as DBusProxy;
@@ -2076,7 +2451,7 @@ namespace MajorisDisks {
                         throw new IOError.FAILED ("Could not open the keyfile: " + Posix.strerror (Posix.errno));
                     var stream = new UnixInputStream (fd, true);
                     try {
-                        Posix.Stat info;
+                        Posix.Stat info = {};
                         if (Posix.fstat (fd, out info) != 0 || !Posix.S_ISREG (info.st_mode) ||
                             info.st_size <= 0 || info.st_size > max_keyfile_size)
                             throw new IOError.INVALID_ARGUMENT ("Choose a nonempty regular keyfile no larger than 8 MiB.");

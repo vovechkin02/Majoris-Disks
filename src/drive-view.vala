@@ -5,6 +5,11 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Image drive_icon;
         [GtkChild] private unowned Gtk.Button information;
         [GtkChild] private unowned Gtk.Button health;
+        [GtkChild] private unowned Gtk.Button backup_drive;
+        [GtkChild] private unowned Gtk.Button detach_image_button;
+        [GtkChild] private unowned Gtk.Button restore_drive;
+        [GtkChild] private unowned Gtk.Button backup_volume;
+        [GtkChild] private unowned Gtk.Button benchmark_button;
         [GtkChild] private unowned Gtk.MenuButton drive_actions;
         [GtkChild] private unowned Gtk.Button eject_drive;
         [GtkChild] private unowned Gtk.Button power_off_drive;
@@ -55,6 +60,10 @@ namespace MajorisDisks {
         private bool updating;
         private FilesystemUsageService usage_service = new FilesystemUsageService ();
         public signal void action_requested (StorageBlock block, string method);
+        public signal void detach_image_requested (StorageBlock block);
+        public signal void backup_requested (StorageBlock block);
+        public signal void restore_requested (StorageBlock block);
+        public signal void benchmark_requested (StorageDrive drive);
         public signal void health_requested (StorageDrive drive);
         public signal void drive_action_requested (StorageDrive drive, string action);
         public signal void drive_settings_requested (StorageDrive drive);
@@ -70,6 +79,11 @@ namespace MajorisDisks {
             information.clicked.connect (() => {
                 if (current != null) new DriveInformationDialog (current).present (this);
             });
+            detach_image_button.clicked.connect (() => { if (current?.medium != null) detach_image_requested (current.medium); });
+            backup_drive.clicked.connect (() => { if (current?.medium != null) backup_requested (current.medium); });
+            restore_drive.clicked.connect (() => { if (current?.medium != null) restore_requested (current.medium); });
+            backup_volume.clicked.connect (() => { if (selected_block != null) backup_requested (selected_block); });
+            benchmark_button.clicked.connect (() => { if (current != null) benchmark_requested (current); });
             health.clicked.connect (() => { if (current != null) health_requested (current); });
             eject_drive.clicked.connect (() => request_drive_action ("Eject"));
             power_off_drive.clicked.connect (() => request_drive_action ("PowerOff"));
@@ -161,6 +175,7 @@ namespace MajorisDisks {
             var disk = drive.medium;
             initialize_disk.visible = disk != null && disk.available && !disk.read_only && !disk.system_hint;
             summary.title = drive.name;
+            benchmark_button.visible = drive.medium != null && drive.medium.size >= 1024 * 1024;
             health.visible = drive.smart || drive.nvme_state != "";
             eject_drive.visible = drive.ejectable;
             power_off_drive.visible = drive.can_power_off;
@@ -169,10 +184,21 @@ namespace MajorisDisks {
             drive_settings.visible = drive.ata_apm_supported || drive.ata_aam_supported ||
                 drive.ata_write_cache_supported || drive.ata_read_lookahead_supported ||
                 (drive.ata_power_management && drive.rotation != 0);
-            drive_actions.visible = eject_drive.visible || power_off_drive.visible || standby_drive.visible || drive_settings.visible;
+            detach_image_button.visible = drive.medium?.loop != null;
+            backup_drive.visible = drive.medium?.size > 0;
+            restore_drive.visible = false;
+            if (disk != null && disk.available && disk.size > 0 && backend != null) {
+                var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.IMAGE_RESTORE,
+                    disk, backend.snapshot.dependencies);
+                restore_drive.visible = eligibility.allowed && !eligibility.unknown;
+            }
+            drive_actions.visible = detach_image_button.visible || backup_drive.visible || restore_drive.visible || eject_drive.visible ||
+                power_off_drive.visible || standby_drive.visible || drive_settings.visible;
             drive_icon.icon_name = drive.icon;
             summary.subtitle = drive.available ? format_size (drive.size) : "No media available";
             if (disk != null) summary.subtitle += " · " + disk.preferred;
+            if (disk?.loop != null) summary.subtitle += "\n" + disk.loop.backing_file +
+                (disk.read_only ? " · Read-only" : " · Read/write");
             if (disk?.table != null) summary.subtitle += " · " + disk.table.scheme.up ();
             StorageDevice[] ordered = {};
             if (disk != null) {
@@ -295,6 +321,7 @@ namespace MajorisDisks {
             take_ownership.visible = UDisksService.supports_ownership (target) &&
                 !StorageSafetyService.assess (target, backend?.snapshot.dependencies).system_critical;
             if (block.encrypted != null) add_volume_field ("Encryption", target == block ? "Locked" : "Unlocked");
+            backup_volume.visible = block.available && block.size > 0;
             unlock_volume.visible = block.encrypted != null && block.encrypted.mapping == null && block.available;
             lock_volume.visible = block.encrypted?.mapping != null && block.available && !block.system_hint;
             change_passphrase.visible = block.encrypted != null && block.available && !block.read_only && !block.system_hint;

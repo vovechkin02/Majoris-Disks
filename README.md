@@ -4,10 +4,10 @@ Disks is the native GTK4 and libadwaita storage inspector for Majoris. It uses t
 
 ## Build and test
 
-On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, `libblkid-dev`, and `udisks2`. The build requires libadwaita 1.5 or later.
+On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, `libblkid-dev`, `libjson-glib-dev`, and `udisks2`. The build requires libadwaita 1.5 or later.
 
 ```sh
-meson setup build
+meson setup build --prefix=/usr --sysconfdir=/etc
 meson compile -C build
 meson test -C build --print-errorlogs
 ./build/src/majoris-disks
@@ -18,6 +18,16 @@ Run as your desktop user with UDisks2 and a session Polkit agent. Discovery read
 Offline resize verification uses libblkid metadata and can request a read-only block descriptor through UDisks for protected devices. The local ext fallback uses `dumpe2fs` from `e2fsprogs`. When authoritative capacity or a known filesystem UUID cannot be verified, resize reports the unverified result.
 
 UDisks unlock supports passphrases, read-only access, and single LUKS keyfiles. VeraCrypt keyfiles and advanced credential options require a separate authorized cryptsetup backend.
+
+## Health, benchmarks, and disk images
+
+The installed desktop autostart entry starts `majoris-disks-health-monitor` independently of the Disks window. It monitors cached UDisks health data without issuing SMART refresh commands that can wake drives. Preferences in the application menu control warning, critical-failure, and failed-self-test notifications.
+
+Drive Actions offers raw backup and restoration. A raw backup of active storage may contain inconsistent data. Restoration checks the selected target, takes an exclusive UDisks descriptor, and verifies the bytes by readback before requesting a rescan. For `.img.xz` images, install `xz-utils`. Compressed restoration validates and expands the image into a temporary file before writing the target, so it requires enough temporary space for the expanded image.
+
+Disk benchmarks measure read throughput and access latency. The optional write benchmark uses a disposable scratch file in the folder you select. The application menu also creates sparse raw images and attaches raw images through UDisks.
+
+For optional VHD, VHDX, and QCOW2 inspection, creation, and conversion, install Debian's `qemu-utils` and `bubblewrap`. The sandbox needs working user namespaces. The application can attach a saved raw conversion read-only. Virtual images with external backing or data files are unsupported.
 
 ## Architecture
 

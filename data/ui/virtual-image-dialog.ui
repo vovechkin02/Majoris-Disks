@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksVirtualImageDialog" parent="AdwAlertDialog">
+    <property name="heading">Inspect and Convert Disk Image</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwActionRow"><property name="title">Image format</property>
+          <child type="suffix"><object class="GtkDropDown" id="format_choice"><property name="valign">center</property><property name="model"><object class="GtkStringList"><items><item>Raw</item><item>VHD</item><item>VHDX</item><item>QCOW2</item></items></object></property></object></child>
+        </object></child>
+        <child><object class="AdwSwitchRow" id="attach"><property name="title">Attach raw copy read-only</property></object></child>
+      </object>
+    </property>
+    <property name="close-response">cancel</property>
+    <responses>
+      <response id="cancel">Close</response>
+      <response id="convert" appearance="suggested">Convert…</response>
+    </responses>
+  </template>
+</interface>

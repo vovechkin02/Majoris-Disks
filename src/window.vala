@@ -11,6 +11,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.MenuButton jobs_button;
         private UDisksService backend = new UDisksService ();
         private string selected = "";
+        private string? requested_drive;
         private bool updating;
         private bool close_confirmed;
         private HashTable<string, StorageBlock> pending = new HashTable<string, StorageBlock> (str_hash, str_equal);
@@ -65,6 +66,10 @@ namespace MajorisDisks {
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
             drive_view.encryption_options_requested.connect (edit_encryption_options);
+            drive_view.detach_image_requested.connect (detach_image);
+            drive_view.backup_requested.connect (choose_backup);
+            drive_view.restore_requested.connect (choose_restore);
+            drive_view.benchmark_requested.connect ((drive) => new BenchmarkDialog (backend, drive).present (this));
             drive_view.health_requested.connect (show_health);
             drive_view.drive_action_requested.connect (confirm_drive_action);
             drive_view.drive_settings_requested.connect (show_drive_settings);
@@ -489,6 +494,188 @@ namespace MajorisDisks {
             DBusError.strip_remote_error (error);
             return "UDisks could not complete the operation. " + error.message;
         }
+        internal void choose_attach_image () {
+            var chooser = new Gtk.FileDialog () { title = "Select a Raw Disk Image" };
+            chooser.open.begin (this, null, (object, result) => {
+                File file;
+                try { file = chooser.open.end (result); } catch (Error error) { return; }
+                var confirmation = new DiskImageConfirmation () {
+                    heading = "Attach Disk Image?",
+                    body = file.get_parse_name () + "\n\nRead/write access allows changes to the image file."
+                };
+                confirmation.set_response_label ("proceed", "Attach Read-Only");
+                confirmation.set_response_appearance ("proceed", Adw.ResponseAppearance.SUGGESTED);
+                confirmation.add_response ("writable", "Attach Read/Write");
+                confirmation.response.connect ((response) => {
+                    if (response == "proceed" || response == "writable") attach_image (file, response == "proceed");
+                });
+                confirmation.present (this);
+            });
+        }
+
+        private void attach_image (File file, bool read_only) {
+            backend.attach_disk_image.begin (file, read_only, (object, result) => {
+                try {
+                    select_drive ("session:" + backend.attach_disk_image.end (result));
+                    notifications.add_toast (new Adw.Toast ("Disk image attached"));
+                } catch (Error error) { show_check_message ("Could not attach disk image", error.message); }
+            });
+        }
+
+        internal void choose_virtual_image () {
+            var chooser = new Gtk.FileDialog () { title = "Inspect a Disk Image" };
+            chooser.open.begin (this, null, (object, result) => {
+                File source;
+                try { source = chooser.open.end (result); } catch (Error error) { return; }
+                VirtualDisk.inspect.begin (source, new Cancellable (), (object, inspected) => {
+                    try {
+                        var info = VirtualDisk.inspect.end (inspected);
+                        var dialog = new VirtualImageDialog () {
+                            body = "%s\nFormat: %s\nVirtual capacity: %s\nFile size: %s\n\nThe original image is preserved. A raw copy can be attached read-only.".printf (
+                                source.get_parse_name (), info.format, format_size (info.capacity), format_size (info.file_size))
+                        };
+                        dialog.response.connect ((response) => {
+                            if (response != "convert") return;
+                            string format = dialog.format;
+                            bool attach = dialog.attach_copy;
+                            var save = new Gtk.FileDialog () { title = "Save Converted Image",
+                                initial_name = "Converted" + image_extension (format) };
+                            save.save.begin (this, null, (object, saved) => {
+                                File target;
+                                try { target = save.save.end (saved); } catch (Error error) { return; }
+                                write_virtual_image (source, target, format, 0, attach);
+                            });
+                        });
+                        dialog.present (this);
+                    } catch (Error error) { show_check_message ("Could not inspect the image", error.message); }
+                });
+            });
+        }
+
+        private static string image_extension (string format) {
+            return format == "raw" ? ".img" : format == "vpc" ? ".vhd" : "." + format;
+        }
+
+        private void write_virtual_image (File? source, File destination, string format, uint64 size, bool attach) {
+            var job = backend.jobs.begin_named (source == null ? "Create virtual disk" : "Convert disk image",
+                destination.get_parse_name (), {});
+            job.cancelable = true;
+            backend.jobs.phase (job, StorageJobState.RUNNING, source == null ? "Creating image" : "Converting image");
+            VirtualDisk.write_image.begin (source, destination, format, size, job.cancellable, (object, result) => {
+                var outcome = new StorageOperationResult ();
+                try {
+                    VirtualDisk.write_image.end (result);
+                    outcome.successful = true;
+                    outcome.summary = source == null ? "Virtual disk created" : "Disk image converted";
+                    notifications.add_toast (new Adw.Toast (outcome.summary));
+                    if (attach && format == "raw") attach_image (destination, true);
+                } catch (Error error) {
+                    outcome.fail ("Could not write the virtual image", error);
+                    show_check_message (outcome.summary, error.message);
+                }
+                backend.jobs.finish (job, outcome);
+            });
+        }
+
+        internal void choose_blank_image () {
+            var setup = new BlankDiskImageDialog ();
+            setup.response.connect ((response) => {
+                if (response != "create") return;
+                uint64 size = setup.bytes;
+                bool attach = setup.attach_after;
+                string format = setup.format;
+                var chooser = new Gtk.FileDialog () { title = "Save Blank Disk Image", initial_name = "Blank" + image_extension (format) };
+                chooser.save.begin (this, null, (object, result) => {
+                    File file;
+                    try { file = chooser.save.end (result); } catch (Error error) { return; }
+                    if (format != "raw") {
+                        write_virtual_image (null, file, format, size, false);
+                        return;
+                    }
+                    DiskImageCopy.create_blank.begin (file, size, null, (object, outcome) => {
+                        try {
+                            DiskImageCopy.create_blank.end (outcome);
+                            notifications.add_toast (new Adw.Toast ("Blank disk image created"));
+                            if (attach) attach_image (file, false);
+                        } catch (Error error) { show_check_message ("Could not create blank image", error.message); }
+                    });
+                });
+            });
+            setup.present (this);
+        }
+
+        private void detach_image (StorageBlock block) {
+            backend.detach_disk_image.begin (block, (object, result) => {
+                try {
+                    backend.detach_disk_image.end (result);
+                    notifications.add_toast (new Adw.Toast ("Disk image detached"));
+                } catch (Error error) { show_check_message ("Could not detach image", error.message); }
+            });
+        }
+
+        private void choose_backup (StorageBlock block) {
+            string identity = backend.modification_identity (block);
+            var chooser = new Gtk.FileDialog () {
+                title = "Save Raw Disk Image",
+                initial_name = Path.get_basename (block.preferred) + (block.physical_drive?.optical == true ? ".iso" : ".img")
+            };
+            chooser.save.begin (this, null, (object, result) => {
+                File destination;
+                try { destination = chooser.save.end (result); } catch (Error error) { return; }
+                var confirmation = new DiskImageConfirmation () {
+                    heading = "Create Disk Image?",
+                    body = "%s · %s\n%s\n\nIf the source is in use, files can change while the image is copied.".printf (
+                        block.preferred, format_size (block.size), destination.get_parse_name ())
+                };
+                confirmation.set_response_label ("proceed", "Create Image");
+                confirmation.response.connect ((response) => {
+                    if (response != "proceed") return;
+                    backend.create_disk_image.begin (block, destination, identity, (object, outcome) => {
+                        try {
+                            backend.create_disk_image.end (outcome);
+                            notifications.add_toast (new Adw.Toast ("Disk image created"));
+                        } catch (Error error) { show_check_message ("Could not create disk image", error.message); }
+                    });
+                });
+                confirmation.present (this);
+            });
+        }
+
+        private void choose_restore (StorageBlock block) {
+            string identity = backend.modification_identity (block);
+            var chooser = new Gtk.FileDialog () { title = "Select Disk Image to Restore" };
+            chooser.open.begin (this, null, (object, result) => {
+                File source;
+                try { source = chooser.open.end (result); } catch (Error error) { return; }
+                var details = new StringBuilder ();
+                foreach (var node in backend.snapshot.dependencies.descendants (block)) {
+                    var child = node as StorageBlock;
+                    if (child == null || child == block) continue;
+                    details.append ("\n").append (child.preferred).append (" · ").append (format_size (child.size));
+                }
+                var drive = block.physical_drive;
+                var confirmation = new DiskImageConfirmation () {
+                    heading = "Overwrite the selected device?",
+                    body = "%s\n\nTarget: %s · %s · %s\nSerial: %s\nWWN: %s%s\n\nRestoring this image overwrites existing data.".printf (
+                        source.get_parse_name (), block.preferred, drive?.model ?? "Storage device",
+                        format_size (block.size), drive?.serial ?? "", drive?.wwn ?? "", details.str)
+                };
+                confirmation.set_response_label ("proceed", "Restore Image");
+                confirmation.set_response_appearance ("proceed", Adw.ResponseAppearance.DESTRUCTIVE);
+                confirmation.response.connect ((response) => {
+                    if (response != "proceed") return;
+                    backend.restore_disk_image.begin (block, source, identity, (object, outcome) => {
+                        try {
+                            var restored = backend.restore_disk_image.end (outcome);
+                            if (restored.successful) notifications.add_toast (new Adw.Toast (restored.summary));
+                            else show_check_message ("Disk image restoration", operation_result_details (restored));
+                        } catch (Error error) { show_check_message ("Could not restore disk image", error.message); }
+                    });
+                });
+                confirmation.present (this);
+            });
+        }
+
         private void refresh () {
             refresh_button.sensitive = false;
             backend.refresh.begin ((obj, result) => {
@@ -502,6 +689,11 @@ namespace MajorisDisks {
             });
         }
 
+        internal void select_drive (string identity) {
+            requested_drive = identity;
+            update_devices ();
+        }
+
         private void update_devices () {
             updating = true;
             DeviceRow? chosen = null;
@@ -509,6 +701,16 @@ namespace MajorisDisks {
                 var row = (DeviceRow) sidebar.get_row_at_index (i);
                 row.update ();
                 if (row.drive.path == selected) chosen = row;
+            }
+            if (requested_drive != null) {
+                for (int i = 0; i < backend.snapshot.devices.get_n_items (); i++) {
+                    var row = (DeviceRow) sidebar.get_row_at_index (i);
+                    if (DriveHealth.identity (row.drive) != requested_drive) continue;
+                    chosen = row;
+                    requested_drive = null;
+                    split.show_content = true;
+                    break;
+                }
             }
             if (chosen == null) chosen = sidebar.get_row_at_index (0) as DeviceRow;
             sidebar.invalidate_headers ();
@@ -598,6 +800,46 @@ namespace MajorisDisks {
             set_response_enabled ("apply", valid);
         }
     }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/virtual-image-dialog.ui")]
+    internal class VirtualImageDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Gtk.DropDown format_choice;
+        [GtkChild] private unowned Adw.SwitchRow attach;
+        public string format { owned get { return disk_image_format (format_choice.selected); } }
+        public bool attach_copy { get { return format_choice.selected == 0 && attach.active; } }
+
+        construct {
+            format_choice.notify["selected"].connect (() => { attach.sensitive = format_choice.selected == 0; });
+        }
+    }
+
+    internal string disk_image_format (uint choice) {
+        switch (choice) {
+            case 1: return "vpc";
+            case 2: return "vhdx";
+            case 3: return "qcow2";
+            default: return "raw";
+        }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/create-blank-image-dialog.ui")]
+    internal class BlankDiskImageDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Gtk.SpinButton size;
+        [GtkChild] private unowned Gtk.DropDown unit;
+        [GtkChild] private unowned Adw.SwitchRow attach;
+        [GtkChild] private unowned Gtk.DropDown format_choice;
+        public string format { owned get { return disk_image_format (format_choice.selected); } }
+        public uint64 bytes { get { return (uint64) size.get_value_as_int () * (unit.selected == 0 ? 1048576 : 1073741824); } }
+        public bool attach_after { get { return format_choice.selected == 0 && attach.active; } }
+
+        construct {
+            format_choice.sensitive = VirtualDisk.available ();
+            format_choice.notify["selected"].connect (() => { attach.sensitive = format_choice.selected == 0; });
+        }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/disk-image-confirmation.ui")]
+    internal class DiskImageConfirmation : Adw.AlertDialog {}
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/unlock-volume-dialog.ui")]
     public class UnlockVolumeDialog : Adw.AlertDialog {

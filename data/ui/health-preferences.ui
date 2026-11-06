@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksHealthPreferences" parent="AdwPreferencesDialog">
+    <property name="title">Preferences</property>
+    <child>
+      <object class="AdwPreferencesPage">
+        <child>
+          <object class="AdwPreferencesGroup">
+            <property name="title">Drive health notifications</property>
+            <child><object class="AdwSwitchRow" id="warnings"><property name="title">Drive-health warnings</property></object></child>
+            <child><object class="AdwSwitchRow" id="critical"><property name="title">Critical drive failures</property></object></child>
+            <child><object class="AdwSwitchRow" id="self_tests"><property name="title">Failed self-tests</property></object></child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </template>
+</interface>

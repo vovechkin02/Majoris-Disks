@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="com.majoris.disks.health" path="/com/majoris/disks/health/">
+    <key name="warnings" type="b"><default>true</default><summary>Drive-health warnings</summary></key>
+    <key name="critical" type="b"><default>true</default><summary>Critical drive failures</summary></key>
+    <key name="self-tests" type="b"><default>true</default><summary>Failed drive self-tests</summary></key>
+  </schema>
+</schemalist>

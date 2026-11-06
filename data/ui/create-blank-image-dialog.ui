@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksBlankDiskImageDialog" parent="AdwAlertDialog">
+    <property name="heading">Create Blank Disk Image</property>
+    <property name="body">Choose the virtual capacity of the new sparse raw image.</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwActionRow"><property name="title">Image format</property>
+          <child type="suffix"><object class="GtkDropDown" id="format_choice"><property name="valign">center</property><property name="model"><object class="GtkStringList"><items><item>Raw</item><item>VHD</item><item>VHDX</item><item>QCOW2</item></items></object></property></object></child>
+        </object></child>
+        <child><object class="AdwActionRow"><property name="title">Virtual capacity</property>
+          <child type="suffix"><object class="GtkSpinButton" id="size"><property name="valign">center</property>
+            <property name="adjustment"><object class="GtkAdjustment"><property name="lower">1</property><property name="upper">1048576</property><property name="step-increment">1</property><property name="value">64</property></object></property>
+          </object></child>
+          <child type="suffix"><object class="GtkDropDown" id="unit"><property name="valign">center</property>
+            <property name="model"><object class="GtkStringList"><items><item>MiB</item><item>GiB</item></items></object></property>
+          </object></child>
+        </object></child>
+        <child><object class="AdwSwitchRow" id="attach"><property name="title">Attach after creation</property><property name="subtitle">Open the new image read/write</property></object></child>
+      </object>
+    </property>
+    <property name="default-response">create</property>
+    <property name="close-response">cancel</property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="create" appearance="suggested">Choose Destination</response>
+    </responses>
+  </template>
+</interface>
