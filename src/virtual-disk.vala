@@ -24,9 +24,14 @@ namespace MajorisDisks {
                 "--clearenv", "--setenv", "LC_ALL", "C", "--ro-bind", "/usr", "/usr",
                 "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
                 "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/" };
+            var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_PIPE |
+                (progress == null ? SubprocessFlags.STDERR_PIPE : SubprocessFlags.STDERR_MERGE));
             if (input >= 0) {
-                argv += "--ro-bind";
-                argv += "/proc/%d/fd/%d".printf (Posix.getpid (), input);
+                int descriptor = Posix.dup (input);
+                if (descriptor < 0) throw new IOError.FAILED ("Could not duplicate the selected image descriptor.");
+                launcher.take_fd (descriptor, 3);
+                argv += "--ro-bind-fd";
+                argv += "3";
                 argv += "/source";
             }
             if (output_directory != null) {
@@ -37,8 +42,7 @@ namespace MajorisDisks {
             argv += "--";
             argv += "/usr/bin/qemu-img";
             foreach (var argument in arguments) argv += argument;
-            var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE |
-                (progress == null ? SubprocessFlags.STDERR_PIPE : SubprocessFlags.STDERR_MERGE));
+            var process = launcher.spawnv (argv);
             string? output, diagnostic;
             try {
                 if (progress == null)

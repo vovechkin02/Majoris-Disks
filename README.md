@@ -27,7 +27,7 @@ Drive Actions offers raw backup and restoration. A raw backup of active storage 
 
 Disk benchmarks measure read throughput and access latency. The optional write benchmark uses a disposable scratch file in the folder you select. The application menu also creates sparse raw images and attaches raw images through UDisks.
 
-For optional VHD, VHDX, and QCOW2 inspection, creation, and conversion, install Debian's `qemu-utils` and `bubblewrap`. The sandbox needs working user namespaces. The application can attach a saved raw conversion read-only. Virtual images with external backing or data files are unsupported.
+For optional VHD, VHDX, and QCOW2 inspection, creation, and conversion, install Debian's `qemu-utils` and a version of `bubblewrap` supporting `--ro-bind-fd`. The sandbox needs working user namespaces. The application can attach a saved raw conversion read-only. Virtual images with external backing or data files are unsupported.
 
 ## Architecture
 

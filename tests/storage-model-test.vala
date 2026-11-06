@@ -931,6 +931,14 @@ private async void exercise_image_workflows () throws Error {
 
         var measured = yield DiskBenchmark.measure (input, 2097152, 512, 4, 4096, jobs, job);
         assert (measured.throughput.length == 4 && measured.latency.length == 4);
+        var aligned = yield DiskBenchmark.measure (input, 2097152, 4096, 4, 4096, jobs, job);
+        assert (aligned.throughput.length == 4 && aligned.latency.length == 4);
+        assert (DiskBenchmark.position (2097152, 4096, 4096, 2, 4) % 4096 == 0);
+        double scratch_rate = yield DiskBenchmark.scratch_write (File.new_for_path (directory), 4096, jobs);
+        assert (scratch_rate > 0);
+        var files = Dir.open (directory);
+        string? name;
+        while ((name = files.read_name ()) != null) assert (!name.has_prefix (".majoris-benchmark-"));
         assert (BenchmarkResult.average (measured.throughput) > 0);
         assert (DiskBenchmark.position (2097152, 4096, 512, 0, 4) == 0);
         assert (DiskBenchmark.position (2097152, 4096, 512, 3, 4) == 2097152 - 4096);
@@ -1122,6 +1130,55 @@ private void test_image_workflows () {
     loop.run ();
 }
 
+private async void exercise_image_descriptor_sandbox () throws Error {
+    if (!FileUtils.test ("/usr/bin/bwrap", FileTest.IS_EXECUTABLE)) {
+        Test.skip ("Bubblewrap is unavailable");
+        return;
+    }
+    var probe = new Subprocess.newv ({ "/usr/bin/bwrap", "--unshare-all", "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64", "/usr/bin/true" },
+        SubprocessFlags.STDERR_SILENCE);
+    yield probe.wait_async ();
+    if (!probe.get_successful ()) {
+        Test.skip ("User namespaces are unavailable");
+        return;
+    }
+    FileIOStream stream;
+    var fixture = File.new_tmp ("majoris-sandbox-XXXXXX", out stream);
+    try {
+        size_t written;
+        stream.output_stream.write_all ("descriptor-bound image".data, out written);
+        var input = stream.input_stream as FileDescriptorBased;
+        assert (input != null);
+        int fd = Posix.dup (input.get_fd ());
+        assert (fd >= 0);
+        var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+        launcher.take_fd (fd, 3);
+        var child = launcher.spawnv ({ "/usr/bin/bwrap", "--unshare-all", "--die-with-parent",
+            "--ro-bind", "/usr", "/usr", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
+            "--ro-bind-fd", "3", "/source", "--", "/usr/bin/cat", "/source" });
+        string? output, diagnostic;
+        yield child.communicate_utf8_async (null, null, out output, out diagnostic);
+        if (!child.get_successful ())
+            throw new IOError.FAILED (diagnostic ?? "The sandbox descriptor probe failed.");
+        assert (output == "descriptor-bound image");
+    } finally {
+        try { stream.close (); fixture.delete (); }
+        catch (Error error) { warning ("Could not clean up the sandbox fixture: %s", error.message); }
+    }
+}
+
+private void test_image_descriptor_sandbox () {
+    var loop = new MainLoop ();
+    bool finished = false;
+    exercise_image_descriptor_sandbox.begin ((object, result) => {
+        try { exercise_image_descriptor_sandbox.end (result); } catch (Error error) { GLib.error ("%s", error.message); }
+        finished = true;
+        loop.quit ();
+    });
+    if (!finished) loop.run ();
+}
+
 private async void exercise_virtual_images () throws Error {
     if (!VirtualDisk.available ()) {
         Test.skip ("qemu-utils or bubblewrap is unavailable");
@@ -1212,6 +1269,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/mount-option-normalization", test_mount_option_normalization);
     Test.add_func ("/operations/mock-dbus-capability", test_mock_capability_query);
     Test.add_func ("/features/drive-health", test_health_problem_assessment);
+    Test.add_func ("/features/virtual-image-descriptor-sandbox", test_image_descriptor_sandbox);
     Test.add_func ("/features/virtual-images", test_virtual_workflows);
     Test.add_func ("/features/mock-restore-rescan", test_mock_rescan);
     Test.add_func ("/features/restore-failure-classification", test_restore_failure_classification);

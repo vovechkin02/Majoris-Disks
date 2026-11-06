@@ -42,13 +42,21 @@ majoris_xz_decode (GInputStream *input, GOutputStream *output, guint64 limit,
                                  "The decompressed image exceeds the permitted size.");
             goto done;
         }
-        if (output != NULL && count != 0 &&
-            !g_output_stream_write_all (output, expanded, count, NULL, cancellable, error))
-            goto done;
+        gboolean first_write = output != NULL && produced == 0 && count != 0;
+        if (output != NULL && count != 0) {
+            gsize written = 0;
+            if (!g_output_stream_write_all (output, expanded, count, &written, cancellable, error)) {
+                *size = produced + written;
+                if (progress != NULL && written != 0)
+                    progress (decoder.total_in, *size, progress_data);
+                goto done;
+            }
+            *size = produced + written;
+        }
         g_checksum_update (hash, expanded, count);
         produced += count;
         gint64 now = g_get_monotonic_time ();
-        if (progress != NULL && (now - last_update >= 200000 || status == LZMA_STREAM_END)) {
+        if (progress != NULL && (first_write || now - last_update >= 200000 || status == LZMA_STREAM_END)) {
             progress (decoder.total_in, produced, progress_data);
             last_update = now;
         }

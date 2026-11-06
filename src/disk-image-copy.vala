@@ -107,7 +107,8 @@ namespace MajorisDisks {
         }
 
         public static async XzImage decode_xz (int input, OutputStream? output, uint64 limit,
-            Cancellable token, StorageJobManager? jobs = null, StorageJob? job = null) throws Error {
+            Cancellable token, StorageJobManager? jobs = null, StorageJob? job = null,
+            ImageWriteState? state = null) throws Error {
             var context = MainContext.ref_thread_default ();
             var decoded = new XzImage ();
             Error? failure = null;
@@ -116,6 +117,8 @@ namespace MajorisDisks {
                     var stream = new UnixInputStream (input, false);
                     int64 started = get_monotonic_time ();
                     decode_xz_native (stream, output, limit, token, (compressed, expanded) => {
+                        if (state != null && output != null && expanded > 0)
+                            state.phase = ImageWritePhase.WRITING;
                         if (jobs == null || job == null) return;
                         uint64 rate = (uint64) (expanded * 1000000.0 /
                             int64.max (1, get_monotonic_time () - started));

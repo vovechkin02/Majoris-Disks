@@ -19,6 +19,9 @@ subdir('src')
 layout_test = executable('storage-model-test', 'tests/storage-model-test.vala', 'tests/mock-open-device.c',
   storage_model_sources, 'src/virtual-disk.vala', include_directories: [include_directories('tests'), xz_include], dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
 sh = find_program('sh')
+native_xz_test = executable('native-xz-test', 'tests/xz-stream-test.c', 'src/xz-stream.c',
+  include_directories: xz_include, dependencies: [dependency('gio-2.0'), xz_dep])
+test('native-xz', native_xz_test)
 test('storage-model', layout_test)
 test('filesystem-capacity-integration', sh,
   args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test])

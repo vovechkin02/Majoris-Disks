@@ -524,6 +524,8 @@ namespace MajorisDisks {
                 int expected = mode == "r" ? Posix.O_RDONLY : Posix.O_RDWR;
                 if (access < 0 || (access & Posix.O_ACCMODE) != expected)
                     throw new IOError.INVALID_DATA ("The returned descriptor has unexpected access permissions.");
+                if ((flags & DIRECT_IO) != 0 && (access & DIRECT_IO) == 0)
+                    throw new IOError.NOT_SUPPORTED ("UDisks did not provide a direct-I/O descriptor. Use Buffered I/O for this device.");
                 synchronize ();
                 if (require_volume (block, "Block") != proxy || modification_identity (block) != identity)
                     throw new IOError.NOT_FOUND ("The selected block device changed.");
@@ -730,9 +732,8 @@ namespace MajorisDisks {
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.RUNNING, "Writing the verified image");
                 if (preflight != null) {
-                    state.phase = ImageWritePhase.WRITING;
                     var output = new UnixOutputStream (target, false);
-                    var decoded = yield DiskImageCopy.decode_xz (input, output, bytes, token, jobs, job);
+                    var decoded = yield DiskImageCopy.decode_xz (input, output, bytes, token, jobs, job, state);
                     yield DiskImageCopy.verify_streamed_write (target, decoded, preflight, jobs, job, state);
                 } else {
                     yield DiskImageCopy.copy (input, target, bytes, jobs, job, true, state);
@@ -744,7 +745,7 @@ namespace MajorisDisks {
                 state.descriptor_closed = true;
                 state.phase = ImageWritePhase.RESCANNING;
                 job.cancelable = false;
-                jobs.phase (job, StorageJobState.FINALIZING, "Refreshing the partition table");
+                jobs.phase (job, StorageJobState.FINALIZING, "Refreshing target storage metadata");
                 var proxy = require_volume (block, "Block");
                 yield state.rescan (proxy, lifetime);
                 synchronize ();
