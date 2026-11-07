@@ -4,13 +4,15 @@
     <property name="extra-child">
       <object class="AdwPreferencesGroup">
         <child><object class="AdwComboRow" id="subvolumes"><property name="title">Subvolume</property></object></child>
-        <child><object class="AdwEntryRow" id="new_subvolume"><property name="title">New top-level subvolume name</property></object></child>
+        <child><object class="AdwEntryRow" id="new_subvolume"><property name="title">New top-level name</property></object></child>
+        <child><object class="AdwSwitchRow" id="snapshot_read_only"><property name="title">Read-only snapshot</property><property name="active">true</property></object></child>
       </object>
     </property>
     <responses>
       <response id="close">Close</response>
       <response id="apply" appearance="suggested">Set Default</response>
       <response id="create">Create Subvolume</response>
+      <response id="snapshot">Snapshot Selected</response>
     </responses>
     <property name="default-response">close</property>
     <property name="close-response">close</property>

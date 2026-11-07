@@ -75,8 +75,11 @@ namespace MajorisDisks {
             drive_view.ownership_requested.connect (confirm_ownership);
             drive_view.label_requested.connect (edit_filesystem_label);
             drive_view.lvm_rename_requested.connect (rename_logical_volume);
+            drive_view.lvm_manage_requested.connect (manage_logical_volumes);
+            drive_view.lvm_add_member_requested.connect (add_lvm_physical_volume);
             drive_view.lvm_create_requested.connect (create_logical_volume);
             drive_view.raid_check_requested.connect (start_raid_check);
+            drive_view.raid_member_requested.connect (manage_raid_member);
             drive_view.raid_power_requested.connect (confirm_raid_power);
             drive_view.btrfs_subvolumes_requested.connect (list_btrfs_subvolumes);
             drive_view.mount_options_requested.connect (edit_mount_options);
@@ -210,6 +213,50 @@ namespace MajorisDisks {
             dialog.present (this);
         }
 
+        private void manage_raid_member (StorageBlock block, bool add) {
+            string identity = backend.modification_identity (block);
+            if (add) {
+                var picker = new CreateStorageGroupDialog (backend, false, true);
+                picker.response.connect ((choice) => {
+                    if (choice != "create") return;
+                    string[] identities;
+                    var members = picker.selected_members (out identities);
+                    if (members.length == 1) change_raid_member (block, members[0], true, identity, identities[0]);
+                });
+                picker.present (this);
+            } else {
+                StorageBlock? array = null;
+                foreach (var candidate in backend.snapshot.blocks.get_values ())
+                    if (candidate.raid != null && candidate.raid == block.raid_membership) array = candidate;
+                if (array == null) return;
+                var anchor = array;
+                string array_identity = backend.modification_identity (anchor);
+                var confirm = new HardwareActionConfirmationDialog () {
+                    heading = "Remove RAID Spare?",
+                    body = "Remove %s from the array. Its RAID metadata will be retained.".printf (block.preferred)
+                };
+                confirm.response.connect ((choice) => {
+                    if (choice == "continue") change_raid_member (anchor, block, false, array_identity, identity);
+                });
+                confirm.present (this);
+            }
+        }
+
+        private void change_raid_member (StorageBlock anchor, StorageBlock member, bool add,
+            string anchor_identity, string member_identity) {
+            if (pending.contains (anchor.path)) return;
+            pending.insert (anchor.path, anchor);
+            backend.change_raid_member.begin (anchor, member, add, anchor_identity, member_identity, (object, result) => {
+                pending.remove (anchor.path);
+                try {
+                    backend.change_raid_member.end (result);
+                    notifications.add_toast (new Adw.Toast (add ? "RAID member added" : "RAID spare removed"));
+                } catch (Error error) {
+                    show_check_message ("Could not confirm the RAID member change", operation_error (error));
+                }
+            });
+        }
+
         private void start_raid_check (StorageBlock block) {
             if (pending.contains (block.path)) return;
             pending.insert (block.path, block);
@@ -231,15 +278,18 @@ namespace MajorisDisks {
                     var dialog = new BtrfsSubvolumesDialog (entries, !block.read_only && !block.system_hint);
                     dialog.response.connect ((response) => {
                         if (pending.contains (block.path)) return;
-                        if (response == "create") {
+                        if (response == "create" || response == "snapshot") {
+                            var source = response == "snapshot" ? dialog.snapshot_source : null;
+                            if (response == "snapshot" && source == null) return;
                             pending.insert (block.path, block);
-                            backend.create_btrfs_subvolume.begin (block, dialog.new_name, identity, (object, created) => {
+                            backend.create_btrfs_subvolume.begin (block, dialog.new_name, identity,
+                                source, dialog.read_only_snapshot, (object, created) => {
                                 pending.remove (block.path);
                                 try {
                                     backend.create_btrfs_subvolume.end (created);
-                                    notifications.add_toast (new Adw.Toast ("Btrfs subvolume created"));
+                                    notifications.add_toast (new Adw.Toast (source == null ? "Btrfs subvolume created" : "Btrfs snapshot created"));
                                 } catch (Error error) {
-                                    show_check_message ("Could not create the Btrfs subvolume", operation_error (error));
+                                    show_check_message ("Could not confirm Btrfs creation", operation_error (error));
                                 }
                             });
                             return;
@@ -307,6 +357,71 @@ namespace MajorisDisks {
                 });
             });
             dialog.present (this);
+        }
+
+        private void add_lvm_physical_volume (StorageBlock context) {
+            string identity = backend.modification_identity (context);
+            var picker = new CreateStorageGroupDialog (backend, false, true, "Add Physical Volume");
+            picker.response.connect ((choice) => {
+                if (choice != "create" || pending.contains (context.path)) return;
+                string[] identities;
+                var members = picker.selected_members (out identities);
+                if (members.length != 1) return;
+                pending.insert (context.path, context);
+                backend.add_lvm_physical_volume.begin (context, members[0], identity, identities[0], (object, result) => {
+                    pending.remove (context.path);
+                    try {
+                        backend.add_lvm_physical_volume.end (result);
+                        notifications.add_toast (new Adw.Toast ("Physical volume added"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm physical-volume addition", operation_error (error));
+                    }
+                });
+            });
+            picker.present (this);
+        }
+
+        private void manage_logical_volumes (StorageBlock context) {
+            string identity = backend.modification_identity (context);
+            var dialog = new LvmLifecycleDialog (backend.logical_volumes_for (context), context.logical_volume?.path ?? "/");
+            dialog.response.connect ((response) => {
+                var volume = dialog.selection;
+                if (volume == null || response == "close") return;
+                string path = volume.path;
+                string uuid = volume.uuid;
+                if (response == "delete") {
+                    var confirm = new HardwareActionConfirmationDialog () {
+                        heading = "Delete Logical Volume?",
+                        body = "All data in %s will be permanently lost.".printf (volume.name)
+                    };
+                    confirm.response.connect ((choice) => {
+                        if (choice == "continue") change_logical_volume_state (context, path, uuid, identity, "Delete");
+                    });
+                    confirm.present (this);
+                } else {
+                    change_logical_volume_state (context, path, uuid, identity,
+                        response == "activate" ? "Activate" : "Deactivate");
+                }
+            });
+            dialog.present (this);
+        }
+
+        private void change_logical_volume_state (StorageBlock context, string path, string uuid,
+            string identity, string method) {
+            if (pending.contains (context.path)) return;
+            pending.insert (context.path, context);
+            backend.change_logical_volume_state.begin (context, path, uuid, identity, method, (object, result) => {
+                pending.remove (context.path);
+                try {
+                    string block = backend.change_logical_volume_state.end (result);
+                    if (block != "") selected = block;
+                    update_devices ();
+                    notifications.add_toast (new Adw.Toast (method == "Activate" ? "Logical volume activated" :
+                        method == "Deactivate" ? "Logical volume deactivated" : "Logical volume deleted"));
+                } catch (Error error) {
+                    show_check_message ("Could not confirm the logical-volume operation", operation_error (error));
+                }
+            });
         }
 
         private void rename_logical_volume (StorageBlock block) {
@@ -1456,6 +1571,12 @@ namespace MajorisDisks {
     internal class BtrfsSubvolumesDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.ComboRow subvolumes;
         [GtkChild] private unowned Adw.EntryRow new_subvolume;
+        [GtkChild] private unowned Adw.SwitchRow snapshot_read_only;
+        private BtrfsSubvolume?[] sources = { null };
+        public bool read_only_snapshot { get { return snapshot_read_only.active; } }
+        public unowned BtrfsSubvolume? snapshot_source {
+            get { return subvolumes.selected < sources.length ? sources[subvolumes.selected] : null; }
+        }
         public string new_name { owned get { return new_subvolume.text; } }
         private uint64[] ids = { 5 };
         public uint selected_id { get { return (uint) ids[subvolumes.selected]; } }
@@ -1468,6 +1589,7 @@ namespace MajorisDisks {
                 if (entry.id == 5) continue;
                 if (info.default_known && entry.id == info.default_id) selected = ids.length;
                 ids += entry.id;
+                sources += entry;
                 labels.append ("%s · ID %s · parent %s%s".printf (entry.path, entry.id.to_string (),
                     entry.parent_id.to_string (), entry.snapshot ? " · Snapshot" : ""));
             }
@@ -1478,15 +1600,24 @@ namespace MajorisDisks {
                 : info.default_unavailable != "" ? info.default_unavailable : "The default subvolume could not be read.";
             set_response_enabled ("apply", false);
             new_subvolume.visible = can_change;
+            snapshot_read_only.visible = can_change;
             set_response_enabled ("create", false);
-            new_subvolume.changed.connect (() => {
-                set_response_enabled ("create", can_change && UDisksService.valid_btrfs_leaf (new_name));
-            });
+            set_response_enabled ("snapshot", false);
+            new_subvolume.changed.connect (() => update_create_responses (can_change));
             subvolumes.notify["selected"].connect (() => {
+                update_create_responses (can_change);
                 uint index = subvolumes.selected;
                 set_response_enabled ("apply", can_change && info.default_known && index < ids.length &&
                     ids[index] <= uint.MAX && ids[index] != info.default_id);
             });
+        }
+
+        private void update_create_responses (bool can_change) {
+            bool valid = can_change && UDisksService.valid_btrfs_leaf (new_name);
+            var source = snapshot_source;
+            set_response_enabled ("create", valid);
+            set_response_enabled ("snapshot", valid && source != null && source.parent_id == 5 &&
+                UDisksService.valid_btrfs_leaf (source.path) && source.path != new_name);
         }
     }
 
@@ -1502,6 +1633,7 @@ namespace MajorisDisks {
         private string[] candidate_identities = {};
         private Gtk.CheckButton[] checks = {};
         private bool raid;
+        private bool single_member;
         public string group_name { owned get { return name_entry.text; } }
         public string level { owned get {
             string[] levels = { "raid0", "raid1", "raid4", "raid5", "raid6", "raid10" };
@@ -1512,11 +1644,19 @@ namespace MajorisDisks {
             return raid && level != "raid1" ? sizes[uint.min (chunk_size.selected, 4)] : 0;
         } }
 
-        public CreateStorageGroupDialog (UDisksService backend, bool raid) {
+        public CreateStorageGroupDialog (UDisksService backend, bool raid, bool single_member = false, string member_heading = "Add RAID Member") {
             this.raid = raid;
+            this.single_member = single_member;
             heading = raid ? "Create RAID Array" : "Create LVM Volume Group";
             body = "Choose unused devices. Creation erases every selected device.";
             raid_level.visible = raid;
+            if (single_member) {
+                heading = member_heading;
+                body = "Select one unused device. Adding it can overwrite its contents.";
+                name_entry.visible = false;
+                estimate.visible = false;
+                set_response_label ("create", "Add");
+            }
             foreach (var block in backend.snapshot.blocks.get_values ()) {
                 if (!backend.can_use_group_member (block)) continue;
                 candidates += block;
@@ -1565,6 +1705,10 @@ namespace MajorisDisks {
             }
             estimate.subtitle = members.length >= minimum ? format_size (capacity) :
                 "Select at least %u devices.".printf (minimum);
+            if (single_member) {
+                set_response_enabled ("create", erase.active && members.length == 1);
+                return;
+            }
             set_response_enabled ("create", erase.active && members.length >= minimum &&
                 UDisksService.valid_lvm_name (group_name) && (!raid || group_name.length <= 32) &&
                 (level != "raid10" || members.length % 2 == 0));
@@ -1612,6 +1756,38 @@ namespace MajorisDisks {
                 !(volume_name in used_names));
         }
     }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-lifecycle-dialog.ui")]
+    internal class LvmLifecycleDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow volumes;
+        private StorageLogicalVolume[] entries;
+        public unowned StorageLogicalVolume? selection {
+            get { return volumes.selected < entries.length ? entries[volumes.selected] : null; }
+        }
+
+        public LvmLifecycleDialog (StorageLogicalVolume[] entries, string preferred) {
+            this.entries = entries;
+            var labels = new Gtk.StringList (null);
+            uint index = 0;
+            foreach (var volume in entries) {
+                if (volume.path == preferred) index = labels.get_n_items ();
+                labels.append ("%s · %s · %s".printf (volume.name, format_size (volume.size),
+                    volume.active ? "Active" : "Inactive"));
+            }
+            volumes.model = labels;
+            if (entries.length > 0) volumes.selected = index;
+            else body = "No logical volumes are available in this group.";
+            volumes.notify["selected"].connect (update_buttons);
+            update_buttons ();
+        }
+
+        private void update_buttons () {
+            var volume = selection;
+            set_response_enabled ("activate", volume != null && !volume.active);
+            set_response_enabled ("deactivate", volume?.active == true);
+            set_response_enabled ("delete", volume != null && !volume.active);
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-rename-dialog.ui")]
     public class LvmRenameDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.EntryRow entry;

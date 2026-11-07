@@ -1,0 +1,16 @@
+<interface>
+  <template class="MajorisDisksLvmLifecycleDialog" parent="AdwAlertDialog">
+    <property name="heading">Manage Logical Volumes</property>
+    <property name="extra-child">
+      <object class="AdwComboRow" id="volumes"><property name="title">Logical volume</property></object>
+    </property>
+    <responses>
+      <response id="close">Close</response>
+      <response id="activate" appearance="suggested">Activate</response>
+      <response id="deactivate">Deactivate</response>
+      <response id="delete" appearance="destructive">Delete…</response>
+    </responses>
+    <property name="default-response">close</property>
+    <property name="close-response">close</property>
+  </template>
+</interface>

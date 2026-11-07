@@ -1099,9 +1099,14 @@ namespace MajorisDisks {
                 throw new IOError.NOT_SUPPORTED ("The selected mount could not be verified as the Btrfs top level.");
         }
 
-        internal async void create_btrfs_subvolume (StorageBlock block, string name, string identity) throws Error {
-            if (!valid_btrfs_leaf (name))
-                throw new IOError.INVALID_ARGUMENT ("Enter a single valid subvolume name.");
+        [CCode (cname = "majoris_btrfs_inspect_subvolume", cheader_filename = "btrfs-inspect.h")]
+        private extern static string? inspect_btrfs_subvolume (string path, uint64 id, string filesystem,
+            string? origin, out bool read_only);
+
+        internal async void create_btrfs_subvolume (StorageBlock block, string name, string identity,
+            BtrfsSubvolume? source = null, bool read_only = false) throws Error {
+            if (!valid_btrfs_leaf (name) || (source != null && (source.parent_id != 5 || !valid_btrfs_leaf (source.path))))
+                throw new IOError.INVALID_ARGUMENT ("Select a top-level subvolume and enter a valid new name.");
             var proxy = require_volume (block, "Filesystem.BTRFS");
             if (!has_btrfs_subvolumes (block))
                 throw new IOError.NOT_SUPPORTED ("Mount the Btrfs filesystem before creating a subvolume.");
@@ -1114,7 +1119,7 @@ namespace MajorisDisks {
             if (!Uuid.string_is_valid (uuid) || count == 0 || members.length != count)
                 throw new IOError.NOT_SUPPORTED ("UDisks could not identify all Btrfs members.");
             locks.acquire_members (block, members, snapshot.dependencies);
-            var job = jobs.begin ("Create Btrfs subvolume", block, snapshot.dependencies);
+            var job = jobs.begin (source == null ? "Create Btrfs subvolume" : "Create Btrfs snapshot", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
             var lifetime = backend_lifetime;
             bool dispatched = false;
@@ -1142,16 +1147,34 @@ namespace MajorisDisks {
                     if (modification_identity (members[i]) != member_identities[i])
                         throw new IOError.NOT_FOUND ("A Btrfs member changed after confirmation.");
                 }
-                jobs.phase (job, StorageJobState.RUNNING, "Creating the top-level Btrfs subvolume");
+                string? origin = null;
+                string mount = block.filesystem.mounts[0];
+                if (source != null) {
+                    bool source_read_only;
+                    origin = inspect_btrfs_subvolume (Path.build_filename (mount, source.path), source.id, uuid,
+                        null, out source_read_only);
+                    if (origin == null)
+                        throw new IOError.NOT_FOUND ("Could not verify the selected snapshot source.");
+                }
+                jobs.phase (job, StorageJobState.RUNNING, source == null ? "Creating the Btrfs subvolume" : "Creating the Btrfs snapshot");
                 dispatched = true;
-                yield call_tracked_method (job, proxy, "CreateSubvolume",
-                    new Variant ("(s@a{sv})", name, new Variant ("a{sv}", null)), lifetime);
-                rows = yield read_btrfs_subvolumes (proxy, false, lifetime);
+                var options = new Variant ("a{sv}", null);
+                yield call_tracked_method (job, proxy, source == null ? "CreateSubvolume" : "CreateSnapshot",
+                    source == null ? new Variant ("(s@a{sv})", name, options) :
+                    new Variant ("(ssb@a{sv})", source.path, name, read_only, options), lifetime);
+                rows = yield read_btrfs_subvolumes (proxy, source != null, lifetime);
                 for (size_t i = 0; i < rows.n_children (); i++) {
                     var row = rows.get_child_value (i);
                     if (row.get_child_value (1).get_uint64 () == 5 && row.get_child_value (2).get_string () == name) {
+                        if (source != null) {
+                            bool actual_read_only;
+                            if (inspect_btrfs_subvolume (Path.build_filename (mount, name),
+                                row.get_child_value (0).get_uint64 (), uuid, origin, out actual_read_only) == null ||
+                                actual_read_only != read_only)
+                                break;
+                        }
                         outcome.successful = true;
-                        outcome.summary = "Btrfs subvolume created";
+                        outcome.summary = source == null ? "Btrfs subvolume created" : "Btrfs snapshot created";
                         return;
                     }
                 }
@@ -1325,6 +1348,105 @@ namespace MajorisDisks {
                 jobs.finish (job, outcome);
                 locks.release (block);
             }
+        }
+
+        private static Variant? find_raid_member (DBusProxy proxy, string path) {
+            var members = proxy.get_cached_property ("ActiveDevices");
+            if (members == null || !members.is_of_type (new VariantType ("a(oiasta{sv})")))
+                return null;
+            for (size_t i = 0; i < members.n_children (); i++) {
+                var row = members.get_child_value (i);
+                if (row.get_child_value (0).get_string () == path) return row;
+            }
+            return null;
+        }
+
+        internal bool can_remove_raid_spare (StorageBlock block) {
+            var array = block.raid_membership;
+            if (array == null) return false;
+            var proxy = manager?.get_interface (array.path, PREFIX + "MDRaid") as DBusProxy;
+            if (proxy == null || proxy.get_cached_property ("Running")?.get_boolean () != true ||
+                proxy.get_cached_property ("SyncAction")?.get_string () != "idle")
+                return false;
+            var member = find_raid_member (proxy, block.path);
+            if (member == null || member.get_child_value (1).get_int32 () >= 0) return false;
+            return "spare" in member.get_child_value (2).get_strv ();
+        }
+
+        internal async void change_raid_member (StorageBlock anchor, StorageBlock member, bool add,
+            string anchor_identity, string member_identity) throws Error {
+            synchronize ();
+            require_volume (anchor, "Block");
+            require_volume (member, "Block");
+            var array = add ? anchor.raid : member.raid_membership;
+            var proxy = array != null ? manager?.get_interface (array.path, PREFIX + "MDRaid") as DBusProxy : null;
+            string uuid = proxy?.get_cached_property ("UUID")?.get_string () ?? "";
+            if (array == null || anchor.raid != array || proxy == null || uuid == "" ||
+                proxy.get_cached_property ("Running")?.get_boolean () != true ||
+                proxy.get_cached_property ("SyncAction")?.get_string () != "idle")
+                throw new IOError.NOT_SUPPORTED ("A running RAID array without active maintenance is required.");
+            var live = proxy.get_cached_property ("ActiveDevices");
+            if (live == null || !live.is_of_type (new VariantType ("a(oiasta{sv})")))
+                throw new IOError.NOT_SUPPORTED ("UDisks did not publish the active member set.");
+            StorageBlock[] locked = { member };
+            for (size_t i = 0; i < live.n_children (); i++) {
+                var block = snapshot.blocks.lookup (live.get_child_value (i).get_child_value (0).get_string ());
+                if (block == null || !block.available || block.system_hint)
+                    throw new IOError.BUSY ("A RAID member could not be identified or is protected.");
+                locked += block;
+            }
+            locks.acquire_members (anchor, locked, snapshot.dependencies);
+            var job = jobs.begin (add ? "Add RAID member" : "Remove RAID spare", anchor, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Verifying the RAID member and array");
+                var safety = StorageSafetyService.assess (anchor, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || member.system_hint ||
+                    (add ? !can_use_group_member (member) : !can_remove_raid_spare (member)))
+                    throw new IOError.BUSY ("The selected member or array cannot be safely changed.");
+                if (add) yield KernelStorageSafety.require_idle (member, lifetime);
+                synchronize ();
+                if (creation_identity_changed (anchor, anchor_identity) || creation_identity_changed (member, member_identity) ||
+                    manager?.get_interface (array.path, PREFIX + "MDRaid") != proxy ||
+                    proxy.get_cached_property ("SyncAction")?.get_string () != "idle" ||
+                    proxy.get_cached_property ("ActiveDevices")?.equal (live) != true ||
+                    (add ? !can_use_group_member (member) : !can_remove_raid_spare (member)))
+                    throw new IOError.BUSY ("The array or member changed after confirmation.");
+                jobs.phase (job, StorageJobState.RUNNING, add ? "Adding the device" : "Removing the spare");
+                dispatched = true;
+                yield call_tracked_method (job, proxy, add ? "AddDevice" : "RemoveDevice",
+                    new Variant ("(o@a{sv})", member.path, new Variant ("a{sv}", null)), lifetime);
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    lifetime.set_error_if_cancelled ();
+                    if (manager?.get_interface (array.path, PREFIX + "MDRaid") != proxy ||
+                        proxy.get_cached_property ("UUID")?.get_string () != uuid)
+                        break;
+                    var observed = proxy.get_cached_property ("ActiveDevices");
+                    if (observed != null && observed.is_of_type (new VariantType ("a(oiasta{sv})")) &&
+                        (find_raid_member (proxy, member.path) != null) == add) {
+                        outcome.successful = true;
+                        outcome.summary = add ? "RAID member added" : "RAID spare removed";
+                        return;
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the RAID member change.");
+            } catch (Error error) {
+                outcome.fail ("Could not confirm the RAID member change", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (anchor);
+            }
+        }
+
+        private bool creation_identity_changed (StorageBlock block, string identity) {
+            return snapshot.blocks.lookup (block.path) != block || !block.available ||
+                modification_identity (block) != identity;
         }
 
         internal bool can_check_raid (StorageBlock block) {
@@ -1640,6 +1762,184 @@ namespace MajorisDisks {
             } finally {
                 jobs.finish (job, outcome);
                 locks.release (member);
+            }
+        }
+
+        internal async void add_lvm_physical_volume (StorageBlock anchor, StorageBlock member,
+            string anchor_identity, string member_identity) throws Error {
+            synchronize ();
+            require_volume (anchor, "Block");
+            require_volume (member, "Block");
+            var group = anchor.volume_group;
+            var proxy = group != null ? manager?.get_interface (group.path, PREFIX + "VolumeGroup") as DBusProxy : null;
+            string uuid = proxy?.get_cached_property ("UUID")?.get_string () ?? "";
+            if (group == null || proxy == null || uuid == "" || !can_use_group_member (member))
+                throw new IOError.NOT_SUPPORTED ("A verified volume group and unused member are required.");
+            locks.acquire_members (anchor, { member }, snapshot.dependencies);
+            var job = jobs.begin ("Add LVM physical volume", anchor, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            uint64 number = member.number;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Verifying the volume group and unused member");
+                var safety = StorageSafetyService.assess (anchor, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || anchor.read_only)
+                    throw new IOError.BUSY ("The volume group is protected or its dependencies are unknown.");
+                yield KernelStorageSafety.require_idle (member, lifetime);
+                synchronize ();
+                if (creation_identity_changed (anchor, anchor_identity) || creation_identity_changed (member, member_identity) ||
+                    anchor.volume_group != group || manager?.get_interface (group.path, PREFIX + "VolumeGroup") != proxy ||
+                    proxy.get_cached_property ("UUID")?.get_string () != uuid || !can_use_group_member (member))
+                    throw new IOError.NOT_FOUND ("The volume group or member changed after confirmation.");
+                jobs.phase (job, StorageJobState.RUNNING, "Adding the physical volume");
+                dispatched = true;
+                yield call_tracked_method (job, proxy, "AddDevice",
+                    new Variant ("(o@a{sv})", member.path, new Variant ("a{sv}", null)), lifetime);
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    lifetime.set_error_if_cancelled ();
+                    var current = snapshot.blocks.lookup (member.path);
+                    if (manager?.get_interface (group.path, PREFIX + "VolumeGroup") != proxy ||
+                        proxy.get_cached_property ("UUID")?.get_string () != uuid)
+                        break;
+                    if (current != null && current.available && current.number == number &&
+                        current.physical_volume_group_path == group.path) {
+                        outcome.successful = true;
+                        outcome.summary = "Physical volume added";
+                        return;
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the new physical-volume membership.");
+            } catch (Error error) {
+                outcome.fail ("Could not confirm physical-volume addition", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (anchor);
+            }
+        }
+
+        internal StorageLogicalVolume[] logical_volumes_for (StorageBlock context) {
+            string group = context.volume_group?.path ?? context.logical_volume?.group_path ?? "/";
+            StorageLogicalVolume[] volumes = {};
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var lv = item as StorageLogicalVolume;
+                if (lv != null && group != "/" && lv.group_path == group && lv.uuid != "")
+                    volumes += lv;
+            }
+            return volumes;
+        }
+
+        private void require_independent_lv (DBusProxy proxy, StorageLogicalVolume volume) throws Error {
+            if (proxy.get_cached_property ("Type")?.get_string () != "block" ||
+                proxy.get_cached_property ("Origin")?.get_string () != "/" ||
+                proxy.get_cached_property ("ThinPool")?.get_string () != "/")
+                throw new IOError.NOT_SUPPORTED ("This operation requires a plain logical volume without a pool or origin.");
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var candidate = item as StorageLogicalVolume;
+                if (candidate == null || candidate.group_path != volume.group_path || candidate == volume) continue;
+                var related = manager?.get_interface (candidate.path, PREFIX + "LogicalVolume") as DBusProxy;
+                if (related == null || related.get_cached_property ("Origin")?.get_string () == volume.path ||
+                    related.get_cached_property ("ThinPool")?.get_string () == volume.path)
+                    throw new IOError.BUSY ("A snapshot or thin volume depends on this logical volume.");
+            }
+        }
+
+        internal async string change_logical_volume_state (StorageBlock context, string path, string uuid,
+            string context_identity, string method) throws Error {
+            if (method != "Activate" && method != "Deactivate" && method != "Delete")
+                throw new IOError.INVALID_ARGUMENT ("Unsupported logical-volume operation.");
+            synchronize ();
+            require_volume (context, "Block");
+            var volume = snapshot.advanced.lookup (path) as StorageLogicalVolume;
+            var proxy = manager?.get_interface (path, PREFIX + "LogicalVolume") as DBusProxy;
+            string group = context.volume_group?.path ?? context.logical_volume?.group_path ?? "/";
+            if (volume == null || proxy == null || uuid == "" || volume.uuid != uuid || volume.group_path != group ||
+                modification_identity (context) != context_identity)
+                throw new IOError.NOT_FOUND ("The selected logical volume or group changed.");
+            bool activate = method == "Activate";
+            bool deleting = method == "Delete";
+            if ((activate || deleting) == volume.active)
+                throw new IOError.BUSY (deleting ? "Deactivate the logical volume before deleting it." :
+                    "The logical volume is already in a different state.");
+            require_independent_lv (proxy, volume);
+            string previous_block = proxy.get_cached_property ("BlockDevice")?.get_string () ?? "/";
+            var active_block = snapshot.blocks.lookup (previous_block);
+            if (!volume.active && previous_block != "/")
+                throw new IOError.BUSY ("The inactive logical volume still exposes a block device.");
+            if (volume.active && (active_block == null || active_block.logical_volume != volume))
+                throw new IOError.NOT_FOUND ("The active logical-volume block device could not be verified.");
+
+            StorageBlock[] locked = active_block == null ? new StorageBlock[0] : new StorageBlock[] { active_block };
+            locks.acquire_members (context, locked, snapshot.dependencies);
+            var job = jobs.begin_named (method + " logical volume", volume.name, { context.path, path });
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the logical volume and its dependencies");
+                var context_safety = StorageSafetyService.assess (context, snapshot.dependencies);
+                if (context_safety.system_critical || context_safety.unknown_dependencies || context.read_only)
+                    throw new IOError.BUSY ("The volume group is protected or its dependencies are unknown.");
+                if (deleting && (proxy.get_cached_property ("ChildConfiguration")?.n_children () ?? 1) != 0)
+                    throw new IOError.BUSY ("Remove the logical volume’s persistent configuration before deleting it.");
+                if (active_block != null) {
+                    var safety = StorageSafetyService.assess (active_block, snapshot.dependencies);
+                    if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents ||
+                        safety.mounted || active_block.swap_active || active_block.encrypted?.mapping != null)
+                        throw new IOError.BUSY ("Unmount filesystems, disable swap and close dependent mappings before deactivation.");
+                    yield KernelStorageSafety.require_idle (active_block, lifetime);
+                }
+                synchronize ();
+                if (modification_identity (context) != context_identity || snapshot.advanced.lookup (path) != volume ||
+                    volume.uuid != uuid || manager?.get_interface (path, PREFIX + "LogicalVolume") != proxy ||
+                    volume.active == (activate || deleting) ||
+                    (proxy.get_cached_property ("BlockDevice")?.get_string () ?? "/") != previous_block)
+                    throw new IOError.NOT_FOUND ("The logical-volume identity or active state changed.");
+                require_independent_lv (proxy, volume);
+                if (deleting && (proxy.get_cached_property ("ChildConfiguration")?.n_children () ?? 1) != 0)
+                    throw new IOError.BUSY ("The logical volume gained persistent configuration.");
+                jobs.phase (job, StorageJobState.RUNNING, method + " logical volume");
+                dispatched = true;
+                var reply = yield call_tracked_method (job, proxy, method,
+                    new Variant ("(@a{sv})", new Variant ("a{sv}", null)), lifetime);
+                if (!reply.is_of_type (new VariantType (activate ? "(o)" : "()")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid logical-volume result.");
+                string block_path = activate ? reply.get_child_value (0).get_string () : previous_block;
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    lifetime.set_error_if_cancelled ();
+                    var current = snapshot.advanced.lookup (path) as StorageLogicalVolume;
+                    var current_block = snapshot.blocks.lookup (block_path);
+                    bool still_present = current != null;
+                    if (deleting)
+                        foreach (var item in snapshot.advanced.get_values ()) {
+                            var remaining = item as StorageLogicalVolume;
+                            still_present |= remaining != null && remaining.uuid == uuid;
+                        }
+                    bool verified = deleting ? !still_present :
+                        current != null && current.uuid == uuid && current.active == activate &&
+                        (activate ? current_block != null && current_block.available && current_block.logical_volume == current :
+                            current_block == null || current_block.logical_volume != current);
+                    if (verified) {
+                        outcome.successful = true;
+                        outcome.summary = activate ? "Logical volume activated" :
+                            deleting ? "Logical volume deleted" : "Logical volume deactivated";
+                        return activate ? block_path : "";
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the new logical-volume state.");
+            } catch (Error error) {
+                outcome.fail ("Could not confirm the logical-volume operation", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (context);
             }
         }
 

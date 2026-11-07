@@ -1,0 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#pragma once
+#include <glib.h>
+
+char *majoris_btrfs_inspect_subvolume (const char *path, guint64 id, const char *filesystem,
+                                      const char *origin, gboolean *read_only);
