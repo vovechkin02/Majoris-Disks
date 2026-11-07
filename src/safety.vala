@@ -7,12 +7,17 @@ namespace MajorisDisks {
     }
 
     public class StorageVolumeGroup : StorageDevice {
+        public uint64 size;
+        public uint64 free_size;
         public StorageVolumeGroup (string path) { base (path); }
     }
 
     public class StorageLogicalVolume : StorageDevice {
         public string group_path = "/";
         public bool active;
+        public uint64 size;
+        public string uuid = "";
+        public double data_allocated_ratio = -1;
         public StorageLogicalVolume (string path) { base (path); }
     }
 

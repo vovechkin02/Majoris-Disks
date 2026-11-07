@@ -344,8 +344,22 @@ namespace MajorisDisks {
             add_volume_field ("Read-only", block.read_only ? "Yes" : "No");
             if (block.raid != null) add_volume_field ("RAID array", block.raid.name + " · " + block.raid.level);
             if (block.raid_membership != null) add_volume_field ("RAID membership", block.raid_membership.name);
-            if (block.logical_volume != null) add_volume_field ("Logical volume", block.logical_volume.name);
-            if (block.volume_group != null) add_volume_field ("LVM volume group", block.volume_group.name);
+            var logical = block.logical_volume;
+            if (logical != null) {
+                add_volume_field ("Logical volume", logical.name);
+                if (logical.uuid != "") add_volume_field ("Logical volume UUID", logical.uuid);
+                if (logical.size > 0) add_volume_field ("Logical volume capacity", format_size (logical.size));
+                if (logical.data_allocated_ratio >= 0.0 && logical.data_allocated_ratio <= 1.0)
+                    add_volume_field ("Logical volume allocation", "%.1f%%".printf (logical.data_allocated_ratio * 100.0));
+            }
+            var group = block.volume_group ?? backend?.snapshot.advanced.lookup (logical?.group_path ?? "/") as StorageVolumeGroup;
+            if (group != null) {
+                add_volume_field ("LVM volume group", group.name);
+                if (group.size > 0) {
+                    add_volume_field ("Volume group capacity", format_size (group.size));
+                    add_volume_field ("Volume group free space", format_size (group.free_size));
+                }
+            }
             target = block.encrypted?.mapping ?? block;
             mount_options.visible = target.filesystem != null && target.uuid != "" && !target.read_only && !target.system_hint;
             take_ownership.visible = UDisksService.supports_ownership (target) &&

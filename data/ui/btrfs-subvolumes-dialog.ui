@@ -1,0 +1,16 @@
+<interface>
+  <template class="MajorisDisksBtrfsSubvolumesDialog" parent="AdwAlertDialog">
+    <property name="heading">Btrfs Subvolumes</property>
+    <property name="extra-child">
+      <object class="AdwComboRow" id="subvolumes">
+        <property name="title">Subvolume</property>
+      </object>
+    </property>
+    <responses>
+      <response id="close">Close</response>
+      <response id="apply" appearance="suggested">Set Default</response>
+    </responses>
+    <property name="default-response">close</property>
+    <property name="close-response">close</property>
+  </template>
+</interface>

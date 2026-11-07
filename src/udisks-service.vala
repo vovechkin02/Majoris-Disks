@@ -34,6 +34,8 @@ namespace MajorisDisks {
         private uint refresh_source;
         private bool connecting;
         private StorageOperationLocks locks = new StorageOperationLocks ();
+        private HashTable<string, DBusProxy> raid_checks = new HashTable<string, DBusProxy> (str_hash, str_equal);
+        private HashTable<string, StorageJob> stopping_raid_checks = new HashTable<string, StorageJob> (str_hash, str_equal);
         private FilesystemMinimumSizeService minimum_sizes = new FilesystemMinimumSizeService ();
         private FilesystemCapacityProbeService capacity_probes = new FilesystemCapacityProbeService ();
         public StorageJobManager jobs { get; private set; default = new StorageJobManager (); }
@@ -306,12 +308,17 @@ namespace MajorisDisks {
             } else if (has (item, "VolumeGroup")) {
                 var group = (previous.lookup (path) as StorageVolumeGroup) ?? new StorageVolumeGroup (path);
                 group.name = property (item, "VolumeGroup", "Name")?.get_string () ?? "";
+                group.size = property (item, "VolumeGroup", "Size")?.get_uint64 () ?? 0;
+                group.free_size = property (item, "VolumeGroup", "FreeSize")?.get_uint64 () ?? 0;
                 device = group;
             } else if (has (item, "LogicalVolume")) {
                 var volume = (previous.lookup (path) as StorageLogicalVolume) ?? new StorageLogicalVolume (path);
                 volume.name = property (item, "LogicalVolume", "Name")?.get_string () ?? "";
                 volume.group_path = property (item, "LogicalVolume", "VolumeGroup")?.get_string () ?? "/";
                 volume.active = property (item, "LogicalVolume", "Active")?.get_boolean () ?? false;
+                volume.uuid = property (item, "LogicalVolume", "UUID")?.get_string () ?? "";
+                volume.size = property (item, "LogicalVolume", "Size")?.get_uint64 () ?? 0;
+                volume.data_allocated_ratio = property (item, "LogicalVolume", "DataAllocatedRatio")?.get_double () ?? -1.0;
                 device = volume;
             }
             if (device != null) snapshot.advanced.insert (path, device);
@@ -958,28 +965,99 @@ namespace MajorisDisks {
                 manager?.get_interface (block.path, PREFIX + "Filesystem.BTRFS") != null;
         }
 
-        internal async string[] list_btrfs_subvolumes (StorageBlock block) throws Error {
+        private async Variant read_btrfs_subvolumes (DBusProxy proxy, bool snapshots_only, Cancellable token) throws Error {
+            var reply = yield proxy.call ("GetSubvolumes", new Variant ("(b@a{sv})", snapshots_only,
+                new Variant ("a{sv}", null)), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 30000, token);
+            if (!reply.is_of_type (new VariantType ("(a(tts)i)")))
+                throw new IOError.INVALID_DATA ("UDisks returned an invalid Btrfs subvolume list.");
+            return reply.get_child_value (0);
+        }
+
+        private async uint read_btrfs_default (DBusProxy proxy, Cancellable token) throws Error {
+            var reply = yield proxy.call ("GetDefaultSubvolumeID", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 30000, token);
+            if (!reply.is_of_type (new VariantType ("(u)")))
+                throw new IOError.INVALID_DATA ("UDisks returned an invalid Btrfs default subvolume ID.");
+            return reply.get_child_value (0).get_uint32 ();
+        }
+
+        internal async BtrfsSubvolumeList list_btrfs_subvolumes (StorageBlock block) throws Error {
             var proxy = require_volume (block, "Filesystem.BTRFS");
             if (!has_btrfs_subvolumes (block))
                 throw new IOError.NOT_SUPPORTED ("Mount this Btrfs filesystem to list its subvolumes.");
             string identity = modification_identity (block);
-            var reply = yield proxy.call ("GetSubvolumes", new Variant ("(b@a{sv})", false, new Variant ("a{sv}", null)),
-                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 30000, backend_lifetime);
-            if (!reply.is_of_type (new VariantType ("(a(tts)i)")))
-                throw new IOError.INVALID_DATA ("UDisks returned an invalid Btrfs subvolume list.");
+            var lifetime = backend_lifetime;
+            var rows = yield read_btrfs_subvolumes (proxy, false, lifetime);
+            var snapshots = yield read_btrfs_subvolumes (proxy, true, lifetime);
+            var snapshot_ids = new HashTable<string, string> (str_hash, str_equal);
+            for (size_t i = 0; i < snapshots.n_children (); i++) {
+                string id = snapshots.get_child_value (i).get_child_value (0).get_uint64 ().to_string ();
+                snapshot_ids.insert (id, id);
+            }
+            var result = new BtrfsSubvolumeList ();
+            result.entries = new BtrfsSubvolume[(int) rows.n_children ()];
+            for (int i = 0; i < result.entries.length; i++) {
+                var row = rows.get_child_value (i);
+                var entry = new BtrfsSubvolume (row.get_child_value (0).get_uint64 (),
+                    row.get_child_value (1).get_uint64 (), row.get_child_value (2).get_string ());
+                entry.snapshot = snapshot_ids.contains (entry.id.to_string ());
+                result.entries[i] = entry;
+            }
+            try {
+                result.default_id = yield read_btrfs_default (proxy, lifetime);
+                result.default_known = true;
+            } catch (Error error) {
+                lifetime.set_error_if_cancelled ();
+            }
             synchronize ();
             if (require_volume (block, "Filesystem.BTRFS") != proxy || modification_identity (block) != identity)
                 throw new IOError.NOT_FOUND ("The selected Btrfs filesystem changed.");
-            var rows = reply.get_child_value (0);
-            string[] result = {};
-            for (size_t i = 0; i < rows.n_children (); i++) {
-                var row = rows.get_child_value (i);
-                result += "%s  ·  ID %s  ·  parent %s".printf (row.get_child_value (2).get_string (),
-                    row.get_child_value (0).get_uint64 ().to_string (), row.get_child_value (1).get_uint64 ().to_string ());
-            }
             return result;
         }
 
+        internal async void set_btrfs_default (StorageBlock block, uint id, uint confirmed_default,
+            string confirmed_identity) throws Error {
+            var proxy = require_volume (block, "Filesystem.BTRFS");
+            if (!has_btrfs_subvolumes (block) || proxy.get_cached_property ("num_devices")?.get_uint64 () != 1)
+                throw new IOError.NOT_SUPPORTED ("Changing the default requires a mounted, single-device Btrfs filesystem.");
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Set Btrfs default subvolume", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the filesystem and subvolume");
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || block.read_only)
+                    throw new IOError.BUSY ("The filesystem or its dependencies prevent changing the default subvolume.");
+                uint current = yield read_btrfs_default (proxy, lifetime);
+                var rows = yield read_btrfs_subvolumes (proxy, false, lifetime);
+                bool found = id == 5;
+                for (size_t i = 0; i < rows.n_children (); i++)
+                    found |= rows.get_child_value (i).get_child_value (0).get_uint64 () == id;
+                synchronize ();
+                if (!found || current != confirmed_default || modification_identity (block) != confirmed_identity ||
+                    require_volume (block, "Filesystem.BTRFS") != proxy ||
+                    proxy.get_cached_property ("num_devices")?.get_uint64 () != 1)
+                    throw new IOError.NOT_FOUND ("The filesystem or subvolume selection changed.");
+                jobs.phase (job, StorageJobState.RUNNING, "Updating the default Btrfs subvolume");
+                dispatched = true;
+                yield call_tracked_method (job, proxy, "SetDefaultSubvolumeID",
+                    new Variant ("(u@a{sv})", id, new Variant ("a{sv}", null)), lifetime);
+                if ((yield read_btrfs_default (proxy, lifetime)) != id)
+                    throw new IOError.FAILED ("UDisks did not confirm the requested default subvolume.");
+                synchronize ();
+                outcome.successful = true;
+                outcome.summary = "Default Btrfs subvolume updated";
+            } catch (Error error) {
+                outcome.fail ("Could not confirm the Btrfs default subvolume", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+        }
         internal bool can_check_raid (StorageBlock block) {
             var raid = block.raid;
             var proxy = raid != null ? manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy : null;
@@ -990,7 +1068,7 @@ namespace MajorisDisks {
                  raid.level == "raid6" || raid.level == "raid10");
         }
 
-        internal async void start_raid_check (StorageBlock block) throws Error {
+        internal async string start_raid_check (StorageBlock block) throws Error {
             synchronize ();
             require_volume (block, "Block");
             if (!can_check_raid (block))
@@ -1000,39 +1078,88 @@ namespace MajorisDisks {
             if (proxy == null)
                 throw new IOError.NOT_FOUND ("The RAID array is no longer available.");
             locks.acquire (block, snapshot.dependencies);
-            var job = jobs.begin ("Start RAID consistency check", block, snapshot.dependencies);
+            var job = jobs.begin ("RAID consistency check", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool requested = false;
             try {
                 var safety = StorageSafetyService.assess (block, snapshot.dependencies);
                 if (safety.system_critical || safety.unknown_dependencies)
                     throw new IOError.BUSY ("The RAID array supports the running system or its dependencies are unknown.");
                 jobs.phase (job, StorageJobState.RUNNING, "Requesting a RAID consistency check");
+                requested = true;
                 yield call_tracked_method (job, proxy, "RequestSyncAction",
-                    new Variant ("(s@a{sv})", "check", new Variant ("a{sv}", null)), backend_lifetime);
-                for (int i = 0; i < 100; i++) {
-                    synchronize ();
-                    if (block.raid != raid || manager?.get_interface (raid.path, PREFIX + "MDRaid") != proxy)
-                        break;
-                    if (proxy.get_cached_property ("SyncAction")?.get_string () == "check") {
-                        outcome.successful = true;
-                        outcome.summary = "RAID consistency check started";
-                        return;
+                    new Variant ("(s@a{sv})", "check", new Variant ("a{sv}", null)), lifetime);
+                int64 start_deadline = get_monotonic_time () + 10 * TimeSpan.SECOND;
+                bool observed = false;
+                bool reached_end = false;
+                int64 stop_deadline = 0;
+                while (true) {
+                    lifetime.set_error_if_cancelled ();
+                    if (block.raid != raid || manager?.get_interface (raid.path, PREFIX + "MDRaid") != proxy ||
+                        proxy.get_cached_property ("Running")?.get_boolean () != true)
+                        throw new IOError.NOT_FOUND ("The RAID array changed while its check was being monitored.");
+                    string action = proxy.get_cached_property ("SyncAction")?.get_string () ?? "";
+                    if (action == "check") {
+                        if (!observed) {
+                            observed = true;
+                            raid_checks.insert (job.id, proxy);
+                            job.cancelable = true;
+                        }
+                        var completed = proxy.get_cached_property ("SyncCompleted");
+                        double fraction = completed?.get_double () ?? 0.0;
+                        bool progress_valid = completed != null && fraction >= 0.0 && fraction <= 1.0;
+                        reached_end |= progress_valid && fraction == 1.0;
+                        uint64 rate = proxy.get_cached_property ("SyncRate")?.get_uint64 () ?? 0;
+                        uint64 remaining = proxy.get_cached_property ("SyncRemainingTime")?.get_uint64 () ?? 0;
+                        string phase = "Checking RAID consistency";
+                        if (rate > 0) phase += " · %s/s".printf (format_size (rate));
+                        if (remaining > 0) phase += " · %s s remaining".printf (((remaining - 1) / TimeSpan.SECOND + 1).to_string ());
+                        if (stopping_raid_checks.contains (job.id) && job.state != StorageJobState.CANCELLING) {
+                            if (stop_deadline == 0)
+                                stop_deadline = get_monotonic_time () + 10 * TimeSpan.SECOND;
+                            if (get_monotonic_time () >= stop_deadline) {
+                                stopping_raid_checks.remove (job.id);
+                                job.cancelable = true;
+                                job.error_message = "UDisks did not confirm that the RAID check stopped.";
+                            }
+                        } else stop_deadline = 0;
+                        if (!stopping_raid_checks.contains (job.id))
+                            jobs.progress (job, phase, fraction, progress_valid);
+                    } else if (observed && action == "idle") {
+                        // Wait for a concurrent Stop request to return before interpreting idle.
+                        if (stopping_raid_checks.contains (job.id) && job.state == StorageJobState.CANCELLING) {
+                            yield settle_delay (lifetime);
+                            continue;
+                        }
+                        if (stopping_raid_checks.contains (job.id)) {
+                            outcome.status = StorageOperationStatus.CANCELLED;
+                            outcome.summary = "RAID consistency check stopped";
+                            return outcome.summary;
+                        }
+                        if (reached_end && raid.degraded == 0) {
+                            outcome.successful = true;
+                            outcome.summary = "RAID consistency check completed";
+                            return outcome.summary;
+                        }
+                        throw new IOError.FAILED ("The RAID check is idle. UDisks did not report whether it completed or was interrupted.");
+                    } else if (observed || get_monotonic_time () >= start_deadline) {
+                        throw new IOError.FAILED ("UDisks did not confirm that the RAID check was running.");
                     }
-                    yield settle_delay (backend_lifetime);
+                    yield settle_delay (lifetime);
                 }
-                outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
-                throw new IOError.TIMED_OUT ("UDisks did not confirm that the RAID check started.");
             } catch (Error error) {
-                bool uncertain = outcome.status == StorageOperationStatus.NEEDS_ATTENTION;
-                outcome.fail ("Could not confirm RAID consistency check", error);
-                if (uncertain) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                outcome.fail ("Could not confirm the RAID consistency check outcome", error);
+                if (requested) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                 throw error;
             } finally {
+                raid_checks.remove (job.id);
+                stopping_raid_checks.remove (job.id);
+                job.cancelable = false;
                 jobs.finish (job, outcome);
                 locks.release (block);
             }
         }
-
         internal static bool valid_lvm_name (string name) {
             if (name.length == 0 || name.length > 127 || name.has_prefix ("-") || name == "." || name == "..")
                 return false;
@@ -1044,7 +1171,7 @@ namespace MajorisDisks {
             return true;
         }
 
-        internal async void rename_logical_volume (StorageBlock block, string name, string confirmed_identity) throws Error {
+        internal async string rename_logical_volume (StorageBlock block, string name, string confirmed_identity) throws Error {
             if (!valid_lvm_name (name))
                 throw new IOError.INVALID_ARGUMENT ("Enter a valid LVM logical volume name.");
             synchronize ();
@@ -1055,7 +1182,7 @@ namespace MajorisDisks {
             if (volume == null || proxy == null || uuid == "")
                 throw new IOError.NOT_SUPPORTED ("UDisks does not expose an identifiable logical volume.");
             if (volume.name == name)
-                return;
+                return block.path;
 
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("Rename logical volume", block, snapshot.dependencies);
@@ -1088,9 +1215,13 @@ namespace MajorisDisks {
                     var changed = manager?.get_interface (result_path, PREFIX + "LogicalVolume") as DBusProxy;
                     if (changed?.get_cached_property ("UUID")?.get_string () == uuid &&
                         changed?.get_cached_property ("Name")?.get_string () == name) {
-                        outcome.successful = true;
-                        outcome.summary = "Logical volume renamed";
-                        return;
+                        string block_path = changed.get_cached_property ("BlockDevice")?.get_string () ?? "/";
+                        var renamed = snapshot.blocks.lookup (block_path);
+                        if (renamed != null && renamed.available && renamed.logical_volume_path == result_path) {
+                            outcome.successful = true;
+                            outcome.summary = "Logical volume renamed";
+                            return renamed.path;
+                        }
                     }
                     yield settle_delay (job.cancellable);
                 }
@@ -2482,6 +2613,27 @@ namespace MajorisDisks {
         }
 
         public async void cancel_job (StorageJob job) throws Error {
+            var raid = raid_checks.lookup (job.id);
+            if (raid != null) {
+                if (!job.cancelable || manager?.get_interface (raid.get_object_path (), PREFIX + "MDRaid") != raid ||
+                    raid.get_cached_property ("SyncAction")?.get_string () != "check")
+                    throw new IOError.NOT_SUPPORTED ("The observed RAID consistency check is no longer running.");
+                stopping_raid_checks.insert (job.id, job);
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.CANCELLING, "Requesting that the RAID check stop");
+                try {
+                    yield raid.call ("RequestSyncAction",
+                        new Variant ("(s@a{sv})", "idle", new Variant ("a{sv}", null)),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 30000, backend_lifetime);
+                    jobs.phase (job, StorageJobState.RUNNING, "Waiting for the RAID check to stop");
+                } catch (Error error) {
+                    stopping_raid_checks.remove (job.id);
+                    job.cancelable = !StorageJobManager.terminal (job.state);
+                    jobs.phase (job, StorageJobState.RUNNING, "Cancellation was not confirmed");
+                    throw error;
+                }
+                return;
+            }
             if (job.local && job.cancelable && job.backend_path == "" && !StorageJobManager.terminal (job.state)) {
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.CANCELLING, "Cancelling");

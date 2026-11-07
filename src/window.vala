@@ -179,8 +179,7 @@ namespace MajorisDisks {
             backend.start_raid_check.begin (block, (obj, result) => {
                 pending.remove (block.path);
                 try {
-                    backend.start_raid_check.end (result);
-                    notifications.add_toast (new Adw.Toast ("RAID consistency check started"));
+                    notifications.add_toast (new Adw.Toast (backend.start_raid_check.end (result)));
                 } catch (Error error) {
                     show_check_message ("Could not confirm the RAID consistency check", operation_error (error));
                 }
@@ -188,11 +187,25 @@ namespace MajorisDisks {
         }
 
         private void list_btrfs_subvolumes (StorageBlock block) {
+            string identity = backend.modification_identity (block);
             backend.list_btrfs_subvolumes.begin (block, (obj, result) => {
                 try {
-                    string[] entries = backend.list_btrfs_subvolumes.end (result);
-                    show_check_message ("Btrfs Subvolumes",
-                        entries.length == 0 ? "No subvolumes were reported." : string.joinv ("\n", entries));
+                    var entries = backend.list_btrfs_subvolumes.end (result);
+                    var dialog = new BtrfsSubvolumesDialog (entries, !block.read_only && !block.system_hint);
+                    dialog.response.connect ((response) => {
+                        if (response != "apply" || pending.contains (block.path)) return;
+                        pending.insert (block.path, block);
+                        backend.set_btrfs_default.begin (block, dialog.selected_id, entries.default_id, identity, (object, changed) => {
+                            pending.remove (block.path);
+                            try {
+                                backend.set_btrfs_default.end (changed);
+                                notifications.add_toast (new Adw.Toast ("Default Btrfs subvolume updated"));
+                            } catch (Error error) {
+                                show_check_message ("Could not set the default Btrfs subvolume", operation_error (error));
+                            }
+                        });
+                    });
+                    dialog.present (this);
                 } catch (Error error) {
                     show_check_message ("Could not list Btrfs subvolumes", operation_error (error));
                 }
@@ -210,7 +223,9 @@ namespace MajorisDisks {
                 backend.rename_logical_volume.begin (block, dialog.new_name, identity, (obj, result) => {
                     pending.remove (block.path);
                     try {
-                        backend.rename_logical_volume.end (result);
+                        string renamed = backend.rename_logical_volume.end (result);
+                        selected = renamed;
+                        update_devices ();
                         notifications.add_toast (new Adw.Toast ("Logical volume renamed"));
                     } catch (Error error) {
                         show_check_message ("Could not confirm the logical volume rename", operation_error (error));
@@ -1340,6 +1355,37 @@ namespace MajorisDisks {
             return summary;
         }
     }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/btrfs-subvolumes-dialog.ui")]
+    internal class BtrfsSubvolumesDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow subvolumes;
+        private uint64[] ids = { 5 };
+        public uint selected_id { get { return (uint) ids[subvolumes.selected]; } }
+
+        public BtrfsSubvolumesDialog (BtrfsSubvolumeList info, bool can_change) {
+            var labels = new Gtk.StringList (null);
+            labels.append ("Top-level subvolume · ID 5");
+            uint selected = 0;
+            foreach (var entry in info.entries) {
+                if (entry.id == 5) continue;
+                if (info.default_known && entry.id == info.default_id) selected = ids.length;
+                ids += entry.id;
+                labels.append ("%s · ID %s · parent %s%s".printf (entry.path, entry.id.to_string (),
+                    entry.parent_id.to_string (), entry.snapshot ? " · Snapshot" : ""));
+            }
+            subvolumes.model = labels;
+            subvolumes.selected = selected;
+            body = info.default_known
+                ? "Default subvolume ID %u. Changing the default affects future mounts without an explicit subvolume.".printf (info.default_id)
+                : "The default subvolume could not be read.";
+            set_response_enabled ("apply", false);
+            subvolumes.notify["selected"].connect (() => {
+                uint index = subvolumes.selected;
+                set_response_enabled ("apply", can_change && info.default_known && index < ids.length &&
+                    ids[index] <= uint.MAX && ids[index] != info.default_id);
+            });
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-rename-dialog.ui")]
     public class LvmRenameDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.EntryRow entry;

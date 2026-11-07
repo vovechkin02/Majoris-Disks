@@ -1,4 +1,22 @@
 namespace MajorisDisks {
+    internal class BtrfsSubvolume : Object {
+        public uint64 id;
+        public uint64 parent_id;
+        public string path;
+        public bool snapshot;
+
+        public BtrfsSubvolume (uint64 id, uint64 parent_id, string path) {
+            this.id = id;
+            this.parent_id = parent_id;
+            this.path = path;
+        }
+    }
+
+    internal class BtrfsSubvolumeList : Object {
+        public BtrfsSubvolume[] entries = {};
+        public uint default_id;
+        public bool default_known;
+    }
     public enum StorageSettingIntent { UNCHANGED, SET, RESET }
 
     public class StorageDevice : Object {
@@ -234,8 +252,3 @@ namespace MajorisDisks {
         }
     }
 }
-
-
-
-
-
