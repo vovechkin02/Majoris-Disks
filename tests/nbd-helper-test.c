@@ -28,10 +28,14 @@ test_pinned_endpoint (void)
     g_assert_cmpint (listen (replacement, 1), ==, 0);
 
     const char *argv[] = { "/usr/bin/test", "-S", "/proc/self/fd/3", NULL };
-    GPid client = 0;
+    GPid client __attribute__((cleanup(reap_client))) = 0;
     g_assert_true (run_client (argv, pinned, &client, &error));
     g_assert_no_error (error);
     g_assert_cmpint (client, >, 0);
+    siginfo_t exited = { 0 };
+    g_assert_cmpint (waitid (P_PID, client, &exited, WEXITED | WNOHANG | WNOWAIT), ==, 0);
+    g_assert_cmpint (exited.si_pid, ==, client);
+    g_assert_cmpint (exited.si_code, ==, CLD_EXITED);
 
     // Our test process is the socket owner, but it is not the installed QEMU exporter.
     g_assert_cmpint (verify_exporter (pinned, getuid ()), ==, -1);

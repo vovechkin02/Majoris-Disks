@@ -120,10 +120,22 @@ private async void verify_nbd_marker (UDisksService backend, StorageBlock block,
     } finally { FileUtils.unlink (copy.get_path ()); }
 }
 
+private string nbd_journal (VirtualAttachment record) {
+    return "/run/majoris-disks-nbd/nbd%u".printf (record.index);
+}
+
+private void verify_nbd_journal (VirtualAttachment record) throws Error {
+    var journal = new KeyFile ();
+    journal.load_from_file (nbd_journal (record), KeyFileFlags.NONE);
+    if (journal.get_string ("attachment", "token") != record.token ||
+        journal.get_string ("attachment", "state") != "attached-verified")
+        throw new IOError.INVALID_DATA ("The NBD fixture did not publish a verified attachment journal.");
+}
+
 private void verify_nbd_cleanup (VirtualAttachment record) throws Error {
     string session = Path.build_filename (Environment.get_user_runtime_dir (), "majoris-nbd", record.token);
     if (VirtualDiskAttachment.lookup ("/dev/nbd%u".printf (record.index)) != null ||
-        FileUtils.test (session, FileTest.EXISTS))
+        FileUtils.test (session, FileTest.EXISTS) || FileUtils.test (nbd_journal (record), FileTest.EXISTS))
         throw new IOError.FAILED ("The NBD fixture still has a managed mapping or runtime record.");
 }
 
@@ -157,6 +169,7 @@ private async void exercise_nbd_devices () throws Error {
                 if (block == null || block.virtual_attachment?.file != image.get_path () ||
                     block.virtual_attachment.format != format || !block.read_only || block.size != 64 * 1024 * 1024)
                     throw new IOError.INVALID_DATA ("The managed virtual fixture could not be verified.");
+                verify_nbd_journal (block.virtual_attachment);
                 try {
                     yield backend.attach_virtual_image (image, false);
                     assert_not_reached ();
