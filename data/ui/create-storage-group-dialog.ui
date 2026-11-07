@@ -1,0 +1,28 @@
+<interface>
+  <template class="MajorisDisksCreateStorageGroupDialog" parent="AdwAlertDialog">
+    <property name="heading">Create Storage Group</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwEntryRow" id="name_entry"><property name="title">Name</property></object></child>
+        <child><object class="AdwComboRow" id="raid_level"><property name="title">RAID level</property>
+          <property name="model"><object class="GtkStringList"><items><item>RAID 0</item><item>RAID 1</item><item>RAID 4</item><item>RAID 5</item><item>RAID 6</item><item>RAID 10</item></items></object></property>
+        </object></child>
+        <child><object class="AdwComboRow" id="chunk_size"><property name="title">Chunk size</property>
+          <property name="model"><object class="GtkStringList"><items><item>Backend default</item><item>64 KiB</item><item>128 KiB</item><item>256 KiB</item><item>512 KiB</item></items></object></property>
+        </object></child>
+        <child><object class="GtkScrolledWindow">
+          <property name="min-content-height">150</property>
+          <property name="child"><object class="GtkListBox" id="devices"><property name="selection-mode">none</property></object></property>
+        </object></child>
+        <child><object class="AdwActionRow" id="estimate"><property name="title">Estimated capacity before metadata</property></object></child>
+        <child><object class="AdwSwitchRow" id="erase"><property name="title">Erase the selected devices</property></object></child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="create" appearance="destructive">Create</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

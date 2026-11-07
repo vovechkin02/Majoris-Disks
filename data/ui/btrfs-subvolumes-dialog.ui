@@ -2,13 +2,15 @@
   <template class="MajorisDisksBtrfsSubvolumesDialog" parent="AdwAlertDialog">
     <property name="heading">Btrfs Subvolumes</property>
     <property name="extra-child">
-      <object class="AdwComboRow" id="subvolumes">
-        <property name="title">Subvolume</property>
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwComboRow" id="subvolumes"><property name="title">Subvolume</property></object></child>
+        <child><object class="AdwEntryRow" id="new_subvolume"><property name="title">New top-level subvolume name</property></object></child>
       </object>
     </property>
     <responses>
       <response id="close">Close</response>
       <response id="apply" appearance="suggested">Set Default</response>
+      <response id="create">Create Subvolume</response>
     </responses>
     <property name="default-response">close</property>
     <property name="close-response">close</property>

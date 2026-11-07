@@ -9,6 +9,7 @@ namespace MajorisDisks {
     public class StorageVolumeGroup : StorageDevice {
         public uint64 size;
         public uint64 free_size;
+        public uint64 extent_size;
         public StorageVolumeGroup (string path) { base (path); }
     }
 

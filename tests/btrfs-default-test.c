@@ -13,7 +13,7 @@ test_mount_identity (void)
     g_assert_no_error (error);
     int fd __attribute__((cleanup(close_fd))) = open_directory (directory);
     g_assert_cmpint (fd, >=, 0);
-    g_assert_false (matches_mount (fd, directory, 1));
+    g_assert_false (matches_mount (fd, directory, 1, "00000000-0000-0000-0000-000000000000"));
     g_autofree char *link = g_build_filename (directory, "substitute", NULL);
     g_assert_cmpint (symlink ("/", link), ==, 0);
     g_assert_cmpint (open_directory (link), ==, -1);

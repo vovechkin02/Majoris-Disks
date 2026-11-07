@@ -314,6 +314,7 @@ namespace MajorisDisks {
                 group.name = property (item, "VolumeGroup", "Name")?.get_string () ?? "";
                 group.size = property (item, "VolumeGroup", "Size")?.get_uint64 () ?? 0;
                 group.free_size = property (item, "VolumeGroup", "FreeSize")?.get_uint64 () ?? 0;
+                group.extent_size = property (item, "VolumeGroup", "ExtentSize")?.get_uint64 () ?? 0;
                 device = group;
             } else if (has (item, "LogicalVolume")) {
                 var volume = (previous.lookup (path) as StorageLogicalVolume) ?? new StorageLogicalVolume (path);
@@ -1069,6 +1070,102 @@ namespace MajorisDisks {
             return result;
         }
 
+        internal static bool valid_btrfs_leaf (string name) {
+            if (name.length == 0 || name.length > 255 || name == "." || name == ".." ||
+                name.contains ("/") || name != name.strip () || !name.validate ())
+                return false;
+            for (int i = 0; i < name.length; i++)
+                if (name[i] >= 0 && (name[i] < 32 || name[i] == 127)) return false;
+            return true;
+        }
+
+        [CCode (cname = "g_strcompress", cheader_filename = "glib.h")]
+        private extern static string unescape_mount_field (string field);
+
+        private async void require_btrfs_top_level (StorageBlock block, Cancellable token) throws Error {
+            string[] mounts = block.filesystem?.mounts ?? new string[0];
+            if (mounts.length != 1)
+                throw new IOError.NOT_SUPPORTED ("Mount the Btrfs top-level subvolume at exactly one location.");
+            uint8[] contents;
+            yield File.new_for_path ("/proc/self/mountinfo").load_contents_async (token, out contents, null);
+            int matching = 0;
+            foreach (var line in ((string) contents).split ("\n")) {
+                var fields = line.split (" ", 6);
+                if (fields.length == 6 && fields[3] == "/" && unescape_mount_field (fields[4]) == mounts[0] &&
+                    fields[5].contains ("- btrfs "))
+                    matching++;
+            }
+            if (matching != 1)
+                throw new IOError.NOT_SUPPORTED ("The selected mount could not be verified as the Btrfs top level.");
+        }
+
+        internal async void create_btrfs_subvolume (StorageBlock block, string name, string identity) throws Error {
+            if (!valid_btrfs_leaf (name))
+                throw new IOError.INVALID_ARGUMENT ("Enter a single valid subvolume name.");
+            var proxy = require_volume (block, "Filesystem.BTRFS");
+            if (!has_btrfs_subvolumes (block))
+                throw new IOError.NOT_SUPPORTED ("Mount the Btrfs filesystem before creating a subvolume.");
+            string uuid = proxy.get_cached_property ("uuid")?.get_string () ?? "";
+            uint64 count = proxy.get_cached_property ("num_devices")?.get_uint64 () ?? 0;
+            StorageBlock[] members = {};
+            foreach (var candidate in snapshot.blocks.get_values ())
+                if (candidate.type_id == "btrfs" && candidate.uuid == uuid && candidate.available)
+                    members += candidate;
+            if (!Uuid.string_is_valid (uuid) || count == 0 || members.length != count)
+                throw new IOError.NOT_SUPPORTED ("UDisks could not identify all Btrfs members.");
+            locks.acquire_members (block, members, snapshot.dependencies);
+            var job = jobs.begin ("Create Btrfs subvolume", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                string[] member_identities = {};
+                foreach (var member in members) {
+                    var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                    if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || member.read_only)
+                        throw new IOError.BUSY ("A Btrfs member is protected or in use.");
+                    member_identities += modification_identity (member);
+                }
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the mount and existing subvolumes");
+                var rows = yield read_btrfs_subvolumes (proxy, false, lifetime);
+                for (size_t i = 0; i < rows.n_children (); i++)
+                    if (rows.get_child_value (i).get_child_value (2).get_string () == name)
+                        throw new IOError.EXISTS ("A top-level subvolume already has that name.");
+                yield require_btrfs_top_level (block, lifetime);
+                synchronize ();
+                if (modification_identity (block) != identity || require_volume (block, "Filesystem.BTRFS") != proxy ||
+                    proxy.get_cached_property ("uuid")?.get_string () != uuid ||
+                    proxy.get_cached_property ("num_devices")?.get_uint64 () != count)
+                    throw new IOError.NOT_FOUND ("The selected Btrfs filesystem changed.");
+                for (int i = 0; i < members.length; i++) {
+                    require_volume (members[i], "Block");
+                    if (modification_identity (members[i]) != member_identities[i])
+                        throw new IOError.NOT_FOUND ("A Btrfs member changed after confirmation.");
+                }
+                jobs.phase (job, StorageJobState.RUNNING, "Creating the top-level Btrfs subvolume");
+                dispatched = true;
+                yield call_tracked_method (job, proxy, "CreateSubvolume",
+                    new Variant ("(s@a{sv})", name, new Variant ("a{sv}", null)), lifetime);
+                rows = yield read_btrfs_subvolumes (proxy, false, lifetime);
+                for (size_t i = 0; i < rows.n_children (); i++) {
+                    var row = rows.get_child_value (i);
+                    if (row.get_child_value (1).get_uint64 () == 5 && row.get_child_value (2).get_string () == name) {
+                        outcome.successful = true;
+                        outcome.summary = "Btrfs subvolume created";
+                        return;
+                    }
+                }
+                throw new IOError.FAILED ("UDisks did not confirm the new top-level subvolume.");
+            } catch (Error error) {
+                outcome.fail ("Could not confirm Btrfs subvolume creation", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+        }
+
         internal async void set_btrfs_default (StorageBlock block, uint id, uint confirmed_default,
             string confirmed_identity) throws Error {
             var proxy = require_volume (block, "Filesystem.BTRFS");
@@ -1341,6 +1438,133 @@ namespace MajorisDisks {
                     return false;
             }
             return true;
+        }
+
+        private DBusProxy? creation_manager (bool raid) {
+            return manager?.get_interface ("/org/freedesktop/UDisks2/Manager",
+                PREFIX + (raid ? "Manager" : "Manager.LVM2")) as DBusProxy;
+        }
+
+        internal bool can_create_storage_group (bool raid) {
+            return creation_manager (raid) != null;
+        }
+
+        internal bool can_use_group_member (StorageBlock block) {
+            if (!block.available || block.read_only || block.ignored || block.system_hint || block.number == 0 ||
+                block.size == 0 || block.table != null || block.partition?.container == true ||
+                block.usage != "" || block.type_id != "" || block.uuid != "" ||
+                block.filesystem != null || block.encrypted != null || block.has_swap ||
+                block.raid_path != "/" || block.raid_member_path != "/" ||
+                block.logical_volume_path != "/" || block.physical_volume_group_path != "/" ||
+                block.backing_path != "/" || block.virtual_attachment != null ||
+                block.mount_configurations.length != 0 || block.encryption_configurations.length != 0)
+                return false;
+            var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+            return !safety.system_critical && !safety.unknown_dependencies && !safety.active_dependents &&
+                !safety.mounted && snapshot.dependencies.children (block).length == 0;
+        }
+
+        internal static uint raid_min_members (string level) {
+            switch (level) {
+            case "raid0": case "raid1": return 2;
+            case "raid4": case "raid5": return 3;
+            case "raid6": case "raid10": return 4;
+            default: return 0;
+            }
+        }
+
+        internal async string create_storage_group (bool raid, StorageBlock[] members, string[] identities,
+            string name, string level, uint64 chunk) throws Error {
+            var proxy = creation_manager (raid);
+            if (proxy == null)
+                throw new IOError.NOT_SUPPORTED ("The required UDisks manager interface is unavailable.");
+            uint minimum = raid ? raid_min_members (level) : 1;
+            if (minimum == 0 || members.length < minimum || identities.length != members.length ||
+                !valid_lvm_name (name) || (raid && (name.length > 32 || name.contains (":") ||
+                (level == "raid10" && members.length % 2 != 0) ||
+                (level == "raid1" ? chunk != 0 :
+                    (chunk != 0 && chunk != 65536 && chunk != 131072 && chunk != 262144 && chunk != 524288)))))
+                throw new IOError.INVALID_ARGUMENT ("The selected members or creation options are invalid.");
+
+            synchronize ();
+            var paths = new VariantBuilder (new VariantType ("ao"));
+            var numbers = new HashTable<string, string> (str_hash, str_equal);
+            uint64[] original_numbers = {};
+            foreach (var member in members) {
+                require_volume (member, "Block");
+                string number = member.number.to_string ();
+                if (!can_use_group_member (member) || numbers.contains (number))
+                    throw new IOError.BUSY ("Each selected member must be a distinct, unused block device.");
+                numbers.insert (number, number);
+                original_numbers += member.number;
+                paths.add ("o", member.path);
+            }
+            locks.acquire_members (members[0], members, snapshot.dependencies);
+            var job = jobs.begin (raid ? "Create RAID array" : "Create LVM volume group",
+                members[0], snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Verifying the selected block devices");
+                foreach (var member in members)
+                    yield KernelStorageSafety.require_idle (member, lifetime);
+                synchronize ();
+                if (creation_manager (raid) != proxy)
+                    throw new IOError.NOT_CONNECTED ("The UDisks manager changed.");
+                for (int i = 0; i < members.length; i++) {
+                    require_volume (members[i], "Block");
+                    if (!can_use_group_member (members[i]) || modification_identity (members[i]) != identities[i])
+                        throw new IOError.BUSY ("A selected member changed after confirmation.");
+                }
+                if (!raid)
+                    foreach (var item in snapshot.advanced.get_values ())
+                        if (item is StorageVolumeGroup && item.name == name)
+                            throw new IOError.EXISTS ("A volume group already has that name.");
+                jobs.phase (job, StorageJobState.RUNNING, raid ? "Creating the array" : "Creating the volume group");
+                dispatched = true;
+                var options = new Variant ("a{sv}", null);
+                var parameters = raid ? new Variant ("(@aosst@a{sv})", paths.end (), level, name, chunk, options) :
+                    new Variant ("(s@ao@a{sv})", name, paths.end (), options);
+                var reply = yield call_tracked_method (job, proxy, raid ? "MDRaidCreate" : "VolumeGroupCreate",
+                    parameters, lifetime);
+                if (!reply.is_of_type (new VariantType ("(o)")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid storage object path.");
+                string path = reply.get_child_value (0).get_string ();
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    var result = manager?.get_interface (path, PREFIX + (raid ? "MDRaid" : "VolumeGroup")) as DBusProxy;
+                    string uuid = result?.get_cached_property ("UUID")?.get_string () ?? "";
+                    bool verified = uuid != "" && (raid
+                        ? result?.get_cached_property ("Level")?.get_string () == level
+                        : result?.get_cached_property ("Name")?.get_string () == name);
+                    for (int member_index = 0; member_index < members.length; member_index++) {
+                        var current = snapshot.blocks.lookup (members[member_index].path);
+                        verified &= current != null && current.number == original_numbers[member_index] &&
+                            (raid ? current.raid_member_path == path : current.physical_volume_group_path == path);
+                    }
+                    if (verified) {
+                        string visible = "";
+                        if (raid)
+                            foreach (var block in snapshot.blocks.get_values ())
+                                if (block.available && block.raid_path == path) visible = block.path;
+                        if (!raid || visible != "") {
+                            outcome.successful = true;
+                            outcome.summary = raid ? "RAID array created" : "LVM volume group created";
+                            return visible;
+                        }
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the new storage object and its members.");
+            } catch (Error error) {
+                outcome.fail ("Could not confirm storage creation", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (members[0]);
+            }
         }
 
         internal async string create_logical_volume (StorageBlock member, string name, uint64 size,

@@ -18,6 +18,7 @@
     <file>ui/edit-filesystem-dialog.ui</file>
     <file>ui/lvm-rename-dialog.ui</file>
     <file>ui/lvm-create-dialog.ui</file>
+    <file>ui/create-storage-group-dialog.ui</file>
     <file>ui/btrfs-subvolumes-dialog.ui</file>
     <file>ui/ownership-dialog.ui</file>
     <file>ui/edit-partition-dialog.ui</file>

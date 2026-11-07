@@ -294,6 +294,49 @@ namespace MajorisDisks {
         }
     }
 
+    internal class LvmCapacity {
+        public static bool parse (string input, uint64 unit, uint64 extent, uint64 free, out uint64 bytes) {
+            bytes = 0;
+            if (unit == 0 || extent == 0) return false;
+            var parts = input.strip ().split (".", 3);
+            uint64 whole = 0, fraction = 0, denominator = 1;
+            if (parts.length > 2 || !decimal_digits (parts[0], out whole) || whole > uint64.MAX / unit)
+                return false;
+            if (parts.length == 2) {
+                if (parts[1].length > 12 || !decimal_digits (parts[1], out fraction))
+                    return false;
+                for (int i = 0; i < parts[1].length; i++) denominator *= 10;
+            }
+            uint64 divisor = denominator, remainder = unit % denominator;
+            while (remainder != 0) {
+                uint64 next = divisor % remainder;
+                divisor = remainder;
+                remainder = next;
+            }
+            uint64 reduced_denominator = denominator / divisor;
+            if (fraction % reduced_denominator != 0)
+                return false;
+            uint64 fractional_bytes = (fraction / reduced_denominator) * (unit / divisor);
+            uint64 whole_bytes = whole * unit;
+            if (fractional_bytes > uint64.MAX - whole_bytes)
+                return false;
+            bytes = whole_bytes + fractional_bytes;
+            return bytes > 0 && bytes <= free && bytes % extent == 0;
+        }
+
+        private static bool decimal_digits (string text, out uint64 number) {
+            number = 0;
+            if (text == "") return false;
+            for (int i = 0; i < text.length; i++) {
+                if (text[i] < '0' || text[i] > '9') return false;
+                uint digit = text[i] - '0';
+                if (number > (uint64.MAX - digit) / 10) return false;
+                number = number * 10 + digit;
+            }
+            return true;
+        }
+    }
+
     public class StorageOperationLocks : Object {
         private HashTable<string, HashTable<string, string>> active =
             new HashTable<string, HashTable<string, string>> (str_hash, str_equal);

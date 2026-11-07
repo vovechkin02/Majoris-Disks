@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 typedef int (*GetDefault) (int, guint64 *);
@@ -45,7 +46,30 @@ matches_uuid (int fd, const char *uuid)
 }
 
 static gboolean
-matches_mount (int fd, const char *path, guint64 device)
+filesystem_member (const char *uuid, dev_t device)
+{
+    g_autofree char *canonical_uuid = g_ascii_strdown (uuid, -1);
+    g_autofree char *members = g_strdup_printf ("/sys/fs/btrfs/%s/devices", canonical_uuid);
+    g_autofree char *block = g_strdup_printf ("/sys/dev/block/%u:%u", major (device), minor (device));
+    struct stat expected;
+    if (stat (block, &expected) != 0)
+        return FALSE;
+    g_autoptr(GDir) directory = g_dir_open (members, 0, NULL);
+    if (directory == NULL)
+        return FALSE;
+    const char *entry;
+    while ((entry = g_dir_read_name (directory)) != NULL) {
+        g_autofree char *candidate = g_build_filename (members, entry, NULL);
+        struct stat actual;
+        if (stat (candidate, &actual) == 0 &&
+            actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean
+matches_mount (int fd, const char *path, guint64 device, const char *uuid)
 {
     struct statx opened;
     g_autofree char *mountinfo = NULL;
@@ -69,7 +93,9 @@ matches_mount (int fd, const char *path, guint64 device)
         g_autofree char *node = g_strcompress (source[1]);
         struct stat info;
         return g_str_equal (actual_path, path) && g_str_has_prefix (node, "/dev/") &&
-               stat (node, &info) == 0 && S_ISBLK (info.st_mode) && (guint64) info.st_rdev == device;
+               stat (node, &info) == 0 && S_ISBLK (info.st_mode) &&
+               ((guint64) info.st_rdev == device ||
+                (filesystem_member (uuid, info.st_rdev) && filesystem_member (uuid, (dev_t) device)));
     }
     return FALSE;
 }
@@ -106,7 +132,7 @@ main (int argc, char **argv)
         return fail ("Invalid Btrfs default-subvolume request.");
 
     int mount __attribute__((cleanup(close_fd))) = open_directory (argv[2]);
-    if (mount < 0 || !matches_mount (mount, argv[2], device) || !matches_uuid (mount, argv[3]))
+    if (mount < 0 || !matches_mount (mount, argv[2], device, argv[3]) || !matches_uuid (mount, argv[3]))
         return fail ("The Btrfs mount or its source identity changed.");
 
     void *library = dlopen ("libbtrfsutil.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -132,7 +158,7 @@ main (int argc, char **argv)
         g_autofree char *path = NULL;
         if (target != 5 && subvolume_path (mount, target, &path) != 0)
             return fail ("The requested Btrfs subvolume no longer exists.");
-        if (!matches_mount (mount, argv[2], device) || !matches_uuid (mount, uuid))
+        if (!matches_mount (mount, argv[2], device, argv[3]) || !matches_uuid (mount, uuid))
             return fail ("The Btrfs mount or source identity changed before writing.");
         if (set_default (mount, target) != 0 || get_default (mount, &current) != 0 || current != target)
             return fail ("The default Btrfs subvolume update could not be verified.");

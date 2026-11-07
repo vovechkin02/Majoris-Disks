@@ -149,6 +149,21 @@ private void test_dependency_safety () {
     var safety = StorageSafetyService.assess (disk, graph);
     assert (safety.system_critical && safety.active_dependents && safety.unknown_dependencies);
 }
+private void test_lvm_capacity () {
+    const uint64 mib = 1048576;
+    const uint64 gib = 1073741824;
+    const uint64 tib = 1099511627776;
+    uint64 bytes;
+    assert (LvmCapacity.parse ("1.5", gib, 4 * mib, 2 * gib, out bytes) && bytes == 1536 * mib);
+    assert (!LvmCapacity.parse ("12", mib, 8 * mib, 64 * mib, out bytes));
+    assert (LvmCapacity.parse ("16", mib, 8 * mib, 17 * mib, out bytes) && bytes == 16 * mib);
+    assert (!LvmCapacity.parse ("16", mib, 8 * mib, 15 * mib, out bytes));
+    assert (LvmCapacity.parse ("3", tib, 32 * mib, 4 * tib, out bytes) && bytes == 3 * tib);
+    assert (!LvmCapacity.parse ("16777216", tib, 4 * mib, uint64.MAX, out bytes));
+    assert (!LvmCapacity.parse ("0.1", mib, 1, uint64.MAX, out bytes));
+    assert (!LvmCapacity.parse ("1e3", mib, 4 * mib, uint64.MAX, out bytes));
+}
+
 private void test_operation_locks () {
     var graph = new StorageDependencyService ();
     var disk = new StorageBlock ("/disk");
@@ -1254,6 +1269,7 @@ public static int main (string[] args) {
     Test.add_func ("/storage/hierarchy", test_hierarchy);
     Test.add_func ("/storage/capabilities", test_capabilities);
     Test.add_func ("/operations/locks", test_operation_locks);
+    Test.add_func ("/operations/lvm-capacity", test_lvm_capacity);
     Test.add_func ("/operations/metadata-safety-classes", test_metadata_safety_classes);
     Test.add_func ("/operations/check-capability", test_check_capability);
     Test.add_func ("/operations/resize-capability", test_resize_capability);

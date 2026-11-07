@@ -36,7 +36,19 @@ namespace MajorisDisks {
                 show_selection ();
                 split.show_content = true;
             });
-            backend.changed.connect (update_devices);
+            var create_vg = new SimpleAction ("create-vg", null);
+            var create_raid = new SimpleAction ("create-raid", null);
+            add_action (create_vg);
+            add_action (create_raid);
+            create_vg.activate.connect (() => create_storage_group (false));
+            create_raid.activate.connect (() => create_storage_group (true));
+            create_vg.set_enabled (backend.can_create_storage_group (false));
+            create_raid.set_enabled (backend.can_create_storage_group (true));
+            backend.changed.connect (() => {
+                create_vg.set_enabled (backend.can_create_storage_group (false));
+                create_raid.set_enabled (backend.can_create_storage_group (true));
+                update_devices ();
+            });
             drive_view.backend = backend;
             drive_view.action_requested.connect ((block, method) => {
                 if (pending.contains (block.path)) return;
@@ -218,7 +230,21 @@ namespace MajorisDisks {
                     var entries = backend.list_btrfs_subvolumes.end (result);
                     var dialog = new BtrfsSubvolumesDialog (entries, !block.read_only && !block.system_hint);
                     dialog.response.connect ((response) => {
-                        if (response != "apply" || pending.contains (block.path)) return;
+                        if (pending.contains (block.path)) return;
+                        if (response == "create") {
+                            pending.insert (block.path, block);
+                            backend.create_btrfs_subvolume.begin (block, dialog.new_name, identity, (object, created) => {
+                                pending.remove (block.path);
+                                try {
+                                    backend.create_btrfs_subvolume.end (created);
+                                    notifications.add_toast (new Adw.Toast ("Btrfs subvolume created"));
+                                } catch (Error error) {
+                                    show_check_message ("Could not create the Btrfs subvolume", operation_error (error));
+                                }
+                            });
+                            return;
+                        }
+                        if (response != "apply") return;
                         pending.insert (block.path, block);
                         backend.set_btrfs_default.begin (block, dialog.selected_id, entries.default_id, identity, (object, changed) => {
                             pending.remove (block.path);
@@ -237,10 +263,31 @@ namespace MajorisDisks {
             });
         }
 
+        private void create_storage_group (bool raid) {
+            var dialog = new CreateStorageGroupDialog (backend, raid);
+            dialog.response.connect ((response) => {
+                if (response != "create") return;
+                string[] identities;
+                var members = dialog.selected_members (out identities);
+                backend.create_storage_group.begin (raid, members, identities, dialog.group_name, dialog.level,
+                    dialog.chunk, (object, result) => {
+                    try {
+                        string visible = backend.create_storage_group.end (result);
+                        if (visible != "") selected = visible;
+                        update_devices ();
+                        notifications.add_toast (new Adw.Toast (raid ? "RAID array created" : "LVM volume group created"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm storage creation", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
         private void create_logical_volume (StorageBlock block) {
             var group = block.volume_group;
             if (group == null) return;
-            var dialog = new CreateLogicalVolumeDialog (group);
+            var dialog = new CreateLogicalVolumeDialog (group, backend.snapshot);
             string identity = backend.modification_identity (block);
             dialog.response.connect ((response) => {
                 if (response != "create" || pending.contains (block.path)) return;
@@ -1408,6 +1455,8 @@ namespace MajorisDisks {
     [GtkTemplate (ui = "/com/majoris/disks/ui/btrfs-subvolumes-dialog.ui")]
     internal class BtrfsSubvolumesDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.ComboRow subvolumes;
+        [GtkChild] private unowned Adw.EntryRow new_subvolume;
+        public string new_name { owned get { return new_subvolume.text; } }
         private uint64[] ids = { 5 };
         public uint selected_id { get { return (uint) ids[subvolumes.selected]; } }
 
@@ -1428,6 +1477,11 @@ namespace MajorisDisks {
                 ? "Default subvolume ID %u. Changing the default affects future mounts without an explicit subvolume.".printf (info.default_id)
                 : info.default_unavailable != "" ? info.default_unavailable : "The default subvolume could not be read.";
             set_response_enabled ("apply", false);
+            new_subvolume.visible = can_change;
+            set_response_enabled ("create", false);
+            new_subvolume.changed.connect (() => {
+                set_response_enabled ("create", can_change && UDisksService.valid_btrfs_leaf (new_name));
+            });
             subvolumes.notify["selected"].connect (() => {
                 uint index = subvolumes.selected;
                 set_response_enabled ("apply", can_change && info.default_known && index < ids.length &&
@@ -1436,25 +1490,128 @@ namespace MajorisDisks {
         }
     }
 
-    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-create-dialog.ui")]
-    internal class CreateLogicalVolumeDialog : Adw.AlertDialog {
+    [GtkTemplate (ui = "/com/majoris/disks/ui/create-storage-group-dialog.ui")]
+    internal class CreateStorageGroupDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.EntryRow name_entry;
-        [GtkChild] private unowned Gtk.SpinButton capacity;
-        public string volume_name { owned get { return name_entry.text; } }
-        public uint64 bytes { get { return (uint64) capacity.get_value_as_int () * 1048576; } }
+        [GtkChild] private unowned Adw.ComboRow raid_level;
+        [GtkChild] private unowned Adw.ComboRow chunk_size;
+        [GtkChild] private unowned Gtk.ListBox devices;
+        [GtkChild] private unowned Adw.ActionRow estimate;
+        [GtkChild] private unowned Adw.SwitchRow erase;
+        private StorageBlock[] candidates = {};
+        private string[] candidate_identities = {};
+        private Gtk.CheckButton[] checks = {};
+        private bool raid;
+        public string group_name { owned get { return name_entry.text; } }
+        public string level { owned get {
+            string[] levels = { "raid0", "raid1", "raid4", "raid5", "raid6", "raid10" };
+            return raid ? levels[uint.min (raid_level.selected, 5)] : "";
+        } }
+        public uint64 chunk { get {
+            uint64[] sizes = { 0, 65536, 131072, 262144, 524288 };
+            return raid && level != "raid1" ? sizes[uint.min (chunk_size.selected, 4)] : 0;
+        } }
 
-        public CreateLogicalVolumeDialog (StorageVolumeGroup group) {
-            body = "%s · %s free".printf (group.name, format_size (group.free_size));
-            set_response_enabled ("create", false);
-            name_entry.changed.connect (() => {
-                set_response_enabled ("create", UDisksService.valid_lvm_name (volume_name) && bytes <= group.free_size);
-            });
-            capacity.value_changed.connect (() => {
-                set_response_enabled ("create", UDisksService.valid_lvm_name (volume_name) && bytes <= group.free_size);
-            });
+        public CreateStorageGroupDialog (UDisksService backend, bool raid) {
+            this.raid = raid;
+            heading = raid ? "Create RAID Array" : "Create LVM Volume Group";
+            body = "Choose unused devices. Creation erases every selected device.";
+            raid_level.visible = raid;
+            foreach (var block in backend.snapshot.blocks.get_values ()) {
+                if (!backend.can_use_group_member (block)) continue;
+                candidates += block;
+                candidate_identities += backend.modification_identity (block);
+                var check = new Gtk.CheckButton.with_label ("%s · %s".printf (block.preferred, format_size (block.size)));
+                checks += check;
+                check.toggled.connect (() => { erase.active = false; validate (); });
+                devices.append (check);
+            }
+            name_entry.changed.connect (validate);
+            raid_level.notify["selected"].connect (validate);
+            erase.notify["active"].connect (validate);
+            validate ();
+        }
+
+        public StorageBlock[] selected_members (out string[] identities) {
+            StorageBlock[] result = {};
+            string[] selected_identities = {};
+            for (int i = 0; i < checks.length; i++) {
+                if (!checks[i].active) continue;
+                result += candidates[i];
+                selected_identities += candidate_identities[i];
+            }
+            identities = selected_identities;
+            return result;
+        }
+
+        private void validate () {
+            string[] identities;
+            var members = selected_members (out identities);
+            uint minimum = raid ? UDisksService.raid_min_members (level) : 1;
+            chunk_size.visible = raid && level != "raid1";
+            uint64 smallest = uint64.MAX;
+            uint64 capacity = 0;
+            foreach (var block in members) {
+                smallest = uint64.min (smallest, block.size);
+                capacity += uint64.min (uint64.MAX - capacity, block.size);
+            }
+            if (raid && members.length >= minimum) {
+                uint64 data_members = members.length;
+                if (level == "raid1") data_members = 1;
+                else if (level == "raid4" || level == "raid5") data_members--;
+                else if (level == "raid6") data_members -= 2;
+                else if (level == "raid10") data_members /= 2;
+                capacity = uint64.min (smallest, uint64.MAX / data_members) * data_members;
+            }
+            estimate.subtitle = members.length >= minimum ? format_size (capacity) :
+                "Select at least %u devices.".printf (minimum);
+            set_response_enabled ("create", erase.active && members.length >= minimum &&
+                UDisksService.valid_lvm_name (group_name) && (!raid || group_name.length <= 32) &&
+                (level != "raid10" || members.length % 2 == 0));
         }
     }
 
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-create-dialog.ui")]
+    internal class CreateLogicalVolumeDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow name_entry;
+        [GtkChild] private unowned Adw.EntryRow capacity;
+        [GtkChild] private unowned Adw.ComboRow unit;
+        [GtkChild] private unowned Adw.ActionRow allocation;
+        private string[] used_names = {};
+        private StorageVolumeGroup group;
+        public string volume_name { owned get { return name_entry.text; } }
+        public uint64 bytes { get; private set; }
+
+        public CreateLogicalVolumeDialog (StorageVolumeGroup group, StorageSnapshot? snapshot = null) {
+            this.group = group;
+            if (snapshot != null) {
+                foreach (var item in snapshot.advanced.get_values ()) {
+                    var lv = item as StorageLogicalVolume;
+                    if (lv != null && lv.group_path == group.path) used_names += lv.name;
+                }
+            }
+            uint64 usable = group.extent_size == 0 ? 0 : group.free_size - group.free_size % group.extent_size;
+            body = "%s · %s allocatable · %s per extent".printf (group.name,
+                format_size (usable), format_size (group.extent_size));
+            name_entry.changed.connect (validate);
+            capacity.changed.connect (validate);
+            unit.notify["selected"].connect (validate);
+            validate ();
+        }
+
+        private void validate () {
+            uint64[] units = { 1048576, 1073741824, 1099511627776 };
+            uint64 size;
+            bool aligned = LvmCapacity.parse (capacity.text, units[uint.min (unit.selected, 2)],
+                group.extent_size, group.free_size, out size);
+            bytes = aligned ? size : 0;
+            allocation.subtitle = aligned
+                ? "%s allocated · %s free afterward".printf (format_size (size), format_size (group.free_size - size))
+                : "Enter an exact multiple of the extent size within the available capacity.";
+            set_response_enabled ("create", aligned && UDisksService.valid_lvm_name (volume_name) &&
+                !(volume_name in used_names));
+        }
+    }
     [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-rename-dialog.ui")]
     public class LvmRenameDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.EntryRow entry;
