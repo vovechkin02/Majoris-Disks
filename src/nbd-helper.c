@@ -1,211 +1,285 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#include "nbd-identity.h"
 #include <gio/gio.h>
 #include <fcntl.h>
-#include <linux/genetlink.h>
-#include <linux/nbd.h>
-#include <linux/nbd-netlink.h>
+#include <glib/gstdio.h>
+#include <signal.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define BUS_NAME "com.majoris.disks.Nbd"
 #define OBJECT_PATH "/com/majoris/disks/Nbd"
 #define ACTION BUS_NAME ".manage"
 
-typedef struct {
-    struct nlmsghdr header;
-    struct genlmsghdr generic;
-    guint8 attributes[512];
-} Request;
-
-static struct nlattr *
-append (Request *request, guint16 type, const void *value, guint16 size)
+static void
+close_fd (int *fd)
 {
-    struct nlattr *attribute = (void *) ((guint8 *) request + request->header.nlmsg_len);
-    attribute->nla_type = type;
-    attribute->nla_len = NLA_HDRLEN + size;
-    if (size != 0)
-        memcpy ((guint8 *) attribute + NLA_HDRLEN, value, size);
-    request->header.nlmsg_len += NLA_ALIGN (attribute->nla_len);
-    return attribute;
-}
-
-static gboolean
-exchange (int fd, Request *request, guint16 field, void *value, gsize size, GError **error)
-{
-    struct sockaddr_nl kernel = { .nl_family = AF_NETLINK };
-    if (sendto (fd, request, request->header.nlmsg_len, 0, (void *) &kernel, sizeof kernel) < 0)
-        goto failure;
-
-    for (;;) {
-        union { struct nlmsghdr align; guint8 bytes[8192]; } buffer;
-        struct sockaddr_nl sender;
-        socklen_t sender_size = sizeof sender;
-        ssize_t received = recvfrom (fd, buffer.bytes, sizeof buffer.bytes, 0, (void *) &sender, &sender_size);
-        if (received < 0)
-            goto failure;
-        if (received == 0 || sender_size != sizeof sender || sender.nl_pid != 0) {
-            errno = EPROTO;
-            goto failure;
-        }
-        int remaining = received;
-        for (struct nlmsghdr *message = &buffer.align; NLMSG_OK (message, remaining);
-             message = NLMSG_NEXT (message, remaining)) {
-            if (message->nlmsg_seq != request->header.nlmsg_seq)
-                continue;
-            if (message->nlmsg_type == NLMSG_ERROR && message->nlmsg_len >= NLMSG_LENGTH (sizeof (struct nlmsgerr))) {
-                struct nlmsgerr *reply = NLMSG_DATA (message);
-                if (reply->error) {
-                    errno = -reply->error;
-                    goto failure;
-                }
-                if (field == 0)
-                    return TRUE;
-                continue;
-            }
-            if (message->nlmsg_len < NLMSG_LENGTH (GENL_HDRLEN))
-                continue;
-            guint8 *cursor = (guint8 *) NLMSG_DATA (message) + GENL_HDRLEN;
-            gsize left = message->nlmsg_len - NLMSG_LENGTH (GENL_HDRLEN);
-            while (left >= NLA_HDRLEN) {
-                struct nlattr *attribute = (void *) cursor;
-                if (attribute->nla_len < NLA_HDRLEN || NLA_ALIGN (attribute->nla_len) > left)
-                    break;
-                if ((attribute->nla_type & NLA_TYPE_MASK) == field && attribute->nla_len == NLA_HDRLEN + size) {
-                    memcpy (value, cursor + NLA_HDRLEN, size);
-                    return TRUE;
-                }
-                left -= NLA_ALIGN (attribute->nla_len);
-                cursor += NLA_ALIGN (attribute->nla_len);
-            }
-        }
-    }
-failure:
-    g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "Kernel NBD request failed: %s", g_strerror (errno));
-    return FALSE;
-}
-
-static Request
-request_for (guint16 family, guint8 command, guint32 sequence)
-{
-    Request request = { 0 };
-    request.header.nlmsg_len = NLMSG_LENGTH (GENL_HDRLEN);
-    request.header.nlmsg_type = family;
-    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-    request.header.nlmsg_seq = sequence;
-    request.generic.cmd = command;
-    request.generic.version = 1;
-    return request;
+    if (*fd >= 0)
+        close (*fd);
 }
 
 static int
-open_netlink (guint16 *family, GError **error)
+private_directory (int parent, const char *name, uid_t owner, mode_t forbidden)
 {
-    int fd = socket (AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
-    struct timeval timeout = { .tv_sec = 10 };
-    if (fd < 0 || setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) != 0) {
-        g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "Cannot open NBD netlink: %s", g_strerror (errno));
-        if (fd >= 0) close (fd);
-        return -1;
-    }
-    Request query = request_for (GENL_ID_CTRL, CTRL_CMD_GETFAMILY, 1);
-    append (&query, CTRL_ATTR_FAMILY_NAME, "nbd", 4);
-    if (!exchange (fd, &query, CTRL_ATTR_FAMILY_ID, family, sizeof *family, error)) {
+    int fd = openat (parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat info;
+    if (fd >= 0 && (fstat (fd, &info) != 0 || info.st_uid != owner || (info.st_mode & forbidden))) {
         close (fd);
         return -1;
     }
     return fd;
 }
 
-static gboolean
-connect_device (int socket_fd, guint64 capacity, guint64 sector, guint64 flags, const char *identity,
-                guint32 *index, GError **error)
+static int
+export_socket (guint uid, const char *token)
 {
-    guint16 family;
-    int fd = open_netlink (&family, error);
-    if (fd < 0) return FALSE;
-    Request request = request_for (family, NBD_CMD_CONNECT, 2);
-    guint64 timeout = 30;
-    guint64 client_flags = NBD_CFLAG_DESTROY_ON_DISCONNECT;
-    guint32 socket_number = socket_fd;
-    append (&request, NBD_ATTR_SIZE_BYTES, &capacity, sizeof capacity);
-    append (&request, NBD_ATTR_BLOCK_SIZE_BYTES, &sector, sizeof sector);
-    append (&request, NBD_ATTR_SERVER_FLAGS, &flags, sizeof flags);
-    append (&request, NBD_ATTR_CLIENT_FLAGS, &client_flags, sizeof client_flags);
-    append (&request, NBD_ATTR_TIMEOUT, &timeout, sizeof timeout);
-    append (&request, NBD_ATTR_BACKEND_IDENTIFIER, identity, strlen (identity) + 1);
-    struct nlattr *sockets = append (&request, NBD_ATTR_SOCKETS | NLA_F_NESTED, NULL, 0);
-    struct nlattr *item = append (&request, NBD_SOCK_ITEM | NLA_F_NESTED, NULL, 0);
-    append (&request, NBD_SOCK_FD, &socket_number, sizeof socket_number);
-    item->nla_len = (guint8 *) &request + request.header.nlmsg_len - (guint8 *) item;
-    sockets->nla_len = (guint8 *) &request + request.header.nlmsg_len - (guint8 *) sockets;
-    gboolean ok = exchange (fd, &request, NBD_ATTR_INDEX, index, sizeof *index, error);
-    close (fd);
-    return ok;
+    g_autofree char *username = g_strdup_printf ("%u", uid);
+    int run __attribute__((cleanup(close_fd))) = private_directory (AT_FDCWD, "/run", 0, 0022);
+    if (run < 0) return -1;
+    int users __attribute__((cleanup(close_fd))) = private_directory (run, "user", 0, 0022);
+    if (users < 0) return -1;
+    int runtime __attribute__((cleanup(close_fd))) = private_directory (users, username, uid, 0077);
+    if (runtime < 0) return -1;
+    int app __attribute__((cleanup(close_fd))) = private_directory (runtime, "majoris-nbd", uid, 0077);
+    if (app < 0) return -1;
+    int session __attribute__((cleanup(close_fd))) = private_directory (app, token, uid, 0077);
+    if (session < 0) return -1;
+    int endpoint __attribute__((cleanup(close_fd))) = private_directory (session, "socket", uid, 0077);
+    if (endpoint < 0) return -1;
+
+    int fd = openat (endpoint, "export.sock", O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    struct stat info;
+    if (fd >= 0 && (fstat (fd, &info) != 0 || !S_ISSOCK (info.st_mode) || info.st_uid != uid)) {
+        close (fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int
+verify_exporter (int endpoint, guint uid)
+{
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    g_snprintf (address.sun_path, sizeof address.sun_path, "/proc/self/fd/%d", endpoint);
+    int probe __attribute__((cleanup(close_fd))) = socket (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    struct ucred peer;
+    socklen_t length = sizeof peer;
+    if (probe < 0 || connect (probe, (struct sockaddr *) &address, sizeof address) != 0 ||
+        getsockopt (probe, SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0 ||
+        length != sizeof peer || peer.uid != uid || peer.pid <= 0)
+        return -1;
+    g_autofree char *exe = g_strdup_printf ("/proc/%d/exe", peer.pid);
+    struct stat actual, installed;
+    if (stat (exe, &actual) != 0 || stat ("/usr/bin/qemu-nbd", &installed) != 0 ||
+        actual.st_dev != installed.st_dev || actual.st_ino != installed.st_ino)
+        return -1;
+    int verified = probe;
+    probe = -1;
+    return verified;
 }
 
 static gboolean
-find_attachment (const char *identity, guint32 *index)
+read_number (guint index, const char *attribute, guint64 *number)
 {
-    g_autoptr(GDir) devices = g_dir_open ("/sys/block", 0, NULL);
-    if (devices == NULL) return FALSE;
+    g_autofree char *path = g_strdup_printf ("/sys/block/nbd%u/%s", index, attribute);
+    g_autofree char *value = NULL;
+    return g_file_get_contents (path, &value, NULL, NULL) &&
+           g_ascii_string_to_unsigned (g_strstrip (value), 10, 0, G_MAXUINT64, number, NULL);
+}
+
+static gboolean
+has_client (guint index)
+{
+    g_autofree char *path = g_strdup_printf ("/sys/block/nbd%u/pid", index);
+    struct stat info;
+    return lstat (path, &info) == 0 || errno != ENOENT;
+}
+
+static int
+claim_device (guint index)
+{
+    g_autofree char *path = g_strdup_printf ("/dev/nbd%u", index);
+    g_autofree char *sysfs = g_strdup_printf ("/sys/block/nbd%u/dev", index);
+    g_autofree char *number = NULL;
+    int fd = open (path, O_RDONLY | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    struct stat info;
+    if (fd < 0)
+        return -1;
+    if (fstat (fd, &info) == 0 && S_ISBLK (info.st_mode) &&
+        g_file_get_contents (sysfs, &number, NULL, NULL)) {
+        g_autofree char *expected = g_strdup_printf ("%u:%u", major (info.st_rdev), minor (info.st_rdev));
+        if (g_str_equal (g_strstrip (number), expected))
+            return fd;
+    }
+    close (fd);
+    return -1;
+}
+
+static int
+allocate_device (guint *index, GError **error)
+{
+    g_autoptr(GDir) devices = g_dir_open ("/sys/block", 0, error);
+    if (devices == NULL)
+        return -1;
     const char *name;
     while ((name = g_dir_read_name (devices)) != NULL) {
-        if (!g_str_has_prefix (name, "nbd")) continue;
-        const char *suffix = name + 3;
-        if (*suffix == 0 || strspn (suffix, "0123456789") != strlen (suffix)) continue;
-        guint64 number = g_ascii_strtoull (suffix, NULL, 10);
-        if (number > G_MAXUINT32) continue;
-        g_autofree char *path = g_build_filename ("/sys/block", name, "backend", NULL);
-        g_autofree char *actual = NULL;
-        if (g_file_get_contents (path, &actual, NULL, NULL) && g_str_equal (g_strstrip (actual), identity)) {
-            *index = (guint32) number;
-            return TRUE;
+        guint64 candidate, size;
+        if (!g_str_has_prefix (name, "nbd") ||
+            !g_ascii_string_to_unsigned (name + 3, 10, 0, G_MAXUINT, &candidate, NULL) ||
+            has_client (candidate))
+            continue;
+        int fd = claim_device (candidate);
+        if (fd < 0)
+            continue;
+        if (!has_client (candidate) && read_number (candidate, "size", &size) && size == 0) {
+            *index = (guint) candidate;
+            return fd;
         }
+        close (fd);
     }
+    g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_BUSY,
+        "No available NBD device. Load the NBD module with partition support or release an unused device.");
+    return -1;
+}
+
+static gboolean
+run_client (const char *const *argv, int endpoint, GPid *pid, GError **error)
+{
+    const int socket_fd = 3;
+    if (!g_spawn_async_with_pipes_and_fds (NULL, argv, NULL,
+        G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL,
+        NULL, NULL, -1, -1, -1, &endpoint, &socket_fd, endpoint >= 0 ? 1 : 0,
+        pid, NULL, NULL, NULL, error))
+        return FALSE;
+
+    gint64 deadline = g_get_monotonic_time () + 20 * G_TIME_SPAN_SECOND;
+    int status;
+    do {
+        pid_t child = waitpid (*pid, &status, WNOHANG);
+        if (child == *pid)
+            return g_spawn_check_wait_status (status, error);
+        if (child < 0 && errno != EINTR) {
+            g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "Could not wait for nbd-client: %s", g_strerror (errno));
+            return FALSE;
+        }
+        g_usleep (10000);
+    } while (g_get_monotonic_time () < deadline);
+
+    // The child remains ours until it is reaped, so its PID cannot have been reused.
+    kill (*pid, SIGKILL);
+    while (waitpid (*pid, &status, 0) < 0 && errno == EINTR) {}
+    g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT, "nbd-client did not finish in time.");
+    return FALSE;
+}
+static gboolean
+disconnect_client (guint index, int *block, const char *identity, GError **error)
+{
+    g_autofree char *live = majoris_nbd_identity (index, NULL);
+    if (live == NULL || g_strcmp0 (live, identity) != 0) {
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "NBD ownership changed.");
+        return FALSE;
+    }
+    g_autofree char *path = g_strdup_printf ("/dev/nbd%u", index);
+    const char *argv[] = { MAJORIS_NBD_CLIENT, "-d", path, NULL };
+    GPid pid = 0;
+    g_autoptr(GError) client_error = NULL;
+    run_client (argv, -1, &pid, &client_error);
+    // The open block device pins the old kernel configuration until the disconnect request returns.
+    close_fd (block);
+    *block = -1;
+    for (guint i = 0; i < 50; i++) {
+        guint64 size;
+        if (!has_client (index) && read_number (index, "size", &size) && size == 0)
+            return TRUE;
+        g_usleep (100000);
+    }
+    if (client_error != NULL)
+        g_propagate_error (error, g_steal_pointer (&client_error));
+    else
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT, "The kernel has not released the NBD device.");
     return FALSE;
 }
 
 static gboolean
-owns_device (guint32 index, const char *identity, dev_t expected)
+write_record (guint index, guint uid, const char *token, const char *identity, GError **error)
 {
-    g_autofree char *base = g_strdup_printf ("/sys/block/nbd%u", index);
-    g_autofree char *backend = g_build_filename (base, "backend", NULL);
-    g_autofree char *dev = g_build_filename (base, "dev", NULL);
-    g_autofree char *stored = NULL;
-    g_autofree char *number = NULL;
-    g_autofree char *expected_number = g_strdup_printf ("%u:%u", major (expected), minor (expected));
-    return g_file_get_contents (backend, &stored, NULL, NULL) &&
-           g_file_get_contents (dev, &number, NULL, NULL) &&
-           g_str_equal (g_strstrip (stored), identity) && g_str_equal (g_strstrip (number), expected_number);
+    g_autoptr(GKeyFile) record = g_key_file_new ();
+    g_key_file_set_uint64 (record, "attachment", "uid", uid);
+    g_key_file_set_string (record, "attachment", "token", token);
+    g_key_file_set_string (record, "attachment", "identity", identity);
+    gsize length;
+    g_autofree char *data = g_key_file_to_data (record, &length, NULL);
+    g_autofree char *path = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", index);
+    return g_file_set_contents_full (path, data, length, G_FILE_SET_CONTENTS_CONSISTENT, 0644, error);
 }
 
 static gboolean
-disconnect_device (guint32 index, const char *identity, GError **error)
+attach_device (guint uid, const char *token, guint64 capacity, gboolean read_only,
+               guint *index, gboolean *uncertain, GError **error)
 {
-    g_autofree char *path = g_strdup_printf ("/dev/nbd%u", index);
-    int block = open (path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_EXCL);
-    if (block < 0) {
-        g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "Cannot claim the NBD device: %s", g_strerror (errno));
+    int endpoint __attribute__((cleanup(close_fd))) = export_socket (uid, token);
+    if (endpoint < 0) {
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "The private NBD socket could not be verified.");
         return FALSE;
     }
-    struct stat info;
-    gboolean ok = FALSE;
-    if (fstat (block, &info) != 0 || !S_ISBLK (info.st_mode) || !owns_device (index, identity, info.st_rdev)) {
-        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "NBD attachment ownership does not match.");
-    } else {
-        guint16 family;
-        int fd = open_netlink (&family, error);
-        if (fd >= 0) {
-            Request request = request_for (family, NBD_CMD_DISCONNECT, 2);
-            append (&request, NBD_ATTR_INDEX, &index, sizeof index);
-            ok = exchange (fd, &request, 0, NULL, 0, error);
-            close (fd);
-        }
+    int block __attribute__((cleanup(close_fd))) = allocate_device (index, error);
+    if (block < 0)
+        return FALSE;
+    // Opening an idle NBD node creates a kernel configuration. Release it before connecting.
+    close_fd (&block);
+    block = -1;
+    int probe __attribute__((cleanup(close_fd))) = verify_exporter (endpoint, uid);
+    if (probe < 0) {
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "The NBD socket peer is not the caller's QEMU exporter.");
+        return FALSE;
     }
-    close (block);
-    return ok;
+    g_autofree char *path = g_strdup_printf ("/dev/nbd%u", *index);
+    const char *argv[] = { MAJORIS_NBD_CLIENT, "-unix", "/proc/self/fd/3", path, "-name", token,
+        "-timeout", "30", read_only ? "-readonly" : NULL, NULL };
+    // The client resolves the pinned socket inode, even if its original pathname changes.
+    GPid spawned = 0;
+    g_autoptr(GError) client_error = NULL;
+    gboolean success = run_client (argv, endpoint, &spawned, &client_error);
+    guint kernel_pid = 0;
+    g_autofree char *identity = majoris_nbd_identity (*index, &kernel_pid);
+    if (identity == NULL || kernel_pid != (guint) spawned) {
+        *uncertain = success || (spawned > 0 && identity == NULL && has_client (*index));
+        if (client_error != NULL)
+            g_propagate_prefixed_error (error, g_steal_pointer (&client_error), "nbd-client could not connect: ");
+        else
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "The kernel did not confirm this NBD client.");
+        return FALSE;
+    }
+
+    guint64 sectors, readonly;
+    gboolean recorded = write_record (*index, uid, token, identity, error);
+    gboolean valid = success && read_number (*index, "size", &sectors) && sectors == capacity / 512 &&
+                     read_number (*index, "ro", &readonly) && readonly == (guint64) read_only;
+    if (valid && recorded) {
+        g_autofree char *verified = majoris_nbd_token (*index, uid);
+        if (g_strcmp0 (verified, token) == 0)
+            return TRUE;
+    }
+
+    g_autoptr(GError) rollback = NULL;
+    block = claim_device (*index);
+    if (block < 0 || !disconnect_client (*index, &block, identity, &rollback)) {
+        *uncertain = TRUE;
+        if (error != NULL && *error == NULL)
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not roll back the NBD mapping.");
+        return FALSE;
+    }
+    g_autofree char *record = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", *index);
+    if (recorded)
+        g_unlink (record);
+    if (error != NULL && *error == NULL)
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "The attached NBD capacity or access mode could not be verified.");
+    return FALSE;
 }
 
 static gboolean
@@ -242,79 +316,115 @@ authorize (GDBusConnection *bus, const char *sender, guint32 *uid, GError **erro
     return FALSE;
 }
 
+static int
+lock_state (GError **error)
+{
+    struct stat info;
+    if (g_mkdir (MAJORIS_NBD_STATE, 0755) != 0 && errno != EEXIST)
+        goto failed;
+    if (lstat (MAJORIS_NBD_STATE, &info) != 0 || !S_ISDIR (info.st_mode) ||
+        info.st_uid != 0 || (info.st_mode & 0022) != 0)
+        goto failed;
+    int fd = open (MAJORIS_NBD_STATE "/lock", O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0 && flock (fd, LOCK_EX | LOCK_NB) == 0)
+        return fd;
+    if (fd >= 0)
+        close (fd);
+failed:
+    g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_BUSY, "The system NBD allocation lock is unavailable.");
+    return -1;
+}
+
+static gboolean
+token_in_use (guint uid, const char *token)
+{
+    g_autoptr(GDir) records = g_dir_open (MAJORIS_NBD_STATE, 0, NULL);
+    if (records == NULL)
+        return TRUE;
+    const char *name;
+    while ((name = g_dir_read_name (records)) != NULL) {
+        guint64 index;
+        if (!g_str_has_prefix (name, "nbd") ||
+            !g_ascii_string_to_unsigned (name + 3, 10, 0, G_MAXUINT, &index, NULL))
+            continue;
+        g_autofree char *current = majoris_nbd_token (index, uid);
+        if (g_strcmp0 (current, token) == 0)
+            return TRUE;
+        guint64 size;
+        if (!has_client (index) && read_number (index, "size", &size) && size == 0) {
+            g_autofree char *stale = g_build_filename (MAJORIS_NBD_STATE, name, NULL);
+            g_unlink (stale);
+        }
+    }
+    return FALSE;
+}
+
+static gboolean
+detach_device (guint uid, guint index, const char *token, GError **error)
+{
+    int block __attribute__((cleanup(close_fd))) = claim_device (index);
+    g_autofree char *identity = majoris_nbd_identity (index, NULL);
+    g_autofree char *owner = majoris_nbd_token (index, uid);
+    if (identity == NULL || g_strcmp0 (owner, token) != 0) {
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "NBD attachment ownership could not be verified.");
+        return FALSE;
+    }
+    if (block < 0) {
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_BUSY, "The NBD device or one of its partitions is in use.");
+        return FALSE;
+    }
+    if (!disconnect_client (index, &block, identity, error))
+        return FALSE;
+    g_autofree char *path = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", index);
+    if (g_unlink (path) != 0 && errno != ENOENT)
+        g_warning ("Could not remove inactive NBD record: %s", g_strerror (errno));
+    return TRUE;
+}
+
 static void
 method_call (GDBusConnection *bus, const char *sender, const char *path, const char *interface,
              const char *method, GVariant *arguments, GDBusMethodInvocation *invocation, gpointer unused)
 {
     g_autoptr(GError) error = NULL;
-    g_autofree char *identity = NULL;
-    guint32 uid, index;
+    guint32 uid, index = 0;
     const char *token;
+    guint64 capacity = 0;
+    gboolean read_only = TRUE;
     gboolean attach = g_str_equal (method, "Attach");
-    if (!attach && !g_str_equal (method, "Detach")) {
-        g_dbus_method_invocation_return_error_literal (invocation, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Unknown NBD operation.");
-        return;
-    }
-    gint32 handle = -1;
-    guint64 capacity = 0, sector = 0, flags = 0;
     if (attach)
-        g_variant_get (arguments, "(h&sttt)", &handle, &token, &capacity, &sector, &flags);
+        g_variant_get (arguments, "(&stb)", &token, &capacity, &read_only);
     else
         g_variant_get (arguments, "(u&s)", &index, &token);
     if (!g_uuid_string_is_valid (token) ||
-        (attach && (sector < 512 || sector > 4096 || (sector & (sector - 1)) != 0 ||
-         capacity == 0 || capacity > G_MAXINT64 || capacity % sector != 0 ||
-         (flags & ~(guint64) (NBD_FLAG_HAS_FLAGS | NBD_FLAG_READ_ONLY | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_FUA)) != 0 ||
-         (flags & NBD_FLAG_HAS_FLAGS) == 0))) {
-        g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Invalid NBD attachment parameters.");
-        goto done;
+        (attach && (capacity == 0 || capacity > G_MAXINT64 || capacity % 512 != 0))) {
+        g_dbus_method_invocation_return_error_literal (invocation, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+            "Invalid NBD attachment parameters.");
+        return;
     }
-    if (!authorize (bus, sender, &uid, &error)) goto done;
-    identity = g_strdup_printf ("majoris:%u:%s", uid, token);
-    if (attach) {
-        if (find_attachment (identity, &index)) {
-            g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_EXISTS, "This attachment token is already connected.");
-            goto done;
+    if (!authorize (bus, sender, &uid, &error)) {
+        g_dbus_method_invocation_return_gerror (invocation, error);
+        return;
+    }
+    int lock __attribute__((cleanup(close_fd))) = lock_state (&error);
+    if (lock >= 0) {
+        if (!attach && detach_device (uid, index, token, &error)) {
+            g_dbus_method_invocation_return_value (invocation, NULL);
+            return;
         }
-        GUnixFDList *list = g_dbus_message_get_unix_fd_list (g_dbus_method_invocation_get_message (invocation));
-        int fd = list != NULL && handle >= 0 && handle < g_unix_fd_list_get_length (list) ?
-                 g_unix_fd_list_get (list, handle, &error) : -1;
-        if (fd < 0) {
-            if (error == NULL) g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Missing NBD socket.");
-            goto done;
-        }
-        struct sockaddr_storage peer;
-        struct ucred credentials;
-        int type;
-        socklen_t peer_size = sizeof peer, credentials_size = sizeof credentials, type_size = sizeof type;
-        if (getpeername (fd, (struct sockaddr *) &peer, &peer_size) != 0 || peer.ss_family != AF_UNIX ||
-            getsockopt (fd, SOL_SOCKET, SO_TYPE, &type, &type_size) != 0 || type != SOCK_STREAM ||
-            getsockopt (fd, SOL_SOCKET, SO_PEERCRED, &credentials, &credentials_size) != 0 || credentials.uid != uid) {
-            g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "The NBD export must be a local socket owned by the caller.");
-            close (fd);
-            goto done;
-        }
-        gboolean ok = connect_device (fd, capacity, sector, flags, identity, &index, &error);
-        close (fd);
-        if (!ok) {
-            if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK) ||
-                g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT)) {
-                if (find_attachment (identity, &index))
-                    g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", index));
-                else
-                    g_dbus_method_invocation_return_dbus_error (invocation, BUS_NAME ".Error.Uncertain",
-                        "The kernel did not confirm the connection. Keep the attachment record for reconciliation.");
+        if (attach && token_in_use (uid, token))
+            g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_EXISTS, "This NBD token is already attached.");
+        else if (attach) {
+            gboolean uncertain = FALSE;
+            if (attach_device (uid, token, capacity, read_only, &index, &uncertain, &error)) {
+                g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", index));
                 return;
             }
-            goto done;
+            if (uncertain) {
+                g_dbus_method_invocation_return_dbus_error (invocation, BUS_NAME ".Error.Uncertain", error->message);
+                return;
+            }
         }
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", index));
-    } else {
-        if (!disconnect_device (index, identity, &error)) goto done;
-        g_dbus_method_invocation_return_value (invocation, NULL);
     }
-    return;
-done:
     g_dbus_method_invocation_return_gerror (invocation, error);
 }
 
@@ -322,9 +432,8 @@ int
 main (void)
 {
     static const char xml[] = "<node><interface name='" BUS_NAME "'>"
-        "<method name='Attach'><arg type='h' direction='in'/><arg type='s' direction='in'/>"
-        "<arg type='t' direction='in'/><arg type='t' direction='in'/><arg type='t' direction='in'/>"
-        "<arg type='u' direction='out'/></method>"
+        "<method name='Attach'><arg type='s' direction='in'/><arg type='t' direction='in'/>"
+        "<arg type='b' direction='in'/><arg type='u' direction='out'/></method>"
         "<method name='Detach'><arg type='u' direction='in'/><arg type='s' direction='in'/></method>"
         "</interface></node>";
     static const GDBusInterfaceVTable vtable = { .method_call = method_call };

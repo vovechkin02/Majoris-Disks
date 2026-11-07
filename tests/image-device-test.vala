@@ -96,6 +96,37 @@ private async void exercise_devices (bool use_xz) throws Error {
     }
 }
 
+private const int NBD_FIXTURE_OFFSET = 32 * 1024 * 1024;
+
+private void set_nbd_marker (File fixture, string marker) throws Error {
+    var stream = fixture.open_readwrite ();
+    ((Seekable) stream).seek (NBD_FIXTURE_OFFSET, SeekType.SET);
+    size_t written;
+    stream.output_stream.write_all (marker.data, out written);
+    stream.close ();
+}
+
+private async void verify_nbd_marker (UDisksService backend, StorageBlock block, File copy, string marker) throws Error {
+    try {
+        yield backend.create_disk_image (block, copy, backend.modification_identity (block), true);
+        var stream = copy.read ();
+        ((Seekable) stream).seek (NBD_FIXTURE_OFFSET, SeekType.SET);
+        uint8[] bytes = new uint8[marker.length];
+        size_t count;
+        stream.read_all (bytes, out count);
+        stream.close ();
+        if (count != marker.length || new Bytes (bytes).compare (new Bytes (marker.data)) != 0)
+            throw new IOError.INVALID_DATA ("The NBD device did not return the expected fixture bytes.");
+    } finally { FileUtils.unlink (copy.get_path ()); }
+}
+
+private void verify_nbd_cleanup (VirtualAttachment record) throws Error {
+    string session = Path.build_filename (Environment.get_user_runtime_dir (), "majoris-nbd", record.token);
+    if (VirtualDiskAttachment.lookup ("/dev/nbd%u".printf (record.index)) != null ||
+        FileUtils.test (session, FileTest.EXISTS))
+        throw new IOError.FAILED ("The NBD fixture still has a managed mapping or runtime record.");
+}
+
 private async void exercise_nbd_devices () throws Error {
     string directory = DirUtils.make_tmp ("majoris-nbd-tests-XXXXXX");
     var raw = File.new_for_path (Path.build_filename (directory, "source.img"));
@@ -109,6 +140,8 @@ private async void exercise_nbd_devices () throws Error {
         var formatter = new Subprocess.newv ({ "mkfs.ext4", "-q", "-F", "-b", "4096",
             "-E", "offset=1048576", raw.get_path (), "4096" }, SubprocessFlags.NONE);
         yield formatter.wait_check_async ();
+        var readback = File.new_for_path (Path.build_filename (directory, "readback.img"));
+        set_nbd_marker (raw, "Majoris read fixture");
 
         foreach (var format in new string[] { "vpc", "vhdx", "qcow2" }) {
             var image = File.new_for_path (Path.build_filename (directory, format));
@@ -145,6 +178,7 @@ private async void exercise_nbd_devices () throws Error {
                 var partitions = block.table?.partitions ?? new StorageBlock[0];
                 if (partitions.length != 1 || partitions[0].type_id != "ext4")
                     throw new IOError.INVALID_DATA ("The virtual fixture partition and filesystem were not discovered.");
+                yield verify_nbd_marker (backend, block, readback, "Majoris read fixture");
                 yield backend.volume_action (partitions[0], "Mount");
                 mounted = partitions[0];
                 try {
@@ -153,7 +187,9 @@ private async void exercise_nbd_devices () throws Error {
                 } catch (Error error) { assert (error is IOError.BUSY); }
                 yield backend.volume_action (mounted, "Unmount");
                 mounted = null;
+                var record = block.virtual_attachment;
                 yield backend.detach_disk_image (block);
+                verify_nbd_cleanup (record);
                 block = null;
                 retain = false;
 
@@ -163,7 +199,23 @@ private async void exercise_nbd_devices () throws Error {
                     block = backend.snapshot.blocks.lookup (writable_path);
                     if (block == null || block.virtual_attachment?.file != image.get_path () || block.read_only)
                         throw new IOError.INVALID_DATA ("The writable virtual fixture could not be verified.");
+                    set_nbd_marker (raw, "Majoris write test  ");
+                    var restored = yield backend.restore_disk_image (block, raw, backend.modification_identity (block));
+                    if (!restored.successful)
+                        throw new IOError.FAILED (restored.summary + " " + restored.technical_error);
+                    record = block.virtual_attachment;
                     yield backend.detach_disk_image (block);
+                    verify_nbd_cleanup (record);
+                    block = null;
+
+                    string check_path = yield backend.attach_virtual_image (image, true);
+                    block = backend.snapshot.blocks.lookup (check_path);
+                    if (block == null || block.virtual_attachment?.file != image.get_path () || !block.read_only)
+                        throw new IOError.INVALID_DATA ("Could not reopen the writable fixture read-only.");
+                    yield verify_nbd_marker (backend, block, readback, "Majoris write test  ");
+                    record = block.virtual_attachment;
+                    yield backend.detach_disk_image (block);
+                    verify_nbd_cleanup (record);
                     block = null;
                     retain = false;
                 }

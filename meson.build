@@ -22,6 +22,9 @@ sh = find_program('sh')
 native_xz_test = executable('native-xz-test', 'tests/xz-stream-test.c', 'src/xz-stream.c',
   include_directories: xz_include, dependencies: [dependency('gio-2.0'), xz_dep])
 test('native-xz', native_xz_test)
+nbd_helper_test = executable('nbd-helper-test', 'tests/nbd-helper-test.c', 'src/nbd-identity.c',
+  include_directories: xz_include, dependencies: dependency('gio-2.0'))
+test('nbd-helper', nbd_helper_test)
 test('storage-model', layout_test)
 test('filesystem-capacity-integration', sh,
   args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test])

@@ -10,11 +10,8 @@ namespace MajorisDisks {
         public string exporter_start = "";
     }
 
-    [CCode (cname = "majoris_nbd_client_available", cheader_filename = "nbd-client.h")]
-    private extern bool nbd_client_available ();
-    [CCode (cname = "majoris_nbd_negotiate", cheader_filename = "nbd-client.h")]
-    private extern int nbd_negotiate (string path, uint64 capacity, bool read_only, Cancellable token,
-        out uint64 sector, out uint64 flags) throws Error;
+    [CCode (cname = "majoris_nbd_token", cheader_filename = "nbd-identity.h")]
+    private extern string? nbd_token (uint index, uint uid);
 
     [CCode (cname = "flock", cheader_filename = "sys/file.h")]
     private extern int lock_file (int fd, int operation);
@@ -32,7 +29,7 @@ namespace MajorisDisks {
                 return "Install qemu-utils and Bubblewrap to attach virtual disks.";
             if (!FileUtils.test ("/usr/bin/setsid", FileTest.IS_EXECUTABLE))
                 return "Install util-linux to supervise virtual-disk exports.";
-            if (!nbd_client_available ()) return "Install libnbd0 to attach virtual disks.";
+            if (!FileUtils.test ("/usr/sbin/nbd-client", FileTest.IS_EXECUTABLE)) return "Install nbd-client to attach virtual disks.";
             if (!FileUtils.test ("/sys/module/nbd", FileTest.IS_DIR))
                 return "Load the Linux NBD module with partition support to attach virtual disks.";
             string partitions;
@@ -46,7 +43,7 @@ namespace MajorisDisks {
                     FileTest.IS_REGULAR)) helper_installed = true;
             }
             if (!helper_installed) return "Install the Majoris NBD authorization helper to attach virtual disks.";
-            if (Environment.get_variable ("XDG_RUNTIME_DIR") == null)
+            if (Environment.get_user_runtime_dir () != "/run/user/%u".printf ((uint) Posix.getuid ()))
                 return "A desktop runtime directory is required to attach virtual disks.";
             return null;
         }
@@ -55,19 +52,8 @@ namespace MajorisDisks {
             return Path.build_filename (Environment.get_user_runtime_dir (), "majoris-nbd");
         }
 
-        private static string owner_prefix () {
-            return "majoris:%u:".printf ((uint) Posix.getuid ());
-        }
-
         private static string device_token (uint index) {
-            string backend;
-            try { FileUtils.get_contents ("/sys/block/nbd%u/backend".printf (index), out backend); }
-            catch (Error error) { return ""; }
-            backend = backend.strip ();
-            string prefix = owner_prefix ();
-            if (!backend.has_prefix (prefix)) return "";
-            string token = backend.substring (prefix.length);
-            return Uuid.string_is_valid (token) ? token : "";
+            return nbd_token (index, (uint) Posix.getuid ()) ?? "";
         }
 
         internal static bool parse_device (string device, out uint index) {
@@ -123,6 +109,11 @@ namespace MajorisDisks {
             return "%s:%s".printf (((uint64) info.st_dev).to_string (), ((uint64) info.st_ino).to_string ());
         }
 
+        private static bool same_source (string path, string key) {
+            Posix.Stat info = {};
+            return Posix.lstat (path, out info) == 0 && Posix.S_ISREG (info.st_mode) && file_key (info) == key;
+        }
+
         private static bool token_has_device (string token) throws Error {
             var devices = Dir.open ("/sys/block");
             string? name;
@@ -166,29 +157,7 @@ namespace MajorisDisks {
             yield;
         }
 
-        private static async int negotiate (string path, uint64 capacity, bool read_only, Cancellable token,
-            out uint64 sector, out uint64 flags) throws Error {
-            var context = MainContext.ref_thread_default ();
-            int socket = -1;
-            uint64 negotiated_sector = 0;
-            uint64 negotiated_flags = 0;
-            Error? failure = null;
-            new Thread<void*>.try ("nbd-negotiation", () => {
-                try { socket = nbd_negotiate (path, capacity, read_only, token, out negotiated_sector, out negotiated_flags); }
-                catch (Error error) { failure = error; }
-                var resume = new IdleSource ();
-                resume.set_callback (negotiate.callback);
-                resume.attach (context);
-                return null;
-            });
-            yield;
-            if (failure != null) throw failure;
-            sector = negotiated_sector;
-            flags = negotiated_flags;
-            return socket;
-        }
-
-        private static Subprocess export_image (int fd, string format, string directory, bool read_only) throws Error {
+        private static Subprocess export_image (int fd, string format, string directory, string id, bool read_only) throws Error {
             var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_SILENCE | SubprocessFlags.STDERR_SILENCE);
             int image = Posix.dup (fd);
             if (image < 0) throw new IOError.FAILED ("Could not retain the virtual image descriptor.");
@@ -199,7 +168,7 @@ namespace MajorisDisks {
                 "--ro-bind", "/usr", "/usr", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
                 "--dev", "/dev", "--tmpfs", "/tmp", read_only ? "--ro-bind-fd" : "--bind-fd", "3", "/source",
                 "--bind", directory, "/export", "--", "/usr/bin/qemu-nbd", "--socket=/export/export.sock",
-                "--format=" + format, "--shared=1", "--handshake-limit=10" };
+                "--format=" + format, "--shared=2", "--export-name=" + id, "--handshake-limit=10" };
             if (read_only) arguments += "--read-only";
             arguments += "/source";
             return launcher.spawnv (arguments);
@@ -216,7 +185,6 @@ namespace MajorisDisks {
                 Posix.O_CREAT | Posix.O_RDWR | Posix.O_NOFOLLOW | Posix.O_CLOEXEC, 0600);
             if (lock < 0) throw new IOError.FAILED ("Could not open the virtual-image operation lock.");
             int fd = -1;
-            int socket = -1;
             string? directory = null;
             Subprocess? exporter = null;
             bool dispatched = false;
@@ -259,7 +227,7 @@ namespace MajorisDisks {
                 record.set_string ("image", "format", inspected.format);
                 record.set_uint64 ("image", "capacity", inspected.capacity);
                 record.save_to_file (Path.build_filename (directory, "image.ini"));
-                exporter = export_image (fd, inspected.format, socket_directory, read_only);
+                exporter = export_image (fd, inspected.format, socket_directory, id, read_only);
                 uint pid;
                 if (!uint.try_parse (exporter.get_identifier () ?? "", out pid))
                     throw new IOError.FAILED ("Could not identify the QEMU exporter process.");
@@ -274,25 +242,32 @@ namespace MajorisDisks {
                         throw new IOError.FAILED ("The QEMU exporter exited without opening its private socket.");
                     yield wait_tick ();
                 }
-                uint64 sector, flags;
-                socket = yield negotiate (endpoint, inspected.capacity, read_only, token, out sector, out flags);
+                Posix.Stat socket_info = {};
+                if (Posix.lstat (endpoint, out socket_info) != 0 || !Posix.S_ISSOCK (socket_info.st_mode))
+                    throw new IOError.TIMED_OUT ("The QEMU exporter did not create its private socket.");
                 token.set_error_if_cancelled ();
-                if (original != image_identity (fd))
+                if (original != image_identity (fd) || !same_source (path, key))
                     throw new IOError.INVALID_DATA ("The image changed before the NBD export was connected.");
                 var bus = yield Bus.get (BusType.SYSTEM, token);
-                var descriptors = new UnixFDList ();
-                int handle = descriptors.append (socket);
                 dispatched = true;
                 // After dispatch, wait for the result even if the user closes the dialog.
-                var reply = yield bus.call_with_unix_fd_list (BUS, OBJECT, BUS, "Attach",
-                    new Variant ("(hsttt)", handle, id, inspected.capacity, sector, flags),
-                    new VariantType ("(u)"), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 150000, descriptors, null);
+                var reply = yield bus.call (BUS, OBJECT, BUS, "Attach",
+                    new Variant ("(stb)", id, inspected.capacity, read_only),
+                    new VariantType ("(u)"), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 180000, null);
                 uint index = reply.get_child_value (0).get_uint32 ();
                 connected = true;
                 if (device_token (index) != id)
                     throw new VirtualAttachmentError.UNCERTAIN ("The kernel attachment could not be verified. Recovery information was retained.");
-                return new VirtualAttachment () { index = index, token = id, file = path, format = inspected.format,
+                var attached = new VirtualAttachment () { index = index, token = id, file = path, format = inspected.format,
                     capacity = inspected.capacity, exporter_pid = pid, exporter_start = start_time };
+                if (!same_source (path, key)) {
+                    try { yield detach (attached); }
+                    catch (Error error) {
+                        throw new VirtualAttachmentError.UNCERTAIN ("The source path changed and cleanup could not be confirmed. " + error.message);
+                    }
+                    throw new IOError.INVALID_DATA ("The image was replaced during authorization. Its original mapping was detached.");
+                }
+                return attached;
             } catch (Error error) {
                 if (dispatched && !connected && (error is DBusError.NO_REPLY || error is IOError.TIMED_OUT ||
                     error is IOError.CLOSED || error is DBusError.DISCONNECTED ||
@@ -301,7 +276,6 @@ namespace MajorisDisks {
                 if (!connected) dispatched = false;
                 throw error;
             } finally {
-                if (socket >= 0) Posix.close (socket);
                 if (fd >= 0) Posix.close (fd);
                 if (!dispatched) {
                     if (exporter != null) {
@@ -319,7 +293,7 @@ namespace MajorisDisks {
                 throw new IOError.PERMISSION_DENIED ("The NBD attachment ownership changed.");
             var bus = yield Bus.get (BusType.SYSTEM);
             yield bus.call (BUS, OBJECT, BUS, "Detach", new Variant ("(us)", record.index, record.token),
-                null, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 150000, null);
+                null, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 180000, null);
             for (int i = 0; i < 50 && device_token (record.index) == record.token; i++) yield wait_tick ();
             if (device_token (record.index) == record.token)
                 throw new IOError.TIMED_OUT ("NBD accepted the detach request, but the mapping is still present.");
