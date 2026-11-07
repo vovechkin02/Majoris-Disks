@@ -172,6 +172,16 @@ private void test_operation_locks () {
         try { locks.acquire (partition, graph); assert_not_reached (); }
         catch (Error error) { assert (error is IOError.BUSY); }
         locks.release_path (partition.path);
+        locks.acquire (unrelated, graph);
+        try { locks.acquire_members (partition, { unrelated }, graph); assert_not_reached (); }
+        catch (Error error) { assert (error is IOError.BUSY); }
+        assert (!locks.conflicts (partition, graph));
+        locks.release (unrelated);
+        locks.acquire_members (partition, { unrelated }, graph);
+        assert (locks.conflicts (disk, graph));
+        assert (locks.conflicts (unrelated, graph));
+        locks.release (partition);
+        assert (!locks.conflicts (unrelated, graph));
     } catch (Error error) {
         assert_not_reached ();
     }

@@ -1,0 +1,2 @@
+#pragma once
+#define MAJORIS_BTRFS_DEFAULT_HELPER "@LIBEXECDIR@/majoris-disks-btrfs-default"

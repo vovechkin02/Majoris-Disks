@@ -63,7 +63,9 @@ namespace MajorisDisks {
             drive_view.ownership_requested.connect (confirm_ownership);
             drive_view.label_requested.connect (edit_filesystem_label);
             drive_view.lvm_rename_requested.connect (rename_logical_volume);
+            drive_view.lvm_create_requested.connect (create_logical_volume);
             drive_view.raid_check_requested.connect (start_raid_check);
+            drive_view.raid_power_requested.connect (confirm_raid_power);
             drive_view.btrfs_subvolumes_requested.connect (list_btrfs_subvolumes);
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
@@ -173,6 +175,29 @@ namespace MajorisDisks {
             });
             dialog.present (this);
         }
+        private void confirm_raid_power (StorageBlock block, bool running) {
+            string identity = backend.modification_identity (block);
+            var dialog = new HardwareActionConfirmationDialog () {
+                heading = running ? "Start RAID Array?" : "Stop RAID Array?",
+                body = running ? "Assemble the array using its verified member devices." :
+                    "The array will become unavailable until started again. Unmount its volumes and close dependent mappings first."
+            };
+            dialog.response.connect ((response) => {
+                if (response != "continue" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.set_raid_running.begin (block, running, identity, (object, result) => {
+                    pending.remove (block.path);
+                    try {
+                        backend.set_raid_running.end (result);
+                        notifications.add_toast (new Adw.Toast (running ? "RAID array started" : "RAID array stopped"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm the RAID state change", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
         private void start_raid_check (StorageBlock block) {
             if (pending.contains (block.path)) return;
             pending.insert (block.path, block);
@@ -210,6 +235,31 @@ namespace MajorisDisks {
                     show_check_message ("Could not list Btrfs subvolumes", operation_error (error));
                 }
             });
+        }
+
+        private void create_logical_volume (StorageBlock block) {
+            var group = block.volume_group;
+            if (group == null) return;
+            var dialog = new CreateLogicalVolumeDialog (group);
+            string identity = backend.modification_identity (block);
+            dialog.response.connect ((response) => {
+                if (response != "create" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.create_logical_volume.begin (block, dialog.volume_name, dialog.bytes, identity, (object, result) => {
+                    pending.remove (block.path);
+                    try {
+                        string created = backend.create_logical_volume.end (result);
+                        if (created != "") {
+                            selected = created;
+                            update_devices ();
+                        }
+                        notifications.add_toast (new Adw.Toast ("Logical volume created"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm logical-volume creation", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
         }
 
         private void rename_logical_volume (StorageBlock block) {
@@ -1376,12 +1426,31 @@ namespace MajorisDisks {
             subvolumes.selected = selected;
             body = info.default_known
                 ? "Default subvolume ID %u. Changing the default affects future mounts without an explicit subvolume.".printf (info.default_id)
-                : "The default subvolume could not be read.";
+                : info.default_unavailable != "" ? info.default_unavailable : "The default subvolume could not be read.";
             set_response_enabled ("apply", false);
             subvolumes.notify["selected"].connect (() => {
                 uint index = subvolumes.selected;
                 set_response_enabled ("apply", can_change && info.default_known && index < ids.length &&
                     ids[index] <= uint.MAX && ids[index] != info.default_id);
+            });
+        }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-create-dialog.ui")]
+    internal class CreateLogicalVolumeDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow name_entry;
+        [GtkChild] private unowned Gtk.SpinButton capacity;
+        public string volume_name { owned get { return name_entry.text; } }
+        public uint64 bytes { get { return (uint64) capacity.get_value_as_int () * 1048576; } }
+
+        public CreateLogicalVolumeDialog (StorageVolumeGroup group) {
+            body = "%s · %s free".printf (group.name, format_size (group.free_size));
+            set_response_enabled ("create", false);
+            name_entry.changed.connect (() => {
+                set_response_enabled ("create", UDisksService.valid_lvm_name (volume_name) && bytes <= group.free_size);
+            });
+            capacity.value_changed.connect (() => {
+                set_response_enabled ("create", UDisksService.valid_lvm_name (volume_name) && bytes <= group.free_size);
             });
         }
     }

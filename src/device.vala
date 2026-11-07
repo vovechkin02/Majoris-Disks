@@ -16,6 +16,7 @@ namespace MajorisDisks {
         public BtrfsSubvolume[] entries = {};
         public uint default_id;
         public bool default_known;
+        public string default_unavailable = "";
     }
     public enum StorageSettingIntent { UNCHANGED, SET, RESET }
 

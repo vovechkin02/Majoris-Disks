@@ -320,6 +320,20 @@ namespace MajorisDisks {
             active.insert (target.path, footprint (target, graph));
         }
 
+        public void acquire_members (StorageBlock target, StorageBlock[] members, StorageDependencyService graph) throws Error {
+            var requested = footprint (target, graph);
+            foreach (var member in members) {
+                var member_paths = footprint (member, graph);
+                foreach (var path in member_paths.get_keys ())
+                    requested.insert (path, path);
+            }
+            foreach (var running in active.get_values ())
+                foreach (var path in requested.get_keys ())
+                    if (running.contains (path))
+                        throw new IOError.BUSY ("Another storage operation is using a member device.");
+            active.insert (target.path, requested);
+        }
+
         public void release (StorageBlock target) {
             active.remove (target.path);
         }

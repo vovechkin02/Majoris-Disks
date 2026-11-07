@@ -30,6 +30,10 @@ namespace MajorisDisks {
 
     public class UDisksService : Object {
         public const string PREFIX = "org.freedesktop.UDisks2.";
+        [CCode (cname = "MAJORIS_BTRFS_DEFAULT_HELPER", cheader_filename = "btrfs-default-config.h")]
+        private extern const string BTRFS_DEFAULT_HELPER;
+        private string btrfs_capability_owner = "";
+        private bool btrfs_native_default;
         private DBusObjectManagerClient? manager;
         private uint refresh_source;
         private bool connecting;
@@ -973,14 +977,62 @@ namespace MajorisDisks {
             return reply.get_child_value (0);
         }
 
-        private async uint read_btrfs_default (DBusProxy proxy, Cancellable token) throws Error {
+        private async bool has_native_btrfs_default (DBusProxy proxy, Cancellable token) throws Error {
+            string owner = proxy.get_name_owner () ?? "";
+            if (owner == "")
+                throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
+            if (btrfs_capability_owner == owner)
+                return btrfs_native_default;
+            var reply = yield proxy.get_connection ().call (owner, proxy.get_object_path (),
+                "org.freedesktop.DBus.Introspectable", "Introspect", null, new VariantType ("(s)"),
+                DBusCallFlags.NONE, 5000, token);
+            var node = new DBusNodeInfo.for_xml (reply.get_child_value (0).get_string ());
+            var iface = node.lookup_interface (PREFIX + "Filesystem.BTRFS");
+            if (proxy.get_name_owner () != owner)
+                throw new IOError.NOT_CONNECTED ("UDisks changed during Btrfs capability discovery.");
+            btrfs_native_default = iface?.lookup_method ("GetDefaultSubvolumeID") != null &&
+                iface?.lookup_method ("SetDefaultSubvolumeID") != null;
+            btrfs_capability_owner = owner;
+            return btrfs_native_default;
+        }
+
+        private async uint run_btrfs_default_helper (StorageBlock block, DBusProxy proxy,
+            bool set, uint previous, uint target, Cancellable token) throws Error {
+            string uuid = proxy.get_cached_property ("uuid")?.get_string () ?? "";
+            string[] mounts = block.filesystem?.mounts ?? new string[0];
+            if (mounts.length == 0 || !Uuid.string_is_valid (uuid) || block.number == 0)
+                throw new IOError.NOT_SUPPORTED ("A mounted Btrfs filesystem with a verified source is required.");
+            if (!FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE) ||
+                !FileUtils.test (BTRFS_DEFAULT_HELPER, FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("Install pkexec and the Majoris Btrfs default-subvolume helper.");
+            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", BTRFS_DEFAULT_HELPER,
+                set ? "set-default" : "get-default", mounts[0], uuid, block.number.to_string () };
+            if (set) {
+                argv += previous.to_string ();
+                argv += target.to_string ();
+            }
+            token.set_error_if_cancelled ();
+            var helper = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+            string? output, diagnostic;
+            // After authorization a write may already have occurred. Wait for its verified outcome.
+            yield helper.communicate_utf8_async (null, set ? null : token, out output, out diagnostic);
+            if (!helper.get_successful ())
+                throw new IOError.FAILED (diagnostic?.strip () ?? "The Btrfs helper failed.");
+            uint id = 0;
+            if (output == null || !uint.try_parse (output.strip (), out id) || id < 5)
+                throw new IOError.INVALID_DATA ("The Btrfs helper returned an invalid default subvolume ID.");
+            return id;
+        }
+
+        private async uint read_btrfs_default (StorageBlock block, DBusProxy proxy, bool native, Cancellable token) throws Error {
+            if (!native)
+                return yield run_btrfs_default_helper (block, proxy, false, 0, 0, token);
             var reply = yield proxy.call ("GetDefaultSubvolumeID", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
                 DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 30000, token);
             if (!reply.is_of_type (new VariantType ("(u)")))
                 throw new IOError.INVALID_DATA ("UDisks returned an invalid Btrfs default subvolume ID.");
             return reply.get_child_value (0).get_uint32 ();
         }
-
         internal async BtrfsSubvolumeList list_btrfs_subvolumes (StorageBlock block) throws Error {
             var proxy = require_volume (block, "Filesystem.BTRFS");
             if (!has_btrfs_subvolumes (block))
@@ -1004,10 +1056,12 @@ namespace MajorisDisks {
                 result.entries[i] = entry;
             }
             try {
-                result.default_id = yield read_btrfs_default (proxy, lifetime);
+                bool native = yield has_native_btrfs_default (proxy, lifetime);
+                result.default_id = yield read_btrfs_default (block, proxy, native, lifetime);
                 result.default_known = true;
             } catch (Error error) {
                 lifetime.set_error_if_cancelled ();
+                result.default_unavailable = error.message;
             }
             synchronize ();
             if (require_volume (block, "Filesystem.BTRFS") != proxy || modification_identity (block) != identity)
@@ -1018,33 +1072,58 @@ namespace MajorisDisks {
         internal async void set_btrfs_default (StorageBlock block, uint id, uint confirmed_default,
             string confirmed_identity) throws Error {
             var proxy = require_volume (block, "Filesystem.BTRFS");
-            if (!has_btrfs_subvolumes (block) || proxy.get_cached_property ("num_devices")?.get_uint64 () != 1)
-                throw new IOError.NOT_SUPPORTED ("Changing the default requires a mounted, single-device Btrfs filesystem.");
-            locks.acquire (block, snapshot.dependencies);
+            if (!has_btrfs_subvolumes (block))
+                throw new IOError.NOT_SUPPORTED ("Changing the default requires a mounted Btrfs filesystem.");
+            string uuid = proxy.get_cached_property ("uuid")?.get_string () ?? "";
+            uint64 expected_members = proxy.get_cached_property ("num_devices")?.get_uint64 () ?? 0;
+            StorageBlock[] members = {};
+            foreach (var candidate in snapshot.blocks.get_values ())
+                if (candidate.type_id == "btrfs" && candidate.uuid == uuid && candidate.available)
+                    members += candidate;
+            if (!Uuid.string_is_valid (uuid) || expected_members == 0 || members.length != expected_members)
+                throw new IOError.NOT_SUPPORTED ("UDisks could not identify all members of this Btrfs filesystem.");
+            locks.acquire_members (block, members, snapshot.dependencies);
             var job = jobs.begin ("Set Btrfs default subvolume", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
             var lifetime = backend_lifetime;
             bool dispatched = false;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Checking the filesystem and subvolume");
-                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
-                if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || block.read_only)
-                    throw new IOError.BUSY ("The filesystem or its dependencies prevent changing the default subvolume.");
-                uint current = yield read_btrfs_default (proxy, lifetime);
+                string[] member_identities = {};
+                foreach (var member in members) {
+                    var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                    if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || member.read_only)
+                        throw new IOError.BUSY ("A filesystem member or its dependencies prevent changing the default subvolume.");
+                    member_identities += modification_identity (member);
+                }
+                bool native = yield has_native_btrfs_default (proxy, lifetime);
+                uint current = native ? yield read_btrfs_default (block, proxy, true, lifetime) : confirmed_default;
                 var rows = yield read_btrfs_subvolumes (proxy, false, lifetime);
                 bool found = id == 5;
                 for (size_t i = 0; i < rows.n_children (); i++)
                     found |= rows.get_child_value (i).get_child_value (0).get_uint64 () == id;
                 synchronize ();
                 if (!found || current != confirmed_default || modification_identity (block) != confirmed_identity ||
-                    require_volume (block, "Filesystem.BTRFS") != proxy ||
-                    proxy.get_cached_property ("num_devices")?.get_uint64 () != 1)
+                    require_volume (block, "Filesystem.BTRFS") != proxy || !has_btrfs_subvolumes (block))
                     throw new IOError.NOT_FOUND ("The filesystem or subvolume selection changed.");
+                if (proxy.get_cached_property ("num_devices")?.get_uint64 () != expected_members)
+                    throw new IOError.NOT_FOUND ("The Btrfs member count changed after confirmation.");
+                for (int i = 0; i < members.length; i++) {
+                    require_volume (members[i], "Block");
+                    if (modification_identity (members[i]) != member_identities[i])
+                        throw new IOError.NOT_FOUND ("A Btrfs member changed after confirmation.");
+                }
                 jobs.phase (job, StorageJobState.RUNNING, "Updating the default Btrfs subvolume");
                 dispatched = true;
-                yield call_tracked_method (job, proxy, "SetDefaultSubvolumeID",
-                    new Variant ("(u@a{sv})", id, new Variant ("a{sv}", null)), lifetime);
-                if ((yield read_btrfs_default (proxy, lifetime)) != id)
+                uint actual;
+                if (native) {
+                    yield call_tracked_method (job, proxy, "SetDefaultSubvolumeID",
+                        new Variant ("(u@a{sv})", id, new Variant ("a{sv}", null)), lifetime);
+                    actual = yield read_btrfs_default (block, proxy, true, lifetime);
+                } else {
+                    actual = yield run_btrfs_default_helper (block, proxy, true, confirmed_default, id, lifetime);
+                }
+                if (actual != id)
                     throw new IOError.FAILED ("UDisks did not confirm the requested default subvolume.");
                 synchronize ();
                 outcome.successful = true;
@@ -1058,6 +1137,99 @@ namespace MajorisDisks {
                 locks.release (block);
             }
         }
+        internal bool can_set_raid_running (StorageBlock block, bool running) {
+            var raid = running ? block.raid_membership : block.raid;
+            var proxy = raid != null ? manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy : null;
+            return block.available && !block.system_hint && proxy != null &&
+                proxy.get_cached_property ("Running")?.get_boolean () == !running &&
+                (!running || raid.degraded == 0);
+        }
+
+        internal async void set_raid_running (StorageBlock block, bool running, string identity) throws Error {
+            synchronize ();
+            require_volume (block, "Block");
+            if (!can_set_raid_running (block, running))
+                throw new IOError.NOT_SUPPORTED ("This RAID array is unavailable or in a different state.");
+            var raid = running ? block.raid_membership : block.raid;
+            var proxy = manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy;
+            string uuid = proxy?.get_cached_property ("UUID")?.get_string () ?? "";
+            if (uuid == "" || proxy == null)
+                throw new IOError.NOT_SUPPORTED ("The RAID array identity is unavailable.");
+
+            StorageBlock[] members = {};
+            string[] member_identities = {};
+            foreach (var member in snapshot.blocks.get_values ()) {
+                if (member.raid_membership != raid) continue;
+                members += member;
+                member_identities += modification_identity (member);
+            }
+            uint count = proxy.get_cached_property ("NumDevices")?.get_uint32 () ?? 0;
+            if (count == 0 || members.length < count)
+                throw new IOError.BUSY ("The RAID member set could not be verified.");
+            locks.acquire_members (block, members, snapshot.dependencies);
+            var job = jobs.begin (running ? "Start RAID array" : "Stop RAID array", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the array and its members");
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || safety.mounted ||
+                    (!running && safety.active_dependents))
+                    throw new IOError.BUSY ("The RAID array is in use or supports the running system.");
+                if (!running) {
+                    if (proxy.get_cached_property ("SyncAction")?.get_string () != "idle" &&
+                        (proxy.get_cached_property ("SyncAction")?.get_string () ?? "") != "")
+                        throw new IOError.BUSY ("Wait for the RAID maintenance operation to finish before stopping the array.");
+                    foreach (var dependent in snapshot.dependencies.descendants (block)) {
+                        var volume = dependent as StorageBlock;
+                        if (volume != null) yield KernelStorageSafety.require_idle (volume, lifetime);
+                    }
+                }
+                synchronize ();
+                for (int i = 0; i < members.length; i++) {
+                    require_volume (members[i], "Block");
+                    if (members[i].system_hint || members[i].raid_membership != raid ||
+                        modification_identity (members[i]) != member_identities[i])
+                        throw new IOError.BUSY ("A RAID member changed or is protected.");
+                }
+                int current_members = 0;
+                foreach (var candidate in snapshot.blocks.get_values ())
+                    if (candidate.raid_membership == raid) current_members++;
+                if (current_members != members.length || proxy.get_cached_property ("NumDevices")?.get_uint32 () != count ||
+                    !can_set_raid_running (block, running) || modification_identity (block) != identity ||
+                    manager?.get_interface (raid.path, PREFIX + "MDRaid") != proxy)
+                    throw new IOError.NOT_FOUND ("The selected RAID array changed after confirmation.");
+                jobs.phase (job, StorageJobState.RUNNING, running ? "Starting the array" : "Stopping the array");
+                dispatched = true;
+                yield call_tracked_method (job, proxy, running ? "Start" : "Stop",
+                    new Variant ("(@a{sv})", new Variant ("a{sv}", null)), lifetime);
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    if (proxy.get_cached_property ("UUID")?.get_string () != uuid ||
+                        manager?.get_interface (raid.path, PREFIX + "MDRaid") != proxy)
+                        break;
+                    bool exposed = false;
+                    foreach (var candidate in snapshot.blocks.get_values ())
+                        exposed |= candidate.available && candidate.raid_path == raid.path;
+                    if (proxy.get_cached_property ("Running")?.get_boolean () == running && exposed == running) {
+                        outcome.successful = true;
+                        outcome.summary = running ? "RAID array started" : "RAID array stopped";
+                        return;
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the requested RAID state.");
+            } catch (Error error) {
+                outcome.fail ("Could not confirm the RAID state change", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+        }
+
         internal bool can_check_raid (StorageBlock block) {
             var raid = block.raid;
             var proxy = raid != null ? manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy : null;
@@ -1169,6 +1341,82 @@ namespace MajorisDisks {
                     return false;
             }
             return true;
+        }
+
+        internal async string create_logical_volume (StorageBlock member, string name, uint64 size,
+            string confirmed_identity) throws Error {
+            if (!valid_lvm_name (name) || size == 0)
+                throw new IOError.INVALID_ARGUMENT ("Enter a valid LVM name and nonzero capacity.");
+            synchronize ();
+            require_volume (member, "Block");
+            var group = member.volume_group;
+            var proxy = group != null ? manager?.get_interface (group.path, PREFIX + "VolumeGroup") as DBusProxy : null;
+            string uuid = proxy?.get_cached_property ("UUID")?.get_string () ?? "";
+            if (group == null || proxy == null || uuid == "")
+                throw new IOError.NOT_SUPPORTED ("The selected device does not belong to an identifiable volume group.");
+            locks.acquire (member, snapshot.dependencies);
+            var job = jobs.begin ("Create logical volume", member, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking volume-group members and free extents");
+                var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || member.read_only)
+                    throw new IOError.BUSY ("The volume group supports the running system or its dependencies are unknown.");
+                foreach (var parent in snapshot.dependencies.ancestors (group)) {
+                    var pv = parent as StorageBlock;
+                    if (pv == null || pv.volume_group != group) continue;
+                    if (!pv.available || pv.read_only || pv.system_hint)
+                        throw new IOError.BUSY ("A physical volume is unavailable, protected, or read-only.");
+                }
+                uint64 extent = proxy.get_cached_property ("ExtentSize")?.get_uint64 () ?? 0;
+                uint64 free = proxy.get_cached_property ("FreeSize")?.get_uint64 () ?? 0;
+                var missing = proxy.get_cached_property ("MissingPhysicalVolumes");
+                if ((missing != null && missing.n_children () != 0) || extent == 0 || size > free || size % extent != 0)
+                    throw new IOError.INVALID_ARGUMENT ("Choose a capacity that fits the free space and is a multiple of the LVM extent size.");
+                foreach (var item in snapshot.advanced.get_values ()) {
+                    var existing = item as StorageLogicalVolume;
+                    if (existing != null && existing.group_path == group.path && existing.name == name)
+                        throw new IOError.EXISTS ("This volume group already has a logical volume with that name.");
+                }
+                if (member.volume_group != group || modification_identity (member) != confirmed_identity ||
+                    manager?.get_interface (group.path, PREFIX + "VolumeGroup") != proxy)
+                    throw new IOError.NOT_FOUND ("The volume group changed after confirmation.");
+
+                jobs.phase (job, StorageJobState.RUNNING, "Allocating logical-volume extents");
+                dispatched = true;
+                var reply = yield call_tracked_method (job, proxy, "CreatePlainVolume",
+                    new Variant ("(st@a{sv})", name, size, new Variant ("a{sv}", null)), lifetime);
+                if (!reply.is_of_type (new VariantType ("(o)")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid logical volume path.");
+                string path = reply.get_child_value (0).get_string ();
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    var created = snapshot.advanced.lookup (path) as StorageLogicalVolume;
+                    if (created != null && created.group_path == group.path && created.name == name &&
+                        created.uuid != "" && created.size == size &&
+                        proxy.get_cached_property ("UUID")?.get_string () == uuid) {
+                        var volume_proxy = manager?.get_interface (path, PREFIX + "LogicalVolume") as DBusProxy;
+                        string block_path = volume_proxy?.get_cached_property ("BlockDevice")?.get_string () ?? "/";
+                        var block = snapshot.blocks.lookup (block_path);
+                        if (!created.active || (block != null && block.available && block.logical_volume_path == path)) {
+                            outcome.successful = true;
+                            outcome.summary = "Logical volume created";
+                            return block?.path ?? "";
+                        }
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not publish the logical volume with the requested geometry.");
+            } catch (Error error) {
+                outcome.fail ("Could not confirm logical-volume creation", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (member);
+            }
         }
 
         internal async string rename_logical_volume (StorageBlock block, string name, string confirmed_identity) throws Error {

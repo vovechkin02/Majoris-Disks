@@ -1,0 +1,144 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <glib.h>
+#include <linux/btrfs.h>
+#include <linux/openat2.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+typedef int (*GetDefault) (int, guint64 *);
+typedef int (*SetDefault) (int, guint64);
+typedef int (*SubvolumePath) (int, guint64, char **);
+
+static void
+close_fd (int *fd)
+{
+    if (*fd >= 0)
+        close (*fd);
+}
+
+static int
+open_directory (const char *path)
+{
+    struct open_how how = { .flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        .resolve = RESOLVE_NO_SYMLINKS };
+    return syscall (SYS_openat2, AT_FDCWD, path, &how, sizeof how);
+}
+
+static gboolean
+matches_uuid (int fd, const char *uuid)
+{
+    struct btrfs_ioctl_fs_info_args info = { 0 };
+    if (ioctl (fd, BTRFS_IOC_FS_INFO, &info) != 0)
+        return FALSE;
+    const guint8 *u = info.fsid;
+    g_autofree char *actual = g_strdup_printf (
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9],
+        u[10], u[11], u[12], u[13], u[14], u[15]);
+    return g_ascii_strcasecmp (actual, uuid) == 0;
+}
+
+static gboolean
+matches_mount (int fd, const char *path, guint64 device)
+{
+    struct statx opened;
+    g_autofree char *mountinfo = NULL;
+    if (statx (fd, "", AT_EMPTY_PATH, STATX_MNT_ID, &opened) != 0 ||
+        !(opened.stx_mask & STATX_MNT_ID) ||
+        !g_file_get_contents ("/proc/self/mountinfo", &mountinfo, NULL, NULL))
+        return FALSE;
+
+    g_auto(GStrv) lines = g_strsplit (mountinfo, "\n", -1);
+    for (guint i = 0; lines[i] != NULL; i++) {
+        g_auto(GStrv) parts = g_strsplit (lines[i], " - ", 2);
+        if (parts[1] == NULL)
+            continue;
+        g_auto(GStrv) mount = g_strsplit (parts[0], " ", 6);
+        g_auto(GStrv) source = g_strsplit (parts[1], " ", 3);
+        if (g_strv_length (mount) < 6 || g_strv_length (source) < 3 ||
+            g_ascii_strtoull (mount[0], NULL, 10) != opened.stx_mnt_id ||
+            !g_str_equal (source[0], "btrfs"))
+            continue;
+        g_autofree char *actual_path = g_strcompress (mount[4]);
+        g_autofree char *node = g_strcompress (source[1]);
+        struct stat info;
+        return g_str_equal (actual_path, path) && g_str_has_prefix (node, "/dev/") &&
+               stat (node, &info) == 0 && S_ISBLK (info.st_mode) && (guint64) info.st_rdev == device;
+    }
+    return FALSE;
+}
+
+static gboolean
+system_filesystem (const char *uuid)
+{
+    const char *critical[] = { "/", "/boot", "/boot/efi", "/usr", "/var", "/etc", "/efi" };
+    for (guint i = 0; i < G_N_ELEMENTS (critical); i++) {
+        int fd __attribute__((cleanup(close_fd))) = open (critical[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd >= 0 && matches_uuid (fd, uuid))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static int
+fail (const char *message)
+{
+    g_printerr ("%s\n", message);
+    return 1;
+}
+
+int
+main (int argc, char **argv)
+{
+    gboolean set = argc == 7 && g_str_equal (argv[1], "set-default");
+    guint64 device, expected = 0, target = 0, current;
+    if (geteuid () != 0 || (!set && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
+        !g_path_is_absolute (argv[2]) || !g_uuid_string_is_valid (argv[3]) ||
+        !g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &device, NULL) ||
+        (set && (!g_ascii_string_to_unsigned (argv[5], 10, 5, G_MAXUINT64, &expected, NULL) ||
+                 !g_ascii_string_to_unsigned (argv[6], 10, 5, G_MAXUINT64, &target, NULL))))
+        return fail ("Invalid Btrfs default-subvolume request.");
+
+    int mount __attribute__((cleanup(close_fd))) = open_directory (argv[2]);
+    if (mount < 0 || !matches_mount (mount, argv[2], device) || !matches_uuid (mount, argv[3]))
+        return fail ("The Btrfs mount or its source identity changed.");
+
+    void *library = dlopen ("libbtrfsutil.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (library == NULL)
+        return fail ("Install libbtrfsutil1 to manage the default Btrfs subvolume.");
+    GetDefault get_default = (GetDefault) dlsym (library, "btrfs_util_get_default_subvolume_fd");
+    SetDefault set_default = (SetDefault) dlsym (library, "btrfs_util_set_default_subvolume_fd");
+    SubvolumePath subvolume_path = (SubvolumePath) dlsym (library, "btrfs_util_subvolume_path_fd");
+    if (get_default == NULL || set_default == NULL || subvolume_path == NULL)
+        return fail ("The installed libbtrfsutil lacks the required default-subvolume API.");
+
+    if (set) {
+        g_autofree char *uuid = g_ascii_strdown (argv[3], -1);
+        g_autofree char *lock_name = g_strdup_printf ("/run/majoris-btrfs-%s.lock", uuid);
+        int lock __attribute__((cleanup(close_fd))) = open (lock_name,
+            O_CREAT | O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0600);
+        struct statvfs state;
+        if (lock < 0 || flock (lock, LOCK_EX | LOCK_NB) != 0 ||
+            system_filesystem (uuid) || fstatvfs (mount, &state) != 0 || (state.f_flag & ST_RDONLY))
+            return fail ("The Btrfs filesystem is protected, read-only, or already being modified.");
+        if (get_default (mount, &current) != 0 || current != expected)
+            return fail ("The default Btrfs subvolume changed after confirmation.");
+        g_autofree char *path = NULL;
+        if (target != 5 && subvolume_path (mount, target, &path) != 0)
+            return fail ("The requested Btrfs subvolume no longer exists.");
+        if (!matches_mount (mount, argv[2], device) || !matches_uuid (mount, uuid))
+            return fail ("The Btrfs mount or source identity changed before writing.");
+        if (set_default (mount, target) != 0 || get_default (mount, &current) != 0 || current != target)
+            return fail ("The default Btrfs subvolume update could not be verified.");
+    } else if (get_default (mount, &current) != 0) {
+        return fail ("Could not read the default Btrfs subvolume.");
+    }
+    g_print ("%" G_GUINT64_FORMAT "\n", current);
+    return 0;
+}

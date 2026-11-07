@@ -31,7 +31,9 @@
 <child><object class="GtkButton" id="check_filesystem"><property name="label">Check Filesystem</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="repair_filesystem"><property name="label">Repair Filesystem</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="take_ownership"><property name="label">Take Ownership</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="create_lvm"><property name="label">Create Logical Volume</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="rename_lvm"><property name="label">Rename Logical Volume</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="raid_power"><property name="label">Start RAID Array</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="raid_check"><property name="label">Check RAID Consistency</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="btrfs_subvolumes"><property name="label">List Btrfs Subvolumes</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="edit_label"><property name="label">Edit Label</property><property name="visible">false</property></object></child>

@@ -1,0 +1,21 @@
+<interface>
+  <template class="MajorisDisksCreateLogicalVolumeDialog" parent="AdwAlertDialog">
+    <property name="heading">Create Logical Volume</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwEntryRow" id="name_entry"><property name="title">Logical volume name</property></object></child>
+        <child><object class="AdwActionRow"><property name="title">Capacity in MiB</property>
+          <child type="suffix"><object class="GtkSpinButton" id="capacity"><property name="numeric">true</property>
+            <property name="adjustment"><object class="GtkAdjustment"><property name="lower">1</property><property name="upper">1048576</property><property name="step-increment">1</property><property name="value">64</property></object></property>
+          </object></child>
+        </object></child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="create" appearance="suggested">Create</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>
