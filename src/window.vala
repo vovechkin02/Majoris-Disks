@@ -62,6 +62,9 @@ namespace MajorisDisks {
             drive_view.metadata_requested.connect (edit_partition_metadata);
             drive_view.ownership_requested.connect (confirm_ownership);
             drive_view.label_requested.connect (edit_filesystem_label);
+            drive_view.lvm_rename_requested.connect (rename_logical_volume);
+            drive_view.raid_check_requested.connect (start_raid_check);
+            drive_view.btrfs_subvolumes_requested.connect (list_btrfs_subvolumes);
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
@@ -170,6 +173,53 @@ namespace MajorisDisks {
             });
             dialog.present (this);
         }
+        private void start_raid_check (StorageBlock block) {
+            if (pending.contains (block.path)) return;
+            pending.insert (block.path, block);
+            backend.start_raid_check.begin (block, (obj, result) => {
+                pending.remove (block.path);
+                try {
+                    backend.start_raid_check.end (result);
+                    notifications.add_toast (new Adw.Toast ("RAID consistency check started"));
+                } catch (Error error) {
+                    show_check_message ("Could not confirm the RAID consistency check", operation_error (error));
+                }
+            });
+        }
+
+        private void list_btrfs_subvolumes (StorageBlock block) {
+            backend.list_btrfs_subvolumes.begin (block, (obj, result) => {
+                try {
+                    string[] entries = backend.list_btrfs_subvolumes.end (result);
+                    show_check_message ("Btrfs Subvolumes",
+                        entries.length == 0 ? "No subvolumes were reported." : string.joinv ("\n", entries));
+                } catch (Error error) {
+                    show_check_message ("Could not list Btrfs subvolumes", operation_error (error));
+                }
+            });
+        }
+
+        private void rename_logical_volume (StorageBlock block) {
+            var volume = block.logical_volume;
+            if (volume == null) return;
+            string identity = backend.modification_identity (block);
+            var dialog = new LvmRenameDialog (volume.name, block.preferred);
+            dialog.response.connect ((response) => {
+                if (response != "apply" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.rename_logical_volume.begin (block, dialog.new_name, identity, (obj, result) => {
+                    pending.remove (block.path);
+                    try {
+                        backend.rename_logical_volume.end (result);
+                        notifications.add_toast (new Adw.Toast ("Logical volume renamed"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm the logical volume rename", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
         private void edit_filesystem_label (StorageBlock block) {
             string identity = backend.modification_identity (block);
             var dialog = new LabelDialog (block);
@@ -1290,6 +1340,21 @@ namespace MajorisDisks {
             return summary;
         }
     }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-rename-dialog.ui")]
+    public class LvmRenameDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow entry;
+        public string new_name { owned get { return entry.text; } }
+
+        public LvmRenameDialog (string original, string device) {
+            body = "Renaming changes the device path for %s. Update any external references that use its current name.".printf (device);
+            entry.text = original;
+            set_response_enabled ("apply", false);
+            entry.changed.connect (() => {
+                set_response_enabled ("apply", entry.text != original && UDisksService.valid_lvm_name (entry.text));
+            });
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/edit-filesystem-dialog.ui")]
     public class LabelDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.EntryRow entry;

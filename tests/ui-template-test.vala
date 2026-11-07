@@ -24,7 +24,7 @@ public static int main (string[] args) {
         new PartitionMap (), new PartitionSegment (), new DriveView (), new DisksWindow (app),
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
         new DriveInformationDialog (drive), new InformationRow ("Test", "Value", false),
-        new LabelDialog (block), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
+        new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
         new OperationResultDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
         new FormatDiskDialog (), new FormatVolumeDialog (backend, block),
         new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block),
@@ -38,7 +38,7 @@ public static int main (string[] args) {
     string[] resources = {
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
         "device-row.ui", "volume-row.ui", "information-row.ui", "sidebar-group-heading.ui",
-        "drive-information-dialog.ui", "edit-filesystem-dialog.ui", "edit-partition-dialog.ui",
+        "drive-information-dialog.ui", "edit-filesystem-dialog.ui", "lvm-rename-dialog.ui", "edit-partition-dialog.ui",
         "ownership-dialog.ui", "operation-result-dialog.ui", "repair-confirmation-dialog.ui",
         "delete-confirmation-dialog.ui", "format-disk-dialog.ui", "format-volume-dialog.ui",
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
@@ -51,5 +51,8 @@ public static int main (string[] args) {
         catch (Error error) { critical ("Missing resource %s: %s", name, error.message); return 1; }
     }
     assert (instances.length == resources.length);
+    assert (UDisksService.valid_lvm_name ("valid-lv_1.2+data"));
+    foreach (string invalid in new string[] { "", "-option", "..", "bad/name", "with space", "é" })
+        assert (!UDisksService.valid_lvm_name (invalid));
     return 0;
 }

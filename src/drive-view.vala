@@ -29,6 +29,9 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button delete_partition;
         [GtkChild] private unowned Gtk.Button format_volume;
         [GtkChild] private unowned Gtk.Button edit_label;
+        [GtkChild] private unowned Gtk.Button rename_lvm;
+        [GtkChild] private unowned Gtk.Button raid_check;
+        [GtkChild] private unowned Gtk.Button btrfs_subvolumes;
         [GtkChild] private unowned Gtk.Button mount_options;
         [GtkChild] private unowned Gtk.Button unlock_volume;
         [GtkChild] private unowned Gtk.Button lock_volume;
@@ -41,6 +44,9 @@ namespace MajorisDisks {
         public signal void metadata_requested (StorageBlock block);
         public signal void ownership_requested (StorageBlock block);
         public signal void label_requested (StorageBlock block);
+        public signal void lvm_rename_requested (StorageBlock block);
+        public signal void raid_check_requested (StorageBlock block);
+        public signal void btrfs_subvolumes_requested (StorageBlock block);
         public signal void mount_options_requested (StorageBlock block);
         public signal void encryption_requested (StorageBlock block, bool unlock);
         public signal void passphrase_requested (StorageBlock block);
@@ -130,6 +136,15 @@ namespace MajorisDisks {
             });
             take_ownership.clicked.connect (() => {
                 if (target != null) ownership_requested (target);
+            });
+            raid_check.clicked.connect (() => {
+                if (selected_block != null) raid_check_requested (selected_block);
+            });
+            btrfs_subvolumes.clicked.connect (() => {
+                if (selected_block != null) btrfs_subvolumes_requested (selected_block);
+            });
+            rename_lvm.clicked.connect (() => {
+                if (selected_block != null) lvm_rename_requested (selected_block);
             });
             edit_label.clicked.connect (() => {
                 if (selected_block != null) label_requested (selected_block);
@@ -263,6 +278,9 @@ namespace MajorisDisks {
             delete_partition.visible = false;
             format_volume.visible = false;
             edit_label.visible = false;
+            rename_lvm.visible = false;
+            raid_check.visible = false;
+            btrfs_subvolumes.visible = false;
             mount_options.visible = false;
             take_ownership.visible = false;
             edit_partition.visible = false;
@@ -290,6 +308,12 @@ namespace MajorisDisks {
                 return;
             }
             selected_block = block;
+            raid_check.visible = backend?.can_check_raid (block) == true;
+            btrfs_subvolumes.visible = backend?.has_btrfs_subvolumes (block) == true;
+            if (block.raid != null && block.raid.state != "")
+                add_volume_field ("RAID sync action", block.raid.state);
+            rename_lvm.visible = block.logical_volume != null && block.available && !block.read_only &&
+                !block.system_hint && block.filesystem?.mounted != true;
             edit_label.visible = block.available && !block.read_only && !block.system_hint &&
                 FilesystemCapabilityService.supports_label (block.type_id) && block.filesystem != null && !block.filesystem.mounted;
             format_volume.visible = block.table == null && block.partition?.container != true &&

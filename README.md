@@ -52,4 +52,4 @@ For isolated Debian test systems, `MAJORIS_DISKS_RUN_NBD_TESTS=1` enables the di
 
 Destructive operations are serialized per dependency graph and revalidate device identity immediately before writes. Filesystem shrinking is enabled only when UDisks reports an appropriate resize mode and a filesystem-specific minimum-size probe succeeds. The application never performs a partition-only shrink around a recognized or unknown filesystem.
 
-Advanced RAID, LVM and Btrfs relationships are displayed when exported by UDisks. Availability of individual maintenance operations depends on the installed UDisks modules and filesystem utilities.
+Advanced RAID, LVM and Btrfs relationships are displayed when exported by UDisks. The volume view can rename an idle, unmounted logical volume through the UDisks LVM2 module. Renaming can change its device path. The volume view also starts consistency checks on idle redundant RAID arrays and lists subvolumes on mounted Btrfs filesystems when the corresponding UDisks interface is available. Availability of individual maintenance operations depends on the installed UDisks modules and filesystem utilities.

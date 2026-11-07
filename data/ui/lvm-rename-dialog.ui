@@ -1,0 +1,16 @@
+<interface>
+  <template class="MajorisDisksLvmRenameDialog" parent="AdwAlertDialog">
+    <property name="heading">Rename Logical Volume</property>
+    <property name="extra-child">
+      <object class="AdwEntryRow" id="entry">
+        <property name="title">Logical volume name</property>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="apply" appearance="suggested">Rename</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

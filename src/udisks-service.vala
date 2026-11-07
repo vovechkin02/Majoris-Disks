@@ -301,6 +301,7 @@ namespace MajorisDisks {
                 raid.name = property (item, "MDRaid", "Name")?.get_string () ?? "";
                 raid.level = property (item, "MDRaid", "Level")?.get_string () ?? "";
                 raid.degraded = property (item, "MDRaid", "Degraded")?.get_uint32 () ?? 0;
+                raid.state = property (item, "MDRaid", "SyncAction")?.get_string () ?? "";
                 device = raid;
             } else if (has (item, "VolumeGroup")) {
                 var group = (previous.lookup (path) as StorageVolumeGroup) ?? new StorageVolumeGroup (path);
@@ -950,6 +951,159 @@ namespace MajorisDisks {
                 jobs.finish (job, outcome);
                 throw error;
             } finally { locks.release (block); }
+        }
+
+        internal bool has_btrfs_subvolumes (StorageBlock block) {
+            return block.type_id == "btrfs" && block.filesystem?.mounted == true &&
+                manager?.get_interface (block.path, PREFIX + "Filesystem.BTRFS") != null;
+        }
+
+        internal async string[] list_btrfs_subvolumes (StorageBlock block) throws Error {
+            var proxy = require_volume (block, "Filesystem.BTRFS");
+            if (!has_btrfs_subvolumes (block))
+                throw new IOError.NOT_SUPPORTED ("Mount this Btrfs filesystem to list its subvolumes.");
+            string identity = modification_identity (block);
+            var reply = yield proxy.call ("GetSubvolumes", new Variant ("(b@a{sv})", false, new Variant ("a{sv}", null)),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 30000, backend_lifetime);
+            if (!reply.is_of_type (new VariantType ("(a(tts)i)")))
+                throw new IOError.INVALID_DATA ("UDisks returned an invalid Btrfs subvolume list.");
+            synchronize ();
+            if (require_volume (block, "Filesystem.BTRFS") != proxy || modification_identity (block) != identity)
+                throw new IOError.NOT_FOUND ("The selected Btrfs filesystem changed.");
+            var rows = reply.get_child_value (0);
+            string[] result = {};
+            for (size_t i = 0; i < rows.n_children (); i++) {
+                var row = rows.get_child_value (i);
+                result += "%s  ·  ID %s  ·  parent %s".printf (row.get_child_value (2).get_string (),
+                    row.get_child_value (0).get_uint64 ().to_string (), row.get_child_value (1).get_uint64 ().to_string ());
+            }
+            return result;
+        }
+
+        internal bool can_check_raid (StorageBlock block) {
+            var raid = block.raid;
+            var proxy = raid != null ? manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy : null;
+            return block.available && raid != null && raid.degraded == 0 && proxy != null &&
+                proxy.get_cached_property ("Running")?.get_boolean () == true &&
+                proxy.get_cached_property ("SyncAction")?.get_string () == "idle" &&
+                (raid.level == "raid1" || raid.level == "raid4" || raid.level == "raid5" ||
+                 raid.level == "raid6" || raid.level == "raid10");
+        }
+
+        internal async void start_raid_check (StorageBlock block) throws Error {
+            synchronize ();
+            require_volume (block, "Block");
+            if (!can_check_raid (block))
+                throw new IOError.NOT_SUPPORTED ("An idle, running, non-degraded redundant array is required.");
+            var raid = block.raid;
+            var proxy = manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy;
+            if (proxy == null)
+                throw new IOError.NOT_FOUND ("The RAID array is no longer available.");
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Start RAID consistency check", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            try {
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies)
+                    throw new IOError.BUSY ("The RAID array supports the running system or its dependencies are unknown.");
+                jobs.phase (job, StorageJobState.RUNNING, "Requesting a RAID consistency check");
+                yield call_tracked_method (job, proxy, "RequestSyncAction",
+                    new Variant ("(s@a{sv})", "check", new Variant ("a{sv}", null)), backend_lifetime);
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    if (block.raid != raid || manager?.get_interface (raid.path, PREFIX + "MDRaid") != proxy)
+                        break;
+                    if (proxy.get_cached_property ("SyncAction")?.get_string () == "check") {
+                        outcome.successful = true;
+                        outcome.summary = "RAID consistency check started";
+                        return;
+                    }
+                    yield settle_delay (backend_lifetime);
+                }
+                outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw new IOError.TIMED_OUT ("UDisks did not confirm that the RAID check started.");
+            } catch (Error error) {
+                bool uncertain = outcome.status == StorageOperationStatus.NEEDS_ATTENTION;
+                outcome.fail ("Could not confirm RAID consistency check", error);
+                if (uncertain) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+        }
+
+        internal static bool valid_lvm_name (string name) {
+            if (name.length == 0 || name.length > 127 || name.has_prefix ("-") || name == "." || name == "..")
+                return false;
+            for (int i = 0; i < name.length; i++) {
+                char c = name[i];
+                if (!c.isalnum () && c != '+' && c != '_' && c != '.' && c != '-')
+                    return false;
+            }
+            return true;
+        }
+
+        internal async void rename_logical_volume (StorageBlock block, string name, string confirmed_identity) throws Error {
+            if (!valid_lvm_name (name))
+                throw new IOError.INVALID_ARGUMENT ("Enter a valid LVM logical volume name.");
+            synchronize ();
+            require_volume (block, "Block");
+            var volume = block.logical_volume;
+            var proxy = volume != null ? manager?.get_interface (volume.path, PREFIX + "LogicalVolume") as DBusProxy : null;
+            string uuid = proxy?.get_cached_property ("UUID")?.get_string () ?? "";
+            if (volume == null || proxy == null || uuid == "")
+                throw new IOError.NOT_SUPPORTED ("UDisks does not expose an identifiable logical volume.");
+            if (volume.name == name)
+                return;
+
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Rename logical volume", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            bool dispatched = false;
+            ulong disconnected = backend_lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            var lifetime = backend_lifetime;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the logical volume and its dependencies");
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents ||
+                    safety.mounted || block.read_only || block.mount_configurations.length != 0 ||
+                    block.encryption_configurations.length != 0)
+                    throw new IOError.BUSY ("The logical volume or its configuration prevents a safe rename.");
+                yield KernelStorageSafety.require_idle (block, job.cancellable);
+                synchronize ();
+                if (modification_identity (block) != confirmed_identity || block.logical_volume != volume ||
+                    manager?.get_interface (volume.path, PREFIX + "LogicalVolume") != proxy)
+                    throw new IOError.NOT_FOUND ("The logical volume changed after confirmation.");
+
+                jobs.phase (job, StorageJobState.RUNNING, "Renaming the logical volume");
+                dispatched = true;
+                var reply = yield call_tracked_method (job, proxy, "Rename",
+                    new Variant ("(s@a{sv})", name, new Variant ("a{sv}", null)), job.cancellable);
+                if (!reply.is_of_type (new VariantType ("(o)")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid logical volume path.");
+                string result_path = reply.get_child_value (0).get_string ();
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    var changed = manager?.get_interface (result_path, PREFIX + "LogicalVolume") as DBusProxy;
+                    if (changed?.get_cached_property ("UUID")?.get_string () == uuid &&
+                        changed?.get_cached_property ("Name")?.get_string () == name) {
+                        outcome.successful = true;
+                        outcome.summary = "Logical volume renamed";
+                        return;
+                    }
+                    yield settle_delay (job.cancellable);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the new logical volume name.");
+            } catch (Error error) {
+                outcome.fail (dispatched ? "Logical volume rename requires attention" : "Logical volume was not renamed", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                lifetime.disconnect (disconnected);
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
         }
 
         private DBusProxy require_volume (StorageBlock block, string iface) throws Error {

@@ -237,9 +237,34 @@ test_readiness_failures (void)
     g_assert_cmpint (kill (slow, SIGTERM), ==, 0);
 }
 
+static void
+test_launch_gate (void)
+{
+    for (int permit = 0; permit <= 1; permit++) {
+        int gate[2], child_fd = 4, status;
+        g_assert_cmpint (socketpair (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate), ==, 0);
+        const char *argv[] = { "/proc/self/exe", "--test-launch-gate", NULL };
+        GPid child = 0;
+        g_autoptr(GError) error = NULL;
+        g_assert_true (g_spawn_async_with_pipes_and_fds (NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD,
+            NULL, NULL, -1, -1, -1, &gate[1], &child_fd, 1, &child, NULL, NULL, NULL, &error));
+        g_assert_no_error (error);
+        close (gate[1]);
+        g_assert_cmpint (waitpid (child, &status, WNOHANG), ==, 0);
+        if (permit)
+            g_assert_cmpint (send (gate[0], "1", 1, MSG_NOSIGNAL), ==, 1);
+        close (gate[0]);
+        g_assert_cmpint (waitpid (child, &status, 0), ==, child);
+        g_assert_true (WIFEXITED (status));
+        g_assert_cmpint (WEXITSTATUS (status), ==, permit ? 0 : 1);
+    }
+}
+
 int
 main (int argc, char **argv)
 {
+    if (argc == 2 && g_str_equal (argv[1], "--test-launch-gate"))
+        return await_launch (4) ? 0 : 1;
     g_test_init (&argc, &argv, NULL);
     g_test_add_func ("/nbd/pinned-endpoint", test_pinned_endpoint);
     g_test_add_func ("/nbd/private-directories", test_private_directories);
@@ -247,5 +272,6 @@ main (int argc, char **argv)
     g_test_add_func ("/nbd/authorization", test_authorization);
     g_test_add_func ("/nbd/foreground-readiness", test_foreground_readiness);
     g_test_add_func ("/nbd/readiness-failures", test_readiness_failures);
+    g_test_add_func ("/nbd/launch-gate", test_launch_gate);
     return g_test_run ();
 }

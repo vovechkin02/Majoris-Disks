@@ -256,9 +256,12 @@ write_record (guint index, guint uid, const char *token, const char *identity, c
     }
     if (client > 0) {
         g_autofree char *start = client_start_time (client, NULL);
+        if (start == NULL) {
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not establish the NBD client start identity.");
+            return FALSE;
+        }
         g_key_file_set_uint64 (record, "attachment", "client-pid", client);
-        if (start != NULL)
-            g_key_file_set_string (record, "attachment", "client-start", start);
+        g_key_file_set_string (record, "attachment", "client-start", start);
     }
     g_key_file_set_uint64 (record, "attachment", "uid", uid);
     g_key_file_set_string (record, "attachment", "token", token);
@@ -319,6 +322,34 @@ probe_attachment (GPid pid, gpointer data)
 }
 
 static gboolean
+await_launch (int fd)
+{
+    char permit;
+    ssize_t bytes;
+    do {
+        bytes = read (fd, &permit, 1);
+    } while (bytes < 0 && errno == EINTR);
+    close (fd);
+    return bytes == 1 && permit == '1';
+}
+
+static int
+connect_client (char **argv)
+{
+    guint64 index;
+    if (!g_ascii_string_to_unsigned (argv[2], 10, 0, G_MAXINT, &index, NULL) ||
+        !g_uuid_string_is_valid (argv[3]) ||
+        (!g_str_equal (argv[4], "0") && !g_str_equal (argv[4], "1")) ||
+        !await_launch (4))
+        return 1;
+    g_autofree char *path = g_strdup_printf ("/dev/nbd%u", (guint) index);
+    const char *client[] = { MAJORIS_NBD_CLIENT, "-unix", "/proc/self/fd/3", path, "-name", argv[3],
+        "-nofork", "-timeout", "30", g_str_equal (argv[4], "1") ? "-readonly" : NULL, NULL };
+    execv (MAJORIS_NBD_CLIENT, (char *const *) client);
+    return 1;
+}
+
+static gboolean
 attach_device (guint uid, const char *token, guint64 capacity, gboolean read_only,
                guint *index, GPid *client, gboolean *uncertain, GError **error)
 {
@@ -335,9 +366,8 @@ attach_device (guint uid, const char *token, guint64 capacity, gboolean read_onl
         g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "The NBD socket peer is not the caller's QEMU exporter.");
         return FALSE;
     }
-    g_autofree char *path = g_strdup_printf ("/dev/nbd%u", *index);
-    const char *argv[] = { MAJORIS_NBD_CLIENT, "-unix", "/proc/self/fd/3", path, "-name", token,
-        "-nofork", "-timeout", "30", read_only ? "-readonly" : NULL, NULL };
+    g_autofree char *device = g_strdup_printf ("%u", *index);
+    const char *argv[] = { "/proc/self/exe", "--connect-client", device, token, read_only ? "1" : "0", NULL };
     g_autofree char *journal = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", *index);
     if (!write_record (*index, uid, token, NULL, "connecting", 0, error))
         return FALSE;
@@ -348,18 +378,46 @@ attach_device (guint uid, const char *token, guint64 capacity, gboolean read_onl
         g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_BUSY, "The selected NBD device became busy.");
         return FALSE;
     }
-    // The kernel will only accept a netlink connection once this temporary configuration closes.
-    close_fd (&block);
-    block = -1;
-    // The client resolves the pinned socket inode, even if its original pathname changes.
-    if (!spawn_client (argv, endpoint, client, error)) {
+    int gate[2];
+    if (socketpair (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate) != 0) {
+        g_unlink (journal);
+        g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "Could not create the NBD launch gate: %s", g_strerror (errno));
+        return FALSE;
+    }
+    int permit __attribute__((cleanup(close_fd))) = gate[0];
+    const int sources[] = { endpoint, gate[1] };
+    const int targets[] = { 3, 4 };
+    gboolean spawned = g_spawn_async_with_pipes_and_fds (NULL, argv, NULL,
+        G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
+        -1, -1, -1, sources, targets, G_N_ELEMENTS (sources), client, NULL, NULL, NULL, error);
+    close (gate[1]);
+    if (!spawned) {
         g_unlink (journal);
         return FALSE;
     }
 
-    g_autoptr(GError) launch_journal_error = NULL;
-    if (!write_record (*index, uid, token, NULL, "client-launched", *client, &launch_journal_error))
-        g_warning ("Could not record the launched NBD client: %s", launch_journal_error->message);
+    // A missing journal cannot leave a live mapping. The child exits on EOF unless explicitly released.
+    if (!write_record (*index, uid, token, NULL, "client-launched", *client, error)) {
+        g_unlink (journal);
+        return FALSE;
+    }
+    if (has_client (*index) || !read_number (*index, "size", &idle_size) || idle_size != 0) {
+        g_unlink (journal);
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_BUSY, "The selected NBD device became busy.");
+        return FALSE;
+    }
+    // The kernel will only accept a netlink connection once this temporary configuration closes.
+    close_fd (&block);
+    block = -1;
+    ssize_t sent;
+    do {
+        sent = send (permit, "1", 1, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent != 1) {
+        g_unlink (journal);
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "The NBD client exited before launch was permitted.");
+        return FALSE;
+    }
 
     g_autoptr(GError) readiness_error = NULL;
     g_autofree char *identity = wait_for_connection (*client, probe_attachment, GUINT_TO_POINTER (*index),
@@ -670,6 +728,8 @@ main (int argc, char **argv)
         "</interface></node>";
     static const GDBusInterfaceVTable vtable = { .method_call = method_call };
     if (geteuid () != 0) return 1;
+    if (argc == 5 && g_str_equal (argv[1], "--connect-client"))
+        return connect_client (argv);
     if (argc == 6 && g_str_equal (argv[1], "--attach-worker"))
         return attach_worker (argv);
     if (argc != 1) return 1;

@@ -16,6 +16,7 @@
     <file>ui/sidebar-group-heading.ui</file>
     <file>ui/information-row.ui</file>
     <file>ui/edit-filesystem-dialog.ui</file>
+    <file>ui/lvm-rename-dialog.ui</file>
     <file>ui/ownership-dialog.ui</file>
     <file>ui/edit-partition-dialog.ui</file>
     <file>ui/operation-result-dialog.ui</file>
