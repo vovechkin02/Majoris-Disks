@@ -25,7 +25,7 @@ test('native-xz', native_xz_test)
 nbd_helper_test = executable('nbd-helper-test', 'tests/nbd-helper-test.c', 'src/nbd-identity.c',
   include_directories: xz_include, dependencies: dependency('gio-2.0'))
 test('nbd-helper', nbd_helper_test)
-btrfs_default_test = executable('btrfs-default-test', 'tests/btrfs-default-test.c',
+btrfs_default_test = executable('btrfs-default-test', 'tests/btrfs-default-test.c', 'src/btrfs-inspect.c',
   include_directories: xz_include, dependencies: dependency('glib-2.0'))
 test('btrfs-default-helper', btrfs_default_test)
 test('storage-model', layout_test)

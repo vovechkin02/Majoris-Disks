@@ -1,0 +1,16 @@
+<interface>
+  <template class="MajorisDisksStorageRemovalDialog" parent="AdwAlertDialog">
+    <property name="extra-child">
+      <object class="AdwSwitchRow" id="wipe">
+        <property name="title">Wipe LVM metadata</property>
+        <property name="subtitle">Erase LVM signatures on the affected physical devices</property>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="remove" appearance="destructive">Confirm Removal</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

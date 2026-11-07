@@ -4,6 +4,7 @@
 #undef main
 #include <glib/gstdio.h>
 #include <errno.h>
+#include "btrfs-inspect.h"
 
 static void
 test_mount_identity (void)
@@ -18,6 +19,10 @@ test_mount_identity (void)
     g_assert_cmpint (symlink ("/", link), ==, 0);
     g_assert_cmpint (open_directory (link), ==, -1);
     g_assert_cmpint (errno, ==, ELOOP);
+    gboolean read_only = FALSE;
+    const char *wrong_uuid = "00000000-0000-0000-0000-000000000000";
+    g_assert_null (majoris_btrfs_inspect_subvolume (directory, 256, wrong_uuid, NULL, &read_only));
+    g_assert_null (majoris_btrfs_inspect_subvolume (link, 256, wrong_uuid, NULL, &read_only));
     g_assert_cmpint (g_unlink (link), ==, 0);
     g_assert_cmpint (g_rmdir (directory), ==, 0);
 }

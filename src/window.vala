@@ -80,8 +80,10 @@ namespace MajorisDisks {
             drive_view.lvm_create_requested.connect (create_logical_volume);
             drive_view.raid_check_requested.connect (start_raid_check);
             drive_view.raid_member_requested.connect (manage_raid_member);
+            drive_view.raid_delete_requested.connect (confirm_raid_delete);
             drive_view.raid_power_requested.connect (confirm_raid_power);
             drive_view.btrfs_subvolumes_requested.connect (list_btrfs_subvolumes);
+            drive_view.btrfs_add_requested.connect (add_btrfs_member);
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
@@ -213,6 +215,34 @@ namespace MajorisDisks {
             dialog.present (this);
         }
 
+        private void confirm_raid_delete (StorageBlock member) {
+            var array = member.raid_membership;
+            if (array == null) return;
+            string identity = backend.storage_membership_identity (member, true);
+            string[] names = {};
+            foreach (var candidate in backend.snapshot.blocks.get_values ())
+                if (candidate.raid_membership == array) names += candidate.preferred;
+            var dialog = new StorageRemovalDialog (false) {
+                heading = "Delete Stopped RAID Array?",
+                body = "Delete %s and permanently destroy RAID metadata on these members: %s.".printf (
+                    array.name, string.joinv (", ", names))
+            };
+            dialog.response.connect ((response) => {
+                if (response != "remove" || pending.contains (member.path)) return;
+                pending.insert (member.path, member);
+                backend.delete_stopped_raid.begin (member, identity, (object, result) => {
+                    pending.remove (member.path);
+                    try {
+                        backend.delete_stopped_raid.end (result);
+                        notifications.add_toast (new Adw.Toast ("RAID array deleted"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm RAID deletion", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
         private void manage_raid_member (StorageBlock block, bool add) {
             string identity = backend.modification_identity (block);
             if (add) {
@@ -268,6 +298,28 @@ namespace MajorisDisks {
                     show_check_message ("Could not confirm the RAID consistency check", operation_error (error));
                 }
             });
+        }
+
+        private void add_btrfs_member (StorageBlock filesystem) {
+            string identity = backend.modification_identity (filesystem);
+            var picker = new CreateStorageGroupDialog (backend, false, true, "Add Btrfs Device");
+            picker.response.connect ((choice) => {
+                if (choice != "create" || pending.contains (filesystem.path)) return;
+                string[] identities;
+                var members = picker.selected_members (out identities);
+                if (members.length != 1) return;
+                pending.insert (filesystem.path, filesystem);
+                backend.add_btrfs_member.begin (filesystem, members[0], identity, identities[0], (object, result) => {
+                    pending.remove (filesystem.path);
+                    try {
+                        backend.add_btrfs_member.end (result);
+                        notifications.add_toast (new Adw.Toast ("Btrfs member added"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm the Btrfs member addition", operation_error (error));
+                    }
+                });
+            });
+            picker.present (this);
         }
 
         private void list_btrfs_subvolumes (StorageBlock block) {
@@ -383,8 +435,12 @@ namespace MajorisDisks {
 
         private void manage_logical_volumes (StorageBlock context) {
             string identity = backend.modification_identity (context);
-            var dialog = new LvmLifecycleDialog (backend.logical_volumes_for (context), context.logical_volume?.path ?? "/");
+            var dialog = new LvmLifecycleDialog (backend.logical_volumes_for (context), context.logical_volume?.path ?? "/", context.volume_group != null);
             dialog.response.connect ((response) => {
+                if (response == "migrate" || response == "remove-pv" || response == "delete-vg") {
+                    confirm_lvm_membership (context, response);
+                    return;
+                }
                 var volume = dialog.selection;
                 if (volume == null || response == "close") return;
                 string path = volume.path;
@@ -402,6 +458,36 @@ namespace MajorisDisks {
                     change_logical_volume_state (context, path, uuid, identity,
                         response == "activate" ? "Activate" : "Deactivate");
                 }
+            });
+            dialog.present (this);
+        }
+
+        private void confirm_lvm_membership (StorageBlock member, string choice) {
+            string identity = backend.storage_membership_identity (member, false);
+            bool migrate = choice == "migrate";
+            bool delete_group = choice == "delete-vg";
+            string method = migrate ? "EmptyDevice" : delete_group ? "Delete" : "RemoveDevice";
+            string target = delete_group ? member.volume_group?.name ?? "" : member.preferred;
+            var dialog = new StorageRemovalDialog (!migrate) {
+                heading = migrate ? "Migrate Physical Volume?" : delete_group ? "Delete Empty Volume Group?" : "Remove Physical Volume?",
+                body = migrate ? "Move all allocated extents from %s to other members of its group.".printf (target) :
+                    delete_group ? "Delete the empty volume group %s and release all its physical volumes.".printf (target) :
+                    "Remove the empty physical volume %s from its group.".printf (target)
+            };
+            if (migrate) dialog.set_response_label ("remove", "Migrate");
+            dialog.response.connect ((response) => {
+                if (response != "remove" || pending.contains (member.path)) return;
+                pending.insert (member.path, member);
+                backend.change_lvm_membership.begin (member, identity, method, dialog.wipe_metadata, (object, result) => {
+                    pending.remove (member.path);
+                    try {
+                        backend.change_lvm_membership.end (result);
+                        notifications.add_toast (new Adw.Toast (migrate ? "Physical volume emptied" :
+                            delete_group ? "Volume group deleted" : "Physical volume removed"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm the LVM operation", operation_error (error));
+                    }
+                });
             });
             dialog.present (this);
         }
@@ -1756,6 +1842,16 @@ namespace MajorisDisks {
                 !(volume_name in used_names));
         }
     }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/storage-removal-dialog.ui")]
+    internal class StorageRemovalDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.SwitchRow wipe;
+        public bool wipe_metadata { get { return wipe.visible && wipe.active; } }
+
+        public StorageRemovalDialog (bool allow_wipe) {
+            wipe.visible = allow_wipe;
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-lifecycle-dialog.ui")]
     internal class LvmLifecycleDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.ComboRow volumes;
@@ -1764,8 +1860,11 @@ namespace MajorisDisks {
             get { return volumes.selected < entries.length ? entries[volumes.selected] : null; }
         }
 
-        public LvmLifecycleDialog (StorageLogicalVolume[] entries, string preferred) {
+        public LvmLifecycleDialog (StorageLogicalVolume[] entries, string preferred, bool physical_context = false) {
             this.entries = entries;
+            set_response_enabled ("migrate", physical_context);
+            set_response_enabled ("remove-pv", physical_context);
+            set_response_enabled ("delete-vg", physical_context && entries.length == 0);
             var labels = new Gtk.StringList (null);
             uint index = 0;
             foreach (var volume in entries) {

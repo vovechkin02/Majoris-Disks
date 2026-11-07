@@ -8,7 +8,10 @@
       <response id="close">Close</response>
       <response id="activate" appearance="suggested">Activate</response>
       <response id="deactivate">Deactivate</response>
-      <response id="delete" appearance="destructive">Delete…</response>
+      <response id="delete" appearance="destructive">Delete LV…</response>
+      <response id="migrate">Migrate Selected PV…</response>
+      <response id="remove-pv">Remove Selected PV…</response>
+      <response id="delete-vg" appearance="destructive">Delete Empty VG…</response>
     </responses>
     <property name="default-response">close</property>
     <property name="close-response">close</property>

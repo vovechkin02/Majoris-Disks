@@ -36,9 +36,11 @@
 <child><object class="GtkButton" id="manage_lvm"><property name="label">Manage Logical Volumes</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="rename_lvm"><property name="label">Rename Logical Volume</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="raid_power"><property name="label">Start RAID Array</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="raid_delete"><property name="label">Delete Stopped RAID Array…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="raid_add"><property name="label">Add RAID Member…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="raid_remove_spare"><property name="label">Remove RAID Spare…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="raid_check"><property name="label">Check RAID Consistency</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="btrfs_add"><property name="label">Add Btrfs Device…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="btrfs_subvolumes"><property name="label">List Btrfs Subvolumes</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="edit_label"><property name="label">Edit Label</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="mount_options"><property name="label">Mount Options</property><property name="visible">false</property></object></child>

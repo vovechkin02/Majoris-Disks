@@ -35,9 +35,11 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button create_lvm;
         [GtkChild] private unowned Gtk.Button raid_check;
         [GtkChild] private unowned Gtk.Button raid_add;
+        [GtkChild] private unowned Gtk.Button raid_delete;
         [GtkChild] private unowned Gtk.Button raid_remove_spare;
         [GtkChild] private unowned Gtk.Button raid_power;
         [GtkChild] private unowned Gtk.Button btrfs_subvolumes;
+        [GtkChild] private unowned Gtk.Button btrfs_add;
         [GtkChild] private unowned Gtk.Button mount_options;
         [GtkChild] private unowned Gtk.Button unlock_volume;
         [GtkChild] private unowned Gtk.Button lock_volume;
@@ -56,8 +58,10 @@ namespace MajorisDisks {
         public signal void lvm_create_requested (StorageBlock block);
         public signal void raid_check_requested (StorageBlock block);
         public signal void raid_member_requested (StorageBlock block, bool add);
+        public signal void raid_delete_requested (StorageBlock block);
         public signal void raid_power_requested (StorageBlock block, bool running);
         public signal void btrfs_subvolumes_requested (StorageBlock block);
+        public signal void btrfs_add_requested (StorageBlock block);
         public signal void mount_options_requested (StorageBlock block);
         public signal void encryption_requested (StorageBlock block, bool unlock);
         public signal void passphrase_requested (StorageBlock block);
@@ -151,6 +155,9 @@ namespace MajorisDisks {
             raid_power.clicked.connect (() => {
                 if (selected_block != null) raid_power_requested (selected_block, selected_block.raid == null);
             });
+            raid_delete.clicked.connect (() => {
+                if (selected_block != null) raid_delete_requested (selected_block);
+            });
             raid_add.clicked.connect (() => {
                 if (selected_block != null) raid_member_requested (selected_block, true);
             });
@@ -159,6 +166,9 @@ namespace MajorisDisks {
             });
             raid_check.clicked.connect (() => {
                 if (selected_block != null) raid_check_requested (selected_block);
+            });
+            btrfs_add.clicked.connect (() => {
+                if (selected_block != null) btrfs_add_requested (selected_block);
             });
             btrfs_subvolumes.clicked.connect (() => {
                 if (selected_block != null) btrfs_subvolumes_requested (selected_block);
@@ -313,9 +323,11 @@ namespace MajorisDisks {
             create_lvm.visible = false;
             raid_check.visible = false;
             raid_add.visible = false;
+            raid_delete.visible = false;
             raid_remove_spare.visible = false;
             raid_power.visible = false;
             btrfs_subvolumes.visible = false;
+            btrfs_add.visible = false;
             mount_options.visible = false;
             take_ownership.visible = false;
             edit_partition.visible = false;
@@ -351,9 +363,11 @@ namespace MajorisDisks {
             raid_check.visible = backend?.can_check_raid (block) == true;
             raid_add.visible = block.available && !block.system_hint && block.raid?.state == "idle";
             raid_remove_spare.visible = backend?.can_remove_raid_spare (block) == true;
+            raid_delete.visible = backend?.can_delete_stopped_raid (block) == true;
             raid_power.visible = backend?.can_set_raid_running (block, block.raid == null) == true;
             raid_power.label = block.raid == null ? "Start RAID Array" : "Stop RAID Array";
             btrfs_subvolumes.visible = backend?.has_btrfs_subvolumes (block) == true;
+            btrfs_add.visible = btrfs_subvolumes.visible && !block.read_only && !block.system_hint;
             if (block.raid != null && block.raid.state != "")
                 add_volume_field ("RAID sync action", block.raid.state);
             rename_lvm.visible = block.logical_volume != null && block.available && !block.read_only &&
