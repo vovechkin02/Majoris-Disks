@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <glib/gstdio.h>
 #include <signal.h>
+#include <stdio.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -156,15 +157,20 @@ reap_client (GPid *pid)
 }
 
 static gboolean
-run_client (const char *const *argv, int endpoint, GPid *pid, GError **error)
+spawn_client (const char *const *argv, int endpoint, GPid *pid, GError **error)
 {
     const int socket_fd = 3;
-    if (!g_spawn_async_with_pipes_and_fds (NULL, argv, NULL,
+    return g_spawn_async_with_pipes_and_fds (NULL, argv, NULL,
         G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL,
         NULL, NULL, -1, -1, -1, &endpoint, &socket_fd, endpoint >= 0 ? 1 : 0,
-        pid, NULL, NULL, NULL, error))
-        return FALSE;
+        pid, NULL, NULL, NULL, error);
+}
 
+static gboolean
+run_client (const char *const *argv, int endpoint, GPid *pid, GError **error)
+{
+    if (!spawn_client (argv, endpoint, pid, error))
+        return FALSE;
     gint64 deadline = g_get_monotonic_time () + 20 * G_TIME_SPAN_SECOND;
     do {
         siginfo_t info = { 0 };
@@ -217,10 +223,43 @@ disconnect_client (guint index, int *block, const char *identity, GError **error
     return FALSE;
 }
 
-static gboolean
-write_record (guint index, guint uid, const char *token, const char *identity, const char *phase, GError **error)
+static char *
+client_start_time (GPid pid, gboolean *running)
 {
+    g_autofree char *path = g_strdup_printf ("/proc/%d/stat", pid);
+    g_autofree char *status = NULL;
+    if (!g_file_get_contents (path, &status, NULL, NULL))
+        return NULL;
+    const char *name_end = strrchr (status, ')');
+    if (name_end == NULL || !g_str_has_prefix (name_end, ") "))
+        return NULL;
+    g_auto(GStrv) fields = g_strsplit (name_end + 2, " ", 21);
+    if (g_strv_length (fields) < 20)
+        return NULL;
+    if (running != NULL)
+        *running = !g_str_equal (fields[0], "Z") && !g_str_equal (fields[0], "X");
+    return g_strdup (fields[19]);
+}
+
+static gboolean
+write_record (guint index, guint uid, const char *token, const char *identity, const char *phase, GPid client, GError **error)
+{
+    g_autofree char *path = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", index);
     g_autoptr(GKeyFile) record = g_key_file_new ();
+    if (!g_str_equal (phase, "connecting")) {
+        g_key_file_load_from_file (record, path, G_KEY_FILE_NONE, NULL);
+        g_autofree char *previous = g_key_file_get_string (record, "attachment", "token", NULL);
+        if (g_strcmp0 (previous, token) != 0 || g_key_file_get_uint64 (record, "attachment", "uid", NULL) != uid)
+            g_clear_pointer (&record, g_key_file_unref);
+        if (record == NULL)
+            record = g_key_file_new ();
+    }
+    if (client > 0) {
+        g_autofree char *start = client_start_time (client, NULL);
+        g_key_file_set_uint64 (record, "attachment", "client-pid", client);
+        if (start != NULL)
+            g_key_file_set_string (record, "attachment", "client-start", start);
+    }
     g_key_file_set_uint64 (record, "attachment", "uid", uid);
     g_key_file_set_string (record, "attachment", "token", token);
     if (identity != NULL)
@@ -228,13 +267,60 @@ write_record (guint index, guint uid, const char *token, const char *identity, c
     g_key_file_set_string (record, "attachment", "state", phase);
     gsize length;
     g_autofree char *data = g_key_file_to_data (record, &length, NULL);
-    g_autofree char *path = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", index);
     return g_file_set_contents_full (path, data, length, G_FILE_SET_CONTENTS_CONSISTENT, 0644, error);
+}
+
+typedef char *(*ConnectionProbe) (GPid pid, gpointer data);
+
+static char *
+wait_for_connection (GPid pid, ConnectionProbe probe, gpointer data, gint64 timeout, GError **error)
+{
+    gint64 deadline = g_get_monotonic_time () + timeout;
+    do {
+        char *identity = probe (pid, data);
+        if (identity != NULL)
+            return identity;
+
+        siginfo_t info = { 0 };
+        if (waitid (P_PID, pid, &info, WEXITED | WNOHANG | WNOWAIT) < 0) {
+            if (errno == EINTR)
+                continue;
+            g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "Could not check nbd-client: %s", g_strerror (errno));
+            return NULL;
+        }
+        // Netlink clients normally exit successfully after handing the connection to the kernel.
+        if (info.si_pid == pid && (info.si_code != CLD_EXITED || info.si_status != 0)) {
+            // A client can fail after the kernel accepted its request.
+            identity = probe (pid, data);
+            if (identity != NULL)
+                return identity;
+            int status = info.si_code == CLD_EXITED ? info.si_status << 8 : info.si_status;
+            g_spawn_check_wait_status (status, error);
+            return NULL;
+        }
+        g_usleep (10000);
+    } while (g_get_monotonic_time () < deadline);
+
+    g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT, "The kernel did not confirm the NBD connection in time.");
+    return NULL;
+}
+
+static char *
+probe_attachment (GPid pid, gpointer data)
+{
+    guint index = GPOINTER_TO_UINT (data), kernel_pid = 0;
+    guint64 size;
+    g_autofree char *identity = majoris_nbd_identity (index, &kernel_pid);
+    // Debian netlink installs the configuration in the calling process. The foreground ioctl
+    // path publishes the NBD_DO_IT caller, while its partition-probing child does not own it.
+    if (kernel_pid != (guint) pid || !read_number (index, "size", &size) || size == 0)
+        return NULL;
+    return g_steal_pointer (&identity);
 }
 
 static gboolean
 attach_device (guint uid, const char *token, guint64 capacity, gboolean read_only,
-               guint *index, gboolean *uncertain, GError **error)
+               guint *index, GPid *client, gboolean *uncertain, GError **error)
 {
     int endpoint __attribute__((cleanup(close_fd))) = export_socket (uid, token);
     if (endpoint < 0) {
@@ -253,7 +339,7 @@ attach_device (guint uid, const char *token, guint64 capacity, gboolean read_onl
     const char *argv[] = { MAJORIS_NBD_CLIENT, "-unix", "/proc/self/fd/3", path, "-name", token,
         "-nofork", "-timeout", "30", read_only ? "-readonly" : NULL, NULL };
     g_autofree char *journal = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", *index);
-    if (!write_record (*index, uid, token, NULL, "connecting", error))
+    if (!write_record (*index, uid, token, NULL, "connecting", 0, error))
         return FALSE;
 
     guint64 idle_size;
@@ -266,33 +352,50 @@ attach_device (guint uid, const char *token, guint64 capacity, gboolean read_onl
     close_fd (&block);
     block = -1;
     // The client resolves the pinned socket inode, even if its original pathname changes.
-    GPid spawned __attribute__((cleanup(reap_client))) = 0;
-    g_autoptr(GError) client_error = NULL;
-    gboolean success = run_client (argv, endpoint, &spawned, &client_error);
-    guint kernel_pid = 0;
-    g_autofree char *identity = majoris_nbd_identity (*index, &kernel_pid);
-    if (identity == NULL || kernel_pid != (guint) spawned) {
-        *uncertain = success || (spawned > 0 && identity == NULL && has_client (*index));
-        if (!*uncertain)
-            g_unlink (journal);
-        if (client_error != NULL)
-            g_propagate_prefixed_error (error, g_steal_pointer (&client_error), "nbd-client could not connect: ");
-        else
-            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "The kernel did not confirm this NBD client.");
+    if (!spawn_client (argv, endpoint, client, error)) {
+        g_unlink (journal);
         return FALSE;
     }
 
+    g_autoptr(GError) launch_journal_error = NULL;
+    if (!write_record (*index, uid, token, NULL, "client-launched", *client, &launch_journal_error))
+        g_warning ("Could not record the launched NBD client: %s", launch_journal_error->message);
+
+    g_autoptr(GError) readiness_error = NULL;
+    g_autofree char *identity = wait_for_connection (*client, probe_attachment, GUINT_TO_POINTER (*index),
+        20 * G_TIME_SPAN_SECOND, &readiness_error);
+    guint observed_pid = 0;
+    g_autofree char *observed = identity == NULL ? majoris_nbd_identity (*index, &observed_pid) : NULL;
+    if (identity == NULL && (!has_client (*index) || (observed != NULL && observed_pid != (guint) *client))) {
+        // Cancel only our still-reserved child. A connection racing the timeout can still
+        // survive in the kernel, so wait for the child and inspect ownership again.
+        kill (*client, SIGKILL);
+        siginfo_t stopped;
+        while (waitid (P_PID, *client, &stopped, WEXITED | WNOWAIT) < 0 && errno == EINTR) {}
+    }
+    if (identity == NULL) {
+        guint kernel_pid = 0;
+        identity = majoris_nbd_identity (*index, &kernel_pid);
+        if (kernel_pid != (guint) *client) {
+            *uncertain = identity == NULL && has_client (*index);
+            if (!*uncertain)
+                g_unlink (journal);
+            g_propagate_error (error, g_steal_pointer (&readiness_error));
+            return FALSE;
+        }
+    }
+
     guint64 sectors, readonly;
-    gboolean recorded = write_record (*index, uid, token, identity, "connected-unverified", error);
+    gboolean recorded = write_record (*index, uid, token, identity, "connected-unverified", *client, error);
     // Debian's netlink client returns after configuring the kernel. Check the actual block path as well.
     block = claim_device (*index);
     g_autofree char *claimed_identity = block >= 0 ? majoris_nbd_identity (*index, NULL) : NULL;
     char sector[512];
-    gboolean valid = success && recorded && g_strcmp0 (claimed_identity, identity) == 0 &&
+    gboolean valid = readiness_error == NULL && recorded && g_strcmp0 (claimed_identity, identity) == 0 &&
                      read_number (*index, "size", &sectors) && sectors == capacity / 512 &&
                      read_number (*index, "ro", &readonly) && readonly == (guint64) read_only &&
                      pread (block, sector, sizeof sector, 0) == sizeof sector;
-    if (valid && write_record (*index, uid, token, identity, "attached-verified", error))
+    if (valid && write_record (*index, uid, token, identity, "attached-verified", *client, error))
         return TRUE;
 
     g_autoptr(GError) rollback = NULL;
@@ -400,11 +503,31 @@ detach_device (guint uid, guint index, const char *token, GError **error)
         return FALSE;
     }
     g_autoptr(GError) journal_error = NULL;
-    if (!write_record (index, uid, token, identity, "disconnecting", &journal_error))
+    if (!write_record (index, uid, token, identity, "disconnecting", 0, &journal_error))
         g_warning ("Could not update the NBD journal before detaching: %s", journal_error->message);
     if (!disconnect_client (index, &block, identity, error))
         return FALSE;
     g_autofree char *path = g_strdup_printf (MAJORIS_NBD_STATE "/nbd%u", index);
+    g_autoptr(GKeyFile) record = g_key_file_new ();
+    if (g_key_file_load_from_file (record, path, G_KEY_FILE_NONE, NULL)) {
+        guint64 pid = g_key_file_get_uint64 (record, "attachment", "client-pid", NULL);
+        g_autofree char *expected = g_key_file_get_string (record, "attachment", "client-start", NULL);
+        if (pid > 0 && pid <= G_MAXINT && expected != NULL) {
+            for (guint i = 0; ; i++) {
+                gboolean running = FALSE;
+                g_autofree char *start = client_start_time ((GPid) pid, &running);
+                if (!running || g_strcmp0 (start, expected) != 0)
+                    break;
+                if (i == 50) {
+                    write_record (index, uid, token, identity, "client-cleanup-pending", 0, NULL);
+                    g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                        "The kernel disconnected the NBD device, but the foreground client is still running.");
+                    return FALSE;
+                }
+                g_usleep (100000);
+            }
+        }
+    }
     if (g_unlink (path) != 0 && errno != ENOENT)
         g_warning ("Could not remove inactive NBD record: %s", g_strerror (errno));
     return TRUE;
@@ -432,13 +555,20 @@ attach_worker (char **argv)
     guint index = 0;
     gboolean uncertain = FALSE;
     g_autoptr(GError) error = NULL;
+    GPid client __attribute__((cleanup(reap_client))) = 0;
     gboolean success = attach_device (uid, token, capacity, g_str_equal (argv[5], "1"),
-        &index, &uncertain, &error);
+        &index, &client, &uncertain, &error);
     int code = error != NULL && error->domain == G_IO_ERROR ? error->code : G_IO_ERROR_FAILED;
     g_autoptr(GVariant) result = g_variant_ref_sink (g_variant_new ("(buibs)", success, index, code,
         uncertain, error != NULL ? error->message : ""));
     g_autofree char *serialized = g_variant_print (result, FALSE);
+    close (3);
+    // Continue supervising the client after the result channel closes. A lost caller must
+    // not prevent reaping the child or accidentally signal a reused PID.
+    signal (SIGPIPE, SIG_IGN);
     g_print ("%s\n", serialized);
+    fflush (stdout);
+    close (STDOUT_FILENO);
     return 0;
 }
 
@@ -463,9 +593,13 @@ supervise_attachment (int lock, guint uid, const char *token, guint64 capacity, 
 
     g_autofree char *output = NULL;
     *uncertain = TRUE;
-    if (!g_subprocess_communicate_utf8 (worker, NULL, NULL, &output, NULL, error) ||
-        !g_subprocess_wait_check (worker, NULL, error))
+    g_autoptr(GDataInputStream) results = g_data_input_stream_new (g_subprocess_get_stdout_pipe (worker));
+    output = g_data_input_stream_read_line_utf8 (results, NULL, NULL, error);
+    if (output == NULL) {
+        if (error != NULL && *error == NULL)
+            g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "The NBD worker exited before reporting a result.");
         return FALSE;
+    }
     g_autoptr(GVariant) result = g_variant_parse (G_VARIANT_TYPE ("(buibs)"), output, NULL, NULL, error);
     if (result == NULL)
         return FALSE;

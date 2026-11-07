@@ -185,6 +185,58 @@ test_authorization (void)
     g_test_dbus_down (bus);
 }
 
+static char *
+simulated_connection (GPid pid, gpointer data)
+{
+    guint *polls = data;
+    return ++*polls == 3 ? g_strdup_printf ("fixture:%d", pid) : NULL;
+}
+
+static char *
+no_connection (GPid pid, gpointer data)
+{
+    return NULL;
+}
+
+static void
+test_foreground_readiness (void)
+{
+    const char *argv[] = { "/usr/bin/sleep", "30", NULL };
+    GPid client __attribute__((cleanup(reap_client))) = 0;
+    g_autoptr(GError) error = NULL;
+    g_assert_true (spawn_client (argv, -1, &client, &error));
+    g_assert_no_error (error);
+    guint polls = 0;
+    g_autofree char *identity = wait_for_connection (client, simulated_connection, &polls, G_TIME_SPAN_SECOND, &error);
+    g_assert_no_error (error);
+    g_assert_nonnull (identity);
+    siginfo_t state = { 0 };
+    g_assert_cmpint (waitid (P_PID, client, &state, WEXITED | WNOHANG | WNOWAIT), ==, 0);
+    g_assert_cmpint (state.si_pid, ==, 0);
+    g_assert_cmpint (kill (client, SIGTERM), ==, 0);
+}
+
+static void
+test_readiness_failures (void)
+{
+    const char *failed[] = { "/usr/bin/false", NULL };
+    const char *pending[] = { "/usr/bin/sleep", "30", NULL };
+    GPid early __attribute__((cleanup(reap_client))) = 0;
+    GPid slow __attribute__((cleanup(reap_client))) = 0;
+    g_autoptr(GError) error = NULL;
+    g_assert_true (spawn_client (failed, -1, &early, &error));
+    g_assert_null (wait_for_connection (early, no_connection, NULL, G_TIME_SPAN_SECOND, &error));
+    g_assert_error (error, G_SPAWN_EXIT_ERROR, 1);
+    g_clear_error (&error);
+    g_assert_true (spawn_client (pending, -1, &slow, &error));
+    g_assert_null (wait_for_connection (slow, no_connection, NULL, 50 * G_TIME_SPAN_MILLISECOND, &error));
+    g_assert_error (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT);
+    siginfo_t state = { 0 };
+    g_assert_cmpint (waitid (P_PID, slow, &state, WEXITED | WNOHANG | WNOWAIT), ==, 0);
+    g_assert_cmpint (state.si_pid, ==, 0);
+    g_assert_cmpint (kill (slow, SIGTERM), ==, 0);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -193,5 +245,7 @@ main (int argc, char **argv)
     g_test_add_func ("/nbd/private-directories", test_private_directories);
     g_test_add_func ("/nbd/unowned-device", test_unowned_device);
     g_test_add_func ("/nbd/authorization", test_authorization);
+    g_test_add_func ("/nbd/foreground-readiness", test_foreground_readiness);
+    g_test_add_func ("/nbd/readiness-failures", test_readiness_failures);
     return g_test_run ();
 }
