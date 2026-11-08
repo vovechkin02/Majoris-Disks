@@ -1167,8 +1167,14 @@ namespace MajorisDisks {
                     string? source_path = source.get_path ();
                     dialog.set_response_enabled ("attach-writable", direct && source_path != null &&
                         Posix.access (source_path, Posix.W_OK) == 0);
+                    dialog.set_response_enabled ("grow", !info.has_snapshots);
+                    if (info.has_snapshots) dialog.body += "\n\nGrowing a copy is unavailable for images with internal snapshots.";
                     if (unavailable != null) dialog.body += "\n\n" + unavailable + " You can still convert to raw.";
                     dialog.response.connect ((response) => {
+                        if (response == "grow") {
+                            choose_grown_image (source, info);
+                            return;
+                        }
                         if (response == "attach-readonly" || response == "attach-writable") {
                             attach_virtual (source, response == "attach-readonly");
                             return;
@@ -1176,12 +1182,13 @@ namespace MajorisDisks {
                         if (response != "convert") return;
                         string format = dialog.format;
                         bool attach = dialog.attach_copy;
+                        bool compress = dialog.compress_copy;
                         var save = new Gtk.FileDialog () { title = "Save Converted Image",
                             initial_name = "Converted" + image_extension (format) };
                         save.save.begin (this, null, (object, saved) => {
                             File target;
                             try { target = save.save.end (saved); } catch (Error error) { return; }
-                            write_virtual_image (source, target, format, 0, attach);
+                            write_virtual_image (source, target, format, 0, attach, null, compress);
                         });
                     });
                     dialog.present (this);
@@ -1193,18 +1200,43 @@ namespace MajorisDisks {
             return format == "raw" ? ".img" : format == "vpc" ? ".vhd" : "." + format;
         }
 
-        private void write_virtual_image (File? source, File destination, string format, uint64 size, bool attach) {
-            var job = backend.jobs.begin_named (source == null ? "Create virtual disk" : "Convert disk image",
+        private void choose_grown_image (File source, VirtualDiskInfo info) {
+            var setup = new BlankDiskImageDialog ();
+            setup.configure_growth (source, info.capacity);
+            setup.response.connect ((response) => {
+                if (response != "create") return;
+                uint64 size = setup.bytes;
+                var save = new Gtk.FileDialog () { title = "Save Larger Disk Image",
+                    initial_name = "Grown" + image_extension (info.format) };
+                save.save.begin (this, null, (object, saved) => {
+                    File target;
+                    try { target = save.save.end (saved); } catch (Error error) { return; }
+                    write_virtual_image (source, target, info.format, size, false, info);
+                });
+            });
+            setup.present (this);
+        }
+
+        private void write_virtual_image (File? source, File destination, string format, uint64 size, bool attach,
+            VirtualDiskInfo? grow = null, bool compress = false) {
+            string operation = grow != null ? "Grow a disk image copy" :
+                source == null ? "Create virtual disk" : "Convert disk image";
+            var job = backend.jobs.begin_named (operation,
                 destination.get_parse_name (), {});
             job.cancelable = true;
-            backend.jobs.phase (job, StorageJobState.RUNNING, source == null ? "Creating image" : "Converting image");
+            string phase = grow != null ? "Copying and verifying the larger image" :
+                compress ? "Compressing and verifying the image" :
+                source == null ? "Creating image" : "Converting image";
+            backend.jobs.phase (job, StorageJobState.RUNNING, phase);
             VirtualDisk.write_image.begin (source, destination, format, size, job.cancellable,
-                (fraction) => backend.jobs.progress (job, "Converting image", fraction, true), (object, result) => {
+                (fraction) => backend.jobs.progress (job, phase, fraction, true), grow,
+                (fd) => backend.require_detached_image (fd), compress, (object, result) => {
                 var outcome = new StorageOperationResult ();
                 try {
                     VirtualDisk.write_image.end (result);
                     outcome.successful = true;
-                    outcome.summary = source == null ? "Virtual disk created" : "Disk image converted";
+                    outcome.summary = grow != null ? "Larger disk image saved and verified" :
+                        source == null ? "Virtual disk created" : "Disk image converted";
                     notifications.add_toast (new Adw.Toast (outcome.summary));
                     if (attach) {
                         if (format == "raw") attach_image (destination, true, outcome.summary);
@@ -1453,11 +1485,14 @@ namespace MajorisDisks {
     internal class VirtualImageDialog : Adw.AlertDialog {
         [GtkChild] private unowned Gtk.DropDown format_choice;
         [GtkChild] private unowned Adw.SwitchRow attach;
+        [GtkChild] private unowned Adw.SwitchRow compression;
         public string format { owned get { return disk_image_format (format_choice.selected); } }
         public bool attach_copy { get { return attach.sensitive && attach.active; } }
+        public bool compress_copy { get { return compression.sensitive && compression.active; } }
 
         construct {
             format_choice.notify["selected"].connect (() => {
+                compression.sensitive = format == "qcow2";
                 string? unavailable = VirtualDiskAttachment.unavailable_reason ();
                 attach.sensitive = format_choice.selected == 0 || unavailable == null;
                 attach.subtitle = attach.sensitive ? "" : unavailable;
@@ -1480,9 +1515,22 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.DropDown unit;
         [GtkChild] private unowned Adw.SwitchRow attach;
         [GtkChild] private unowned Gtk.DropDown format_choice;
+        [GtkChild] private unowned Adw.ActionRow format_row;
         public string format { owned get { return disk_image_format (format_choice.selected); } }
         public uint64 bytes { get { return (uint64) size.get_value_as_int () * (unit.selected == 0 ? 1048576 : 1073741824); } }
         public bool attach_after { get { return attach.sensitive && attach.active; } }
+
+        public void configure_growth (File source, uint64 current_size) {
+            heading = "Grow a Copy of the Disk Image";
+            body = "%s · %s\n\nChoose a larger virtual capacity for the copy. Partitions and filesystems inside it keep their current sizes.".printf (
+                source.get_parse_name (), format_size (current_size));
+            format_row.visible = false;
+            attach.visible = false;
+            size.value = (double) (current_size / 1048576 + 1);
+            size.value_changed.connect (() => set_response_enabled ("create", bytes > current_size));
+            unit.notify["selected"].connect (() => set_response_enabled ("create", bytes > current_size));
+            set_response_enabled ("create", bytes > current_size);
+        }
 
         construct {
             format_choice.sensitive = VirtualDisk.available ();

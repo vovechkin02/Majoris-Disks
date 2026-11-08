@@ -53,6 +53,7 @@ test('disposable-xz-integration', imaging_test, args: ['--xz'], timeout: 180)
 test('disposable-partition-image-integration', imaging_test, args: ['--partition'], timeout: 180)
 test('disposable-partition-xz-integration', imaging_test, args: ['--partition', '--xz'], timeout: 180)
 test('disposable-nbd-integration', imaging_test, args: ['--nbd'], timeout: 300)
+test('virtual-image-growth', imaging_test, args: ['--grow'], timeout: 120)
 test('disposable-loop-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],
   timeout: 120)

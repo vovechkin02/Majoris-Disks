@@ -3,9 +3,12 @@ namespace MajorisDisks {
         public string format;
         public uint64 capacity;
         public uint64 file_size;
+        public string identity = "";
+        public bool has_snapshots;
     }
 
     internal delegate void ConversionProgress (double fraction);
+    internal delegate void ImageSourceCheck (int fd) throws Error;
 
     internal class VirtualDisk {
         public static bool available () {
@@ -91,6 +94,8 @@ namespace MajorisDisks {
             Posix.Stat file = {};
             if (Posix.fstat (input, out file) != 0 || !Posix.S_ISREG (file.st_mode))
                 throw new IOError.INVALID_DATA ("Choose a regular local image file.");
+            string? identity = image_identity (input);
+            if (identity == null) throw new IOError.INVALID_DATA ("Could not identify the image.");
             var parser = new Json.Parser ();
             parser.load_from_data (yield run (input, null, { "info", "--output=json", "/source" }, token));
             var root = parser.get_root ()?.get_object ();
@@ -110,6 +115,11 @@ namespace MajorisDisks {
             result.format = format;
             result.capacity = (uint64) capacity;
             result.file_size = (uint64) file.st_size;
+            result.identity = identity;
+            result.has_snapshots = root.has_member ("snapshots") &&
+                root.get_array_member ("snapshots").get_length () > 0;
+            if (identity != image_identity (input))
+                throw new IOError.INVALID_DATA ("The image changed during inspection.");
             return result;
         }
 
@@ -147,11 +157,14 @@ namespace MajorisDisks {
         }
 
         public static async void write_image (File? source, File destination, string format, uint64 capacity,
-            Cancellable token, ConversionProgress? progress = null) throws Error {
+            Cancellable token, ConversionProgress? progress = null, VirtualDiskInfo? grow = null,
+            ImageSourceCheck? check_source = null, bool compress = false) throws Error {
             string? path = destination.get_path ();
             string? parent = destination.get_parent ()?.get_path ();
             if (path == null || parent == null || !supported (format))
                 throw new IOError.INVALID_ARGUMENT ("Choose a local destination and a supported image format.");
+            if (compress && (source == null || format != "qcow2" || grow != null))
+                throw new IOError.INVALID_ARGUMENT ("Compression requires converting an existing image to QCOW2.");
             if (destination.query_exists (token))
                 throw new IOError.EXISTS ("An image already exists at the selected destination.");
             string directory = Path.build_filename (parent, ".majoris-" + Uuid.string_random ());
@@ -160,7 +173,9 @@ namespace MajorisDisks {
             string temporary = Path.build_filename (directory, "disk");
             int fd = -1;
             try {
-                if (source == null) {
+                if (grow != null && (source == null || format != grow.format || capacity <= grow.capacity))
+                    throw new IOError.INVALID_ARGUMENT ("Choose a larger capacity in the same image format.");
+                if (source == null || grow != null) {
                     if (capacity == 0 || capacity > int64.MAX)
                         throw new IOError.INVALID_ARGUMENT ("Choose a valid virtual capacity.");
                     string[] create = { "create", "-f", format };
@@ -168,20 +183,46 @@ namespace MajorisDisks {
                     create += "/output/disk";
                     create += capacity.to_string ();
                     yield run (-1, directory, create, token);
-                } else {
+                }
+                if (source != null) {
                     fd = open_image (source);
                     string? original = image_identity (fd);
                     if (original == null) throw new IOError.INVALID_DATA ("Could not identify the selected source image.");
                     var information = yield inspect_fd (fd, token);
-                    yield check_conversion_space (fd, information.format, format, destination, token);
-                    capacity = information.capacity;
+                    if (grow == null) capacity = information.capacity;
+                    else {
+                        if (original != grow.identity || information.format != grow.format ||
+                            information.capacity != grow.capacity || information.has_snapshots)
+                            throw new IOError.INVALID_DATA ("The source changed or contains internal snapshots.");
+                        if (check_source != null) check_source (fd);
+                    }
+                    // The VHD drivers do not implement measurement. For growth, use the
+                    // raw size as a conservative estimate for the copied payload.
+                    string measure_format = grow != null && (format == "vpc" || format == "vhdx") ?
+                        "raw" : format;
+                    yield check_conversion_space (fd, information.format, measure_format, destination, token);
                     if (original != image_identity (fd))
                         throw new IOError.INVALID_DATA ("The image changed before conversion.");
                     string[] convert = { "convert", "-p", "-f", information.format, "-O", format };
-                    if (format == "vpc") { convert += "-o"; convert += "force_size=on"; }
+                    if (grow != null) convert += "-n";
+                    else if (format == "vpc") { convert += "-o"; convert += "force_size=on"; }
+                    if (compress) convert += "-c";
                     convert += "/source";
                     convert += "/output/disk";
-                    yield run (fd, directory, convert, token, progress);
+                    ConversionProgress? copy_progress = null;
+                    bool verify_contents = grow != null || compress;
+                    if (progress != null) {
+                        if (verify_contents) copy_progress = (fraction) => progress (fraction * 0.8);
+                        else copy_progress = (fraction) => progress (fraction);
+                    }
+                    yield run (fd, directory, convert, token, copy_progress);
+                    if (verify_contents) {
+                        // Non-strict comparison accepts extra sectors only if they read back as zero.
+                        ConversionProgress? verify_progress = null;
+                        if (progress != null) verify_progress = (fraction) => progress (0.8 + fraction * 0.2);
+                        yield run (fd, directory, { "compare", "-p", "-f", information.format, "-F", format,
+                            "/source", "/output/disk" }, token, verify_progress);
+                    }
                     if (original != image_identity (fd))
                         throw new IOError.INVALID_DATA ("The source image changed during conversion.");
                 }
@@ -191,6 +232,11 @@ namespace MajorisDisks {
                     if (verified.format != format || verified.capacity != capacity)
                         throw new IOError.INVALID_DATA ("The output format or virtual capacity did not match the request.");
                 } finally { Posix.close (output); }
+                if (grow != null) {
+                    if (grow.identity != image_identity (fd))
+                        throw new IOError.INVALID_DATA ("The source image changed during verification.");
+                    if (check_source != null) check_source (fd);
+                }
                 token.set_error_if_cancelled ();
                 if (rename_without_replacement (CURRENT_DIRECTORY, temporary, CURRENT_DIRECTORY, path, NO_REPLACEMENT) != 0)
                     throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));

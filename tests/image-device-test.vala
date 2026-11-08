@@ -285,7 +285,88 @@ private async void exercise_nbd_devices () throws Error {
     }
 }
 
+private async void exercise_image_growth () throws Error {
+    string directory = DirUtils.make_tmp ("majoris-image-growth-XXXXXX");
+    var raw = File.new_for_path (Path.build_filename (directory, "fixture.img"));
+    var source = File.new_for_path (Path.build_filename (directory, "source"));
+    var grown = File.new_for_path (Path.build_filename (directory, "grown"));
+    var token = new Cancellable ();
+    uint64 initial = 64 * 1024 * 1024;
+    try {
+        yield DiskImageCopy.create_blank (raw, initial);
+        set_nbd_marker (raw, "Majoris image growth fixture");
+        foreach (string format in new string[] { "raw", "vpc", "vhdx", "qcow2" }) {
+            yield VirtualDisk.write_image (raw, source, format, 0, token);
+            var info = yield VirtualDisk.inspect (source, token);
+            try {
+                yield VirtualDisk.write_image (source, grown, format, initial - 1048576, token, null, info);
+                throw new IOError.FAILED ("Image shrinking should have been rejected.");
+            } catch (IOError.INVALID_ARGUMENT expected) {}
+            try {
+                yield VirtualDisk.write_image (source, grown, format, initial * 2, token, null, info,
+                    (fd) => { throw new IOError.BUSY ("Simulated attached source"); });
+                throw new IOError.FAILED ("An attached source should have been rejected.");
+            } catch (IOError.BUSY expected) {}
+            double last_progress = 0;
+            bool regressed = false;
+            yield VirtualDisk.write_image (source, grown, format, initial * 2, token, (fraction) => {
+                if (fraction < last_progress) regressed = true;
+                last_progress = fraction;
+            }, info);
+            var result = yield VirtualDisk.inspect (grown, token);
+            var original = yield VirtualDisk.inspect (source, token);
+            if (result.format != format || result.capacity != initial * 2 || original.identity != info.identity ||
+                regressed || last_progress != 1)
+                throw new IOError.INVALID_DATA ("Unexpected growth result for " + format);
+            FileUtils.unlink (source.get_path ());
+            FileUtils.unlink (grown.get_path ());
+        }
+        var backing = new Subprocess.newv ({ "/usr/bin/qemu-img", "create", "-f", "qcow2",
+            "-F", "raw", "-b", raw.get_path (), source.get_path () }, SubprocessFlags.STDOUT_SILENCE);
+        yield backing.wait_check_async (token);
+        try {
+            yield VirtualDisk.inspect (source, token);
+            throw new IOError.FAILED ("An external backing file should have been rejected.");
+        } catch (IOError.NOT_SUPPORTED expected) {}
+        FileUtils.unlink (source.get_path ());
+        yield VirtualDisk.write_image (raw, source, "qcow2", 0, token);
+        var snapshot = new Subprocess.newv ({ "/usr/bin/qemu-img", "snapshot", "-c", "fixture",
+            source.get_path () }, SubprocessFlags.NONE);
+        yield snapshot.wait_check_async (token);
+        var snapshotted = yield VirtualDisk.inspect (source, token);
+        if (!snapshotted.has_snapshots) throw new IOError.INVALID_DATA ("The internal snapshot was not detected.");
+        try {
+            yield VirtualDisk.write_image (source, grown, "qcow2", initial * 2, token, null, snapshotted);
+            throw new IOError.FAILED ("An internal snapshot should have blocked growth.");
+        } catch (IOError.INVALID_DATA expected) {}
+        yield VirtualDisk.write_image (raw, grown, "qcow2", 0, token, null, null, null, true);
+        var compressed = yield VirtualDisk.inspect (grown, token);
+        if (compressed.format != "qcow2" || compressed.capacity != initial)
+            throw new IOError.INVALID_DATA ("The compressed image has the wrong format or capacity.");
+    } finally {
+        FileUtils.unlink (source.get_path ());
+        FileUtils.unlink (grown.get_path ());
+        FileUtils.unlink (raw.get_path ());
+        DirUtils.remove (directory);
+    }
+}
+
 public static int main (string[] args) {
+    if ("--grow" in args) {
+        if (!VirtualDisk.available ()) {
+            stdout.printf ("SKIP: image growth requires qemu-utils and Bubblewrap.\n");
+            return 77;
+        }
+        var growth_loop = new MainLoop ();
+        int growth_status = 0;
+        exercise_image_growth.begin ((object, result) => {
+            try { exercise_image_growth.end (result); }
+            catch (Error error) { stderr.printf ("%s\n", error.message); growth_status = 1; }
+            growth_loop.quit ();
+        });
+        growth_loop.run ();
+        return growth_status;
+    }
     bool nbd = args.length > 1 && args[1] == "--nbd";
     bool use_xz = "--xz" in args;
     bool partition = "--partition" in args;

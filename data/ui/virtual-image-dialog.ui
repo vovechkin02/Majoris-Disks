@@ -7,6 +7,7 @@
         <child><object class="AdwActionRow"><property name="title">Image format</property>
           <child type="suffix"><object class="GtkDropDown" id="format_choice"><property name="valign">center</property><property name="model"><object class="GtkStringList"><items><item>Raw</item><item>VHD</item><item>VHDX</item><item>QCOW2</item></items></object></property></object></child>
         </object></child>
+        <child><object class="AdwSwitchRow" id="compression"><property name="title">Compress QCOW2 data</property><property name="subtitle">Available when converting to QCOW2</property><property name="sensitive">false</property></object></child>
         <child><object class="AdwSwitchRow" id="attach"><property name="title">Attach converted image read-only</property></object></child>
       </object>
     </property>
@@ -16,6 +17,7 @@
       <response id="attach-readonly" appearance="suggested">Attach Read-Only</response>
       <response id="attach-writable" appearance="destructive">Attach Read/Write</response>
       <response id="convert">Convert…</response>
+      <response id="grow">Grow a Copy…</response>
     </responses>
   </template>
 </interface>

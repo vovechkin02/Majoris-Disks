@@ -5,7 +5,7 @@
     <property name="body">Choose the virtual capacity of the new sparse raw image.</property>
     <property name="extra-child">
       <object class="AdwPreferencesGroup">
-        <child><object class="AdwActionRow"><property name="title">Image format</property>
+        <child><object class="AdwActionRow" id="format_row"><property name="title">Image format</property>
           <child type="suffix"><object class="GtkDropDown" id="format_choice"><property name="valign">center</property><property name="model"><object class="GtkStringList"><items><item>Raw</item><item>VHD</item><item>VHDX</item><item>QCOW2</item></items></object></property></object></child>
         </object></child>
         <child><object class="AdwActionRow"><property name="title">Virtual capacity</property>

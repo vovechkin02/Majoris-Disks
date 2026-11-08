@@ -981,6 +981,23 @@ namespace MajorisDisks {
             return result;
         }
 
+        internal void require_detached_image (int fd) throws Error {
+            if (owner == null) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
+            Posix.Stat source = {};
+            if (Posix.fstat (fd, out source) != 0)
+                throw new IOError.FAILED ("Could not identify the selected image.");
+            string path = FileUtils.read_link ("/proc/self/fd/%d".printf (fd));
+            synchronize ();
+            foreach (var block in snapshot.blocks.get_values ()) {
+                string? backing = block.loop?.backing_file ?? block.virtual_attachment?.file;
+                if (backing == null || backing == "") continue;
+                Posix.Stat attached = {};
+                if (backing == path || (Posix.stat (backing, out attached) == 0 &&
+                    attached.st_dev == source.st_dev && attached.st_ino == source.st_ino))
+                    throw new IOError.BUSY ("Detach the source image before growing a copy.");
+            }
+        }
+
         internal async string attach_disk_image (File source, bool read_only) throws Error {
             string? path = source.get_path ();
             string name = (source.get_basename () ?? "").down ();
