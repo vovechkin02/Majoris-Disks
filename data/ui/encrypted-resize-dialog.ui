@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksEncryptedResizeDialog" parent="AdwAlertDialog">
+    <property name="heading">Resize Encrypted Volume</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child>
+          <object class="AdwEntryRow" id="backing_entry">
+            <property name="title">New backing capacity in bytes (optional)</property>
+            <property name="input-purpose">digits</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwEntryRow" id="size_entry">
+            <property name="title">New cleartext capacity in bytes</property>
+            <property name="input-purpose">digits</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwPasswordEntryRow" id="passphrase_entry">
+            <property name="title">Passphrase if required by UDisks</property>
+          </object>
+        </child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="resize" appearance="destructive">Resize</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

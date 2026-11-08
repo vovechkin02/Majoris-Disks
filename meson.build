@@ -66,6 +66,15 @@ if cryptsetup_dep.found()
     args: [meson.current_source_dir() / 'tests/luks-header-integration.sh', luks_header_worker, luks_service_test],
     env: ['MAJORIS_TEST_FAULT_LIBRARY=' + luks_worker_faults.full_path()],
     depends: luks_worker_faults, timeout: 300)
+  test('luks-resize-integration', sh,
+    args: [meson.current_source_dir() / 'tests/luks-resize-integration.sh', luks_service_test],
+    timeout: 300)
+  test('luks-partition-resize-integration', sh,
+    args: [meson.current_source_dir() / 'tests/luks-resize-integration.sh', luks_service_test, 'partition'],
+    timeout: 300)
+  test('luks-configuration-integration', sh,
+    args: [meson.current_source_dir() / 'tests/luks-configuration-integration.sh', luks_service_test],
+    timeout: 300)
 endif
 test('disposable-loop-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],

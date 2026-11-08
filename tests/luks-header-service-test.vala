@@ -6,12 +6,22 @@ private async void exercise_service (string device, string backing, string mode,
     StorageBlock? target = null;
     bool advanced = mode == "advanced";
     bool credentials = mode == "credentials";
+    bool resize = mode == "resize";
+    bool configuration = mode == "configuration";
+    bool restore_mount = mode == "restore-mount" || mode == "refuse-bind-mount";
     bool restore = mode != "backup" && !credentials;
     for (int attempt = 0; attempt < 60; attempt++) {
         yield service.refresh ();
         foreach (var candidate in service.snapshot.blocks.get_values ()) {
-            if (candidate.device == device && candidate.loop?.backing_file == backing &&
-                candidate.logical_sector_size > 0 && candidate.encrypted?.mapping == null &&
+            var parent = candidate.partition == null ? null :
+                service.snapshot.blocks.lookup (candidate.partition.table_path);
+            bool correct_backing = candidate.loop?.backing_file == backing ||
+                (resize && parent?.loop?.backing_file == backing);
+            var mapping = candidate.encrypted?.mapping;
+            if (candidate.device == device && correct_backing &&
+                (resize || restore_mount ? mapping != null && mapping.logical_sector_size > 0 &&
+                    (parent == null || parent.logical_sector_size > 0) :
+                    mapping == null && candidate.logical_sector_size > 0) &&
                 (advanced ? UDisksService.is_luks_recovery_candidate (candidate) :
                     UDisksService.is_luks_header_candidate (candidate))) {
                 target = candidate;
@@ -23,6 +33,98 @@ private async void exercise_service (string device, string backing, string mode,
         yield;
     }
     if (target == null) throw new IOError.NOT_FOUND ("UDisks did not publish the expected disposable loop fixture.");
+    if (restore_mount) {
+        if (Environment.get_variable ("MAJORIS_TEST_CRYPTTAB") != "1" ||
+            !FileUtils.test ("/etc/majoris-private-crypttab", FileTest.IS_REGULAR))
+            throw new IOError.PERMISSION_DENIED ("The isolated mount fixture is required.");
+        var mapping = target.encrypted.mapping;
+        assert (mapping.filesystem != null && mapping.filesystem.mounted);
+        if (mode == "refuse-bind-mount") {
+            try {
+                yield service.check_filesystem (mapping);
+                assert_not_reached ();
+            } catch (IOError error) { assert (error is IOError.NOT_SUPPORTED); }
+        } else {
+            assert (yield service.check_filesystem (mapping));
+            assert (mapping.filesystem.mounts.length == 1 && mapping.filesystem.mounts[0] == path);
+        }
+        return;
+    }
+    if (configuration) {
+        if (Environment.get_variable ("MAJORIS_TEST_CRYPTTAB") != "1" ||
+            !FileUtils.test ("/etc/majoris-private-crypttab", FileTest.IS_REGULAR))
+            throw new IOError.PERMISSION_DENIED ("The isolated crypttab fixture is required.");
+        string identity = service.modification_identity (target);
+        string name = Path.get_basename (backing).replace (".img", "");
+        string original = "majoris original disposable passphrase";
+        string replacement = "majoris rotated disposable passphrase";
+        try {
+            yield service.configure_encryption (target, true, true, name, "luks,nofail", "incorrect credential",
+                null, identity, target.uuid);
+            assert_not_reached ();
+        } catch (IOError error) { assert (error is IOError.INVALID_DATA); }
+        assert (target.encryption_configurations.length == 0);
+        stdout.printf ("Creating an automatic crypttab entry\n");
+        yield service.configure_encryption (target, true, true, name, "luks,nofail", original,
+            null, identity, target.uuid);
+        var original_entry = target.encryption_configuration;
+        assert (original_entry != null && original_entry.name == name);
+        stdout.printf ("Creating a manual crypttab entry\n");
+        yield service.configure_encryption (target, true, false, name + "-manual", "luks,nofail", "",
+            null, identity, target.uuid);
+        assert (target.encryption_configurations.length == 2);
+        stdout.printf ("Rotating the automatic entry's credential\n");
+        var result = yield service.configure_encryption (target, true, true, name, "luks,nofail,discard", replacement,
+            original_entry.backend_item, identity, target.uuid);
+        assert (result.successful && result.completed_steps.length == 3);
+        assert (target.encryption_configurations.length == 2);
+        try {
+            yield service.configure_encryption (target, false, false, name, "", "",
+                original_entry.backend_item, identity, target.uuid);
+            assert_not_reached ();
+        } catch (IOError error) { assert (error is IOError.NOT_FOUND); }
+        try {
+            yield service.configure_encryption (target, true, true, name, "luks", "",
+                null, identity, target.uuid);
+            assert_not_reached ();
+        } catch (IOError error) { assert (error is IOError.EXISTS); }
+        foreach (var saved in target.encryption_configurations)
+            assert (saved.name == name ? saved.options == "luks,nofail,discard" :
+                saved.name == name + "-manual" && saved.options == "luks,nofail,noauto");
+        stdout.printf ("Passed: crypttab creation, multi-entry editing, rotation, stale record and collision checks\n");
+        return;
+    }
+    if (mode == "remove-configuration") {
+        if (Environment.get_variable ("MAJORIS_TEST_CRYPTTAB") != "1" ||
+            !FileUtils.test ("/etc/majoris-private-crypttab", FileTest.IS_REGULAR))
+            throw new IOError.PERMISSION_DENIED ("The isolated crypttab fixture is required.");
+        var entries = target.encryption_configurations;
+        assert (entries.length == 2);
+        foreach (var saved in entries) {
+            yield service.configure_encryption (target, false, false, saved.name, "", "",
+                saved.backend_item, service.modification_identity (target), target.uuid);
+        }
+        assert (target.encryption_configurations.length == 0);
+        stdout.printf ("Passed: crypttab removal and configuration readback\n");
+        return;
+    }
+    if (resize) {
+        uint64 requested;
+        uint64 backing_requested = 0;
+        var sizes = path.split (":", 2);
+        if (!uint64.try_parse (sizes[0], out requested) ||
+            (sizes.length == 2 && !uint64.try_parse (sizes[1], out backing_requested)))
+            throw new IOError.INVALID_ARGUMENT ("Invalid fixture size.");
+        var header = yield service.review_luks_header (target, service.modification_identity (target));
+        var outcome = yield service.resize_encrypted_mapping (target, header, requested,
+            "majoris original disposable passphrase", backing_requested);
+        if (!outcome.successful)
+            throw new IOError.FAILED (outcome.summary + " " + outcome.technical_error + " " + outcome.actual_state);
+        assert (target.encrypted.mapping.size == requested);
+        assert (backing_requested == 0 || target.size == backing_requested);
+        stdout.printf ("Passed: %s\n", outcome.actual_state);
+        return;
+    }
     if (credentials) {
         string original = "majoris original disposable passphrase";
         string extra = "majoris service disposable credential";

@@ -61,10 +61,11 @@
             <child><object class="GtkButton" id="unlock_volume"><property name="label">Unlock</property><property name="visible">false</property></object></child>
             <child><object class="GtkButton" id="lock_volume"><property name="label">Lock</property><property name="visible">false</property></object></child>
             <child><object class="GtkButton" id="change_passphrase"><property name="label">Change Passphrase…</property></object></child>
-            <child><object class="GtkButton" id="encryption_options"><property name="label">Encryption Options…</property></object></child>
+            <child><object class="GtkButton" id="encryption_options"><property name="label">Automatic Unlocking Options…</property></object></child>
             <child><object class="GtkButton" id="luks_keyslots"><property name="label">Manage Unlocking Credentials…</property></object></child>
             <child><object class="GtkButton" id="luks_backup"><property name="label">Back Up LUKS Header…</property></object></child>
             <child><object class="GtkButton" id="luks_restore"><property name="label">Restore LUKS Header…</property></object></child>
+            <child><object class="GtkButton" id="resize_encrypted"><property name="label">Resize Encrypted Volume…</property><property name="visible">false</property></object></child>
             <child><object class="GtkButton" id="luks_recovery"><property name="label">Advanced Damaged-Header Recovery…</property></object></child>
           </object>
         </child>

@@ -924,8 +924,14 @@ namespace MajorisDisks {
                     try { UDisksService.require_luks_restore_idle (block, backend.snapshot.dependencies); }
                     catch (Error error) { writable = false; }
                     var manager = new LuksKeyslotsDialog (review, writable);
+                    manager.set_response_enabled ("review-config", block.encryption_configurations.length != 0);
                     string action = yield manager.choose (this, null);
                     if (action == "close") return;
+                    if (action == "review-config") {
+                        pending.remove (block.path);
+                        edit_encryption_options (block);
+                        return;
+                    }
                     var dialog = new LuksCredentialDialog (action, manager.selected_slot,
                         manager.remaining_slots (), block.encryption_configurations.length > 0, this);
                     int first = -1;
@@ -965,7 +971,16 @@ namespace MajorisDisks {
             if (pending.contains (block.path)) return;
             string identity = backend.modification_identity (block);
             var dialog = new ChangePassphraseDialog (block);
+            if (block.encryption_configurations.length != 0) {
+                dialog.body += "\n\nThis volume has automatic-unlock configuration. Changing this credential may prevent automatic unlocking after restart.";
+                dialog.add_response ("review-config", "Review Automatic Unlocking…");
+            }
             dialog.response.connect ((response) => {
+                if (response == "review-config") {
+                    dialog.clear_secrets ();
+                    edit_encryption_options (block);
+                    return;
+                }
                 if (response != "change" || pending.contains (block.path)) return;
                 string current_secret = dialog.current_passphrase;
                 string replacement = dialog.new_passphrase;
@@ -997,8 +1012,10 @@ namespace MajorisDisks {
                         dialog.confirmed_identity, dialog.confirmed_uuid, (source, completed) => {
                             passphrase = ""; pending.remove (block.path);
                             try {
-                                backend.configure_encryption.end (completed);
-                                notifications.add_toast (new Adw.Toast ("Encryption options updated"));
+                                var result = backend.configure_encryption.end (completed);
+                                if (result.completed_steps.length > 2)
+                                    show_check_message ("Automatic Unlocking Updated", operation_result_details (result));
+                                else notifications.add_toast (new Adw.Toast (result.summary));
                             } catch (Error error) {
                                 show_check_message ("Could not update encryption options", operation_error (error));
                             }
@@ -1131,6 +1148,10 @@ namespace MajorisDisks {
         }
 
         private void resize_volume (StorageBlock block) {
+            if (block.encrypted != null) {
+                resize_encrypted_volume.begin (block);
+                return;
+            }
             if (block.logical_volume != null) {
                 resize_lvm_volume (block);
                 return;
@@ -1160,6 +1181,53 @@ namespace MajorisDisks {
                     });
             });
             dialog.present (this);
+        }
+
+        private async void resize_encrypted_volume (StorageBlock block) {
+            if (pending.contains (block.path)) return;
+            pending.insert (block.path, block);
+            try {
+                if (!(yield backend.has_encrypted_resize (block)))
+                    throw new IOError.NOT_SUPPORTED ("UDisks does not expose encrypted resizing.");
+                var header = yield backend.review_luks_header (block, backend.modification_identity (block));
+                var mapping = block.encrypted?.mapping;
+                if (mapping == null || !backend.can_resize_encrypted_mapping (block))
+                    throw new IOError.NOT_SUPPORTED ("The cleartext mapping is unavailable.");
+                var modes = FilesystemResizeMode.OFFLINE_GROW;
+                uint64 minimum = 0;
+                if (mapping.filesystem != null) {
+                    string missing;
+                    modes = yield backend.filesystem_resize_modes (mapping.type_id, out missing);
+                    if ((modes & FilesystemResizeMode.OFFLINE_SHRINK) != 0) {
+                        try { minimum = yield backend.encrypted_resize_minimum (mapping); }
+                        catch (Error error) { debug ("Encrypted filesystem minimum unavailable: %s", error.message); }
+                    }
+                }
+                if (backend.modification_identity (block) != header.identity)
+                    throw new IOError.NOT_FOUND ("The LUKS stack changed while its resize capabilities were checked.");
+                uint64 backing_alignment = 0;
+                uint64 backing_maximum = block.size;
+                try { backing_maximum = backend.encrypted_backing_maximum (block, out backing_alignment); }
+                catch (Error error) { backing_alignment = 0; }
+                var dialog = new EncryptedResizeDialog (block, mapping, header, modes, minimum,
+                    backing_maximum, backing_alignment);
+                if ((yield dialog.choose (this, null)) != "resize") {
+                    dialog.clear_secret ();
+                    return;
+                }
+                string passphrase = dialog.take_passphrase ();
+                var result = yield backend.resize_encrypted_mapping (block, header, dialog.requested, passphrase,
+                    dialog.backing_requested);
+                passphrase = "";
+                drive_view.invalidate_usage (mapping);
+                if (!result.successful)
+                    show_check_message ("Encrypted Resize", operation_result_details (result));
+                else notifications.add_toast (new Adw.Toast (result.summary));
+            } catch (Error error) {
+                show_check_message ("Could Not Resize Encrypted Volume", operation_error (error));
+            } finally {
+                pending.remove (block.path);
+            }
         }
         private void resize_lvm_volume (StorageBlock block) {
             var group = backend.snapshot.advanced.lookup (block.logical_volume.group_path) as StorageVolumeGroup;
@@ -1969,11 +2037,85 @@ namespace MajorisDisks {
         }
     }
 
+    [GtkTemplate (ui = "/com/majoris/disks/ui/encrypted-resize-dialog.ui")]
+    internal class EncryptedResizeDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow backing_entry;
+        [GtkChild] private unowned Adw.EntryRow size_entry;
+        [GtkChild] private unowned Adw.PasswordEntryRow passphrase_entry;
+        internal uint64 requested { get; private set; }
+        internal uint64 backing_requested { get; private set; }
+
+        internal EncryptedResizeDialog (StorageBlock block, StorageBlock mapping, LuksHeaderReview header,
+            FilesystemResizeMode modes, uint64 minimum, uint64 backing_maximum = 0, uint64 backing_alignment = 0) throws Error {
+            uint64 alignment = uint64.max (header.encryption_sector_size, mapping.logical_sector_size);
+            if (alignment == 0 || header.data_offset >= block.size)
+                throw new IOError.INVALID_DATA ("The LUKS payload geometry is unavailable.");
+            uint64 maximum = block.size - header.data_offset;
+            maximum -= maximum % alignment;
+            bool filesystem = mapping.filesystem != null;
+            uint64 current = mapping.size;
+            uint64 backing = block.size;
+            uint64 offset = header.data_offset;
+            bool online_grow = mapping.filesystem?.mounted == true && (modes & FilesystemResizeMode.ONLINE_GROW) != 0;
+            bool can_grow = (maximum > current || (backing_alignment != 0 && backing_maximum > backing)) &&
+                (!filesystem || online_grow || (modes & FilesystemResizeMode.OFFLINE_GROW) != 0);
+            bool can_shrink = filesystem && minimum != 0 && minimum < current &&
+                (modes & FilesystemResizeMode.OFFLINE_SHRINK) != 0;
+            body = "%s · %s\nUUID %s\nBacking capacity %s bytes\nLUKS payload offset %s bytes\nCleartext capacity %s bytes\nMaximum cleartext capacity %s bytes\nAlignment %s bytes"
+                .printf (block.preferred, header.version, header.uuid, block.size.to_string (),
+                    header.data_offset.to_string (), current.to_string (), maximum.to_string (), alignment.to_string ());
+            if (filesystem) {
+                uint64 fs_size = mapping.filesystem.size;
+                body += "\nInner ext4 capacity " + (fs_size == 0 ? "unknown" : fs_size.to_string () + " bytes");
+                body += "\nVerified shrink minimum " + (can_shrink ? minimum.to_string () + " bytes" : "unavailable");
+            }
+            if (can_grow) body += online_grow ? "\nOnline growth available" : "\nOffline growth available";
+            if (can_shrink) body += "\nOffline shrink available";
+            if (!can_grow && !can_shrink) body += "\nNo verified resize range is available.";
+            backing_entry.visible = backing_alignment != 0;
+            if (backing_entry.visible)
+                body += "\nMaximum backing capacity %s bytes · Alignment %s bytes".printf (
+                    backing_maximum.to_string (), backing_alignment.to_string ());
+            body += "\n\nBack up important data before resizing. An interrupted resize can leave the layers at different capacities.";
+            passphrase_entry.visible = header.version == "LUKS2";
+            size_entry.text = (can_grow && maximum > current ? maximum : current).to_string ();
+            void validate () {
+                uint64 value = 0;
+                uint64 outer = backing;
+                bool change_outer = backing_entry.text != "";
+                bool valid_outer = !change_outer || (backing_alignment != 0 &&
+                    Regex.match_simple ("^[0-9]+\\z", backing_entry.text) &&
+                    uint64.try_parse (backing_entry.text, out outer) && outer > offset &&
+                    outer <= backing_maximum && outer % backing_alignment == 0);
+                bool valid = valid_outer && Regex.match_simple ("^[0-9]+\\z", size_entry.text) &&
+                    uint64.try_parse (size_entry.text, out value) && value != 0 && value <= outer - offset &&
+                    value % alignment == 0 && ((can_grow && value > current && outer >= backing) ||
+                        (can_shrink && value < current && value >= minimum && outer <= backing));
+                requested = valid ? value : 0;
+                backing_requested = valid && change_outer ? outer : 0;
+                set_response_enabled ("resize", valid);
+            }
+            size_entry.changed.connect (validate);
+            backing_entry.changed.connect (validate);
+            validate ();
+        }
+
+        internal string take_passphrase () {
+            string passphrase = passphrase_entry.text;
+            clear_secret ();
+            return passphrase;
+        }
+
+        internal void clear_secret () { passphrase_entry.text = ""; }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/encryption-options-dialog.ui")]
     public class EncryptionOptionsDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.ComboRow entry;
         [GtkChild] private unowned Adw.SwitchRow custom;
         [GtkChild] private unowned Adw.SwitchRow startup;
+        [GtkChild] private unowned Adw.SwitchRow nofail;
+        [GtkChild] private unowned Adw.SwitchRow discard;
         [GtkChild] private unowned Adw.EntryRow mapping_name;
         [GtkChild] private unowned Adw.EntryRow options;
         [GtkChild] private unowned Adw.PasswordEntryRow secret;
@@ -1981,7 +2123,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow identifier;
         public bool enabled { get { return custom.active; } }
         public bool unlock_at_startup { get { return startup.active; } }
-        public string mapping { owned get { return mapping_name.text.strip (); } }
+        public string mapping { owned get { return mapping_name.text; } }
         public string crypttab_options { owned get { return options.text; } }
         public string new_passphrase { owned get { return secret.text; } }
         public string confirmed_identity { get; private set; }
@@ -1989,11 +2131,14 @@ namespace MajorisDisks {
         private StorageEncryptionConfiguration[] configurations;
         private string default_options;
         private Gtk.StringList entries = new Gtk.StringList (null);
+        private bool updating_options;
         public Variant? original_item { owned get {
             return entry.selected < configurations.length ? configurations[entry.selected].backend_item : null;
         } }
         public EncryptionOptionsDialog (StorageBlock block, string identity) {
             configurations = block.encryption_configurations;
+            keyfile.use_markup = false;
+            identifier.use_markup = false;
             default_options = block.physical_drive?.removable == true ? "nofail,noauto" : "nofail";
             confirmed_identity = identity; confirmed_uuid = block.uuid;
             entry.model = entries;
@@ -2002,7 +2147,11 @@ namespace MajorisDisks {
             entries.append ("New configuration"); entry.selected = 0;
             entry.notify["selected"].connect (load_selected);
             custom.notify["active"].connect (validate); startup.notify["active"].connect (validate);
-            mapping_name.changed.connect (validate); options.changed.connect (validate); secret.changed.connect (validate);
+            mapping_name.changed.connect (validate);
+            options.changed.connect (() => { update_standard_options (); validate (); });
+            secret.changed.connect (validate);
+            nofail.notify["active"].connect (() => set_standard_option ("nofail", nofail.active));
+            discard.notify["active"].connect (() => set_standard_option ("discard", discard.active));
             load_selected ();
         }
         private void load_selected () {
@@ -2010,34 +2159,66 @@ namespace MajorisDisks {
             custom.active = configuration != null;
             mapping_name.text = configuration?.name ?? "luks-" + confirmed_uuid;
             options.text = configuration?.options ?? default_options;
-            startup.active = !("," + options.text + ",").contains (",noauto,");
+            startup.active = true;
+            foreach (var option in options.text.split (","))
+                if (option.strip () == "noauto") startup.active = false;
             keyfile.subtitle = configuration == null || configuration.passphrase_path == "" ? "None" :
                 configuration.passphrase_path;
             identifier.subtitle = configuration?.device ?? "UUID=" + confirmed_uuid;
             secret.text = ""; validate ();
+        }
+        private void update_standard_options () {
+            updating_options = true;
+            bool fail = false;
+            bool trim = false;
+            foreach (var option in options.text.split (",")) {
+                fail |= option.strip () == "nofail";
+                trim |= option.strip () == "discard";
+            }
+            nofail.active = fail;
+            discard.active = trim;
+            updating_options = false;
+        }
+        private void set_standard_option (string name, bool enabled) {
+            if (updating_options) return;
+            string[] values = {};
+            if (options.text != "")
+                foreach (var option in options.text.split (","))
+                    if (option.strip () != name) values += option;
+            if (enabled) values += name;
+            options.text = string.joinv (",", values);
         }
         private void validate () {
             bool fields = custom.active;
             var configuration = entry.selected < configurations.length ? configurations[entry.selected] : null;
             string key_path = configuration?.passphrase_path ?? "";
             bool device_key = key_path.has_prefix ("/dev/");
-            bool external_key = key_path != "" && !device_key &&
+            bool external_key = key_path != "" &&
                 !MountOptionService.manages_crypttab_keyfile (key_path);
-            body = external_key ? "Editing or removing this entry through UDisks could delete an externally managed key file." :
-                fields && device_key ? "UDisks cannot safely edit an entry that uses a device as its key." :
-                !fields && key_path != "" && !device_key ?
-                    "Removing this entry also deletes its key file. Make sure you have another way to unlock the volume." : "";
-            set_response_appearance ("apply", !fields && key_path != "" && !device_key ?
+            bool external_options = MountOptionService.external_crypttab_options (configuration?.options ?? "");
+            bool read_only = external_key || external_options;
+            body = device_key ? "This entry uses a device as its key source." :
+                external_key ? "This entry references an externally managed key file." :
+                external_options ? "This entry uses token-managed or other advanced unlocking settings." :
+                !fields && key_path != "" ?
+                    "Removing this entry also deletes its key file. Make sure you have another way to unlock the volume." :
+                fields && key_path != "" && secret.text != "" ?
+                    "The volume must be locked. Majoris will enrol and verify the replacement before updating crypttab. The previous keyslot will remain active." : "";
+            set_response_appearance ("apply", !fields && configuration != null ?
                 Adw.ResponseAppearance.DESTRUCTIVE : Adw.ResponseAppearance.SUGGESTED);
-            startup.sensitive = fields; mapping_name.sensitive = fields; options.sensitive = fields;
-            secret.sensitive = fields;
-            bool valid = !fields || (mapping_name.text.strip () != "" && !mapping_name.text.contains ("/") &&
-                !mapping_name.text.contains (",") && !mapping_name.text.contains (" "));
-            if (valid && fields && !device_key) {
-                try { MountOptionService.normalize_encryption (options.text, startup.active); }
+            custom.sensitive = !read_only;
+            startup.sensitive = fields && !read_only;
+            nofail.sensitive = fields && !read_only;
+            discard.sensitive = fields && !read_only;
+            mapping_name.editable = fields && !read_only;
+            options.editable = fields && !read_only;
+            secret.sensitive = fields && !read_only;
+            bool valid = fields ? MountOptionService.valid_crypttab_name (mapping_name.text) : configuration != null;
+            if (valid && fields && !read_only) {
+                try { MountOptionService.normalize_encryption (options.text, startup.active, configuration?.options ?? ""); }
                 catch (Error error) { valid = false; }
             }
-            set_response_enabled ("apply", valid && !external_key && !(fields && device_key));
+            set_response_enabled ("apply", valid && !read_only);
         }
         public void clear_secret () { secret.text = ""; }
     }

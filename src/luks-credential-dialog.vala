@@ -114,7 +114,7 @@ namespace MajorisDisks {
                     break;
             }
             if (configured && !identify && action != "add")
-                body += "\n\nThis volume has crypttab configuration. Changing its credentials may interrupt automatic unlocking.";
+                body += "\n\nThis volume has automatic-unlock configuration. Changing this credential may prevent automatic unlocking after restart.";
             if (remove) set_response_appearance ("apply", Adw.ResponseAppearance.DESTRUCTIVE);
             remaining_slot.visible = remove;
             string[] labels = {};

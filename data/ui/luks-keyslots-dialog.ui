@@ -21,6 +21,7 @@
     </property>
     <responses>
       <response id="close">Close</response>
+      <response id="review-config">Review Automatic Unlocking…</response>
       <response id="identify">Verify Credential…</response>
       <response id="add">Add Credential…</response>
       <response id="change">Change…</response>

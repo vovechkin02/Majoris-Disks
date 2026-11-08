@@ -9,9 +9,28 @@ namespace MajorisDisks {
     public enum MountVisibility { DEFAULT, SHOW, HIDE }
 
     public class MountOptionService {
+        internal static bool valid_crypttab_name (string name) {
+            return name.length <= 127 && Regex.match_simple ("^[A-Za-z0-9_+.-]+\\z", name) &&
+                name != "." && name != ".." && name != "control";
+        }
+
+        internal static bool external_crypttab_options (string input) {
+            foreach (var raw in input.split (",")) {
+                string option = raw.strip ();
+                if (option.has_prefix ("fido2-") || option.has_prefix ("tpm2-") ||
+                    option.has_prefix ("pkcs11-") || option.has_prefix ("keyscript=") ||
+                    option.has_prefix ("header=") || option == "plain" || option == "tcrypt" ||
+                    option == "bitlk" || option == "swap" || option == "tmp" ||
+                    option.has_prefix ("tmp=") || option == "x-initrd.attach" || option == "initramfs" ||
+                    option.has_prefix ("key-slot=") || option.has_prefix ("keyfile-offset=") ||
+                    option.has_prefix ("keyfile-size=")) return true;
+            }
+            return false;
+        }
+
         internal static bool manages_crypttab_keyfile (string path) {
             string name = Path.get_basename (path);
-            return Path.get_dirname (path) == "/etc/luks-keys" && name != "." && name != ".." &&
+            return Path.get_dirname (path) == "/etc/luks-keys" && valid_crypttab_name (name) &&
                 Filename.canonicalize (path) == path;
         }
 
@@ -62,18 +81,28 @@ namespace MajorisDisks {
             return string.joinv (",", result);
         }
 
-        public static string normalize_encryption (string input, bool startup) throws Error {
+        public static string normalize_encryption (string input, bool startup, string existing = "") throws Error {
             string[] result = {};
+            string[] names = {};
             if (input.strip () != "") {
                 foreach (var option in parse (input)) {
-                    string name = option.split ("=")[0];
-                    if (name.has_prefix ("x-gvfs-") || name == "subvol" || name == "subvolid" ||
-                        name == "compress" || name == "compress-force" || name == "swap" || name == "tmp" ||
-                        option.contains (" ") || option.contains ("\t"))
-                        throw new IOError.INVALID_ARGUMENT ("The option ‘%s’ is not valid here.".printf (name));
+                    string name = option.split ("=", 2)[0];
+                    bool supported = contains ({ "auto", "noauto", "luks", "nofail", "discard",
+                        "readonly", "read-only", "headless", "_netdev", "try-empty-password" }, option) ||
+                        Regex.match_simple ("^(x-systemd.device-timeout|keyfile-timeout|timeout)=[0-9]+(ms|s|min|h)?\\z", option) ||
+                        Regex.match_simple ("^tries=[0-9]+\\z", option);
+                    bool inherited = contains (existing.split (","), option);
+                    if ((!supported && !inherited) || external_crypttab_options (option) ||
+                        Regex.match_simple ("[[:cntrl:][:space:]]", option))
+                        throw new IOError.INVALID_ARGUMENT ("The option ‘%s’ cannot be edited here.".printf (name));
+                    if (contains (names, name) && !name.has_prefix ("x-parent"))
+                        throw new IOError.INVALID_ARGUMENT ("The option ‘%s’ is specified more than once.".printf (name));
+                    names += name;
                     if (option != "auto" && option != "noauto") result += option;
                 }
             }
+            if (contains (names, "readonly") && contains (names, "read-only"))
+                throw new IOError.INVALID_ARGUMENT ("Specify the read-only option only once.");
             if (!startup) result += "noauto";
             return string.joinv (",", result);
         }
@@ -160,6 +189,11 @@ namespace MajorisDisks {
         private Variant[] persistent_mount_configurations = {};
         public string device_identity = "";
         public string[] observed_mount_points = {};
+        internal string mount_namespace = "";
+        internal string mount_signature = "";
+        internal string encrypted_backing_path = "";
+        internal string encrypted_backing_identity = "";
+        internal string encrypted_backing_uuid = "";
         public MountRestorationStatus mount_restoration = MountRestorationStatus.UNKNOWN;
         public string error { get; set; default = ""; }
         public StoragePreparationEntry (StoragePreparationKind kind, string object_path, string[] state,

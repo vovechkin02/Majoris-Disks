@@ -206,6 +206,16 @@ public static int main (string[] args) {
     var partition = block.partition;
     var job = backend.jobs.begin ("Test", block, backend.snapshot.dependencies);
     var health_report = new StorageHealthReport ();
+    var resize_header = new LuksHeaderReview ("identity", "ticket", "LUKS2",
+        Uuid.string_random (), "readable", 0, 4096, false, false, "");
+    resize_header.encryption_sector_size = 512;
+    var resize_backing = new StorageBlock ("/test/luks") { size = 16384 };
+    var resize_mapping = new StorageBlock ("/test/mapping") { size = 8192 };
+    EncryptedResizeDialog encrypted_resize;
+    try { encrypted_resize = new EncryptedResizeDialog (resize_backing, resize_mapping, resize_header,
+        FilesystemResizeMode.OFFLINE_GROW, 0); }
+    catch (Error error) { critical ("%s", error.message); return 1; }
+    assert (encrypted_resize.requested == 12288);
     Object[] instances = {
         new PartitionMap (), new PartitionSegment (), new DriveView (), window,
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
@@ -213,7 +223,7 @@ public static int main (string[] args) {
         new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new BtrfsBalanceDialog (true), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
         new OperationResultDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
         new FormatDiskDialog (), new FormatVolumeDialog (backend, block),
-        new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block),
+        new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block), encrypted_resize,
         new JobRow (backend, job), new JobsPopover (backend), new ActiveJobsDialog (),
         new MountOptionsDialog (block, "identity"), new UnlockVolumeDialog (block),
         new LockVolumeConfirmationDialog (), new ChangePassphraseDialog (block),
@@ -231,7 +241,7 @@ public static int main (string[] args) {
         "drive-information-dialog.ui", "edit-filesystem-dialog.ui", "lvm-rename-dialog.ui", "lvm-lifecycle-dialog.ui", "storage-removal-dialog.ui", "lvm-create-dialog.ui", "create-storage-group-dialog.ui", "btrfs-subvolumes-dialog.ui", "btrfs-balance-dialog.ui", "edit-partition-dialog.ui",
         "ownership-dialog.ui", "operation-result-dialog.ui", "repair-confirmation-dialog.ui",
         "delete-confirmation-dialog.ui", "format-disk-dialog.ui", "format-volume-dialog.ui",
-        "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
+        "create-partition-dialog.ui", "resize-volume-dialog.ui", "encrypted-resize-dialog.ui", "job-row.ui", "jobs-popover.ui",
         "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui",
          "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui",
         "luks-header-backup-dialog.ui", "luks-header-restore-dialog.ui", "luks-keyslots-dialog.ui", "luks-credential-dialog.ui", "encryption-options-dialog.ui",

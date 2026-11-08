@@ -504,6 +504,20 @@ private void test_mount_restoration_status () {
     assert (stacked.mount_set_matches ({ "/first", "/first" }));
 }
 
+private void test_kernel_mount_signatures () {
+    bool whole;
+    string record = " 22 253:1 / /mnt/data rw,nosuid - ext4 /dev/dm-1 rw,errors=remount-ro";
+    var original = KernelStorageSafety.mount_signatures ("35" + record, "253:1", out whole);
+    assert (whole && original.length == 1);
+    var remounted = KernelStorageSafety.mount_signatures ("47" + record, "253:1", out whole);
+    assert (whole && remounted.length == 1 && remounted[0] == original[0]);
+    var changed = KernelStorageSafety.mount_signatures ("47" + record.replace ("rw,nosuid", "ro"), "253:1", out whole);
+    assert (changed.length == 1 && changed[0] != original[0]);
+    var bind = KernelStorageSafety.mount_signatures ("35" + record + "\n" +
+        "48 22 253:1 /subdir /mnt/bind rw - ext4 /dev/dm-1 rw", "253:1", out whole);
+    assert (!whole && bind.length == 2);
+}
+
 private void test_preparation_device_identity () {
     var block = new StorageBlock ("/swap");
     block.uuid = "swap-uuid";
@@ -528,6 +542,27 @@ private void test_crypttab_keyfile_scope () {
     assert (!MountOptionService.manages_crypttab_keyfile ("/etc/luks-keys/subdirectory/key"));
     assert (!MountOptionService.manages_crypttab_keyfile ("/etc/luks-keys/.."));
     assert (!MountOptionService.manages_crypttab_keyfile ("/etc/luks-keys/volume/"));
+}
+
+private void test_crypttab_option_preservation () {
+    assert (MountOptionService.valid_crypttab_name ("luks-data_1.backup+new"));
+    foreach (var invalid in new string[] { "", "control", "..", "data/key", "data\tkey", "data\n", " data" })
+        assert (!MountOptionService.valid_crypttab_name (invalid));
+    assert (MountOptionService.external_crypttab_options ("luks,tpm2-device=auto"));
+    assert (MountOptionService.external_crypttab_options ("luks,header=/root/header"));
+    try {
+        string original = "luks,x-parent=foo,readonly,site-option=unchanged";
+        assert (MountOptionService.normalize_encryption (original, false, original) == original + ",noauto");
+        assert (MountOptionService.normalize_encryption ("luks,x-systemd.device-timeout=5s,discard", true) ==
+            "luks,x-systemd.device-timeout=5s,discard");
+    } catch (Error error) { assert_not_reached (); }
+    foreach (var unsupported in new string[] { "plain", "keyscript=/bin/test", "site-option=new",
+        "readonly,read-only", "tries=3,tries=4" }) {
+        bool rejected = false;
+        try { MountOptionService.normalize_encryption (unsupported, true); }
+        catch (Error error) { rejected = error is IOError.INVALID_ARGUMENT; }
+        assert (rejected);
+    }
 }
 
 private void test_offline_capacity_identity () {
@@ -1354,8 +1389,10 @@ public static int main (string[] args) {
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
     Test.add_func ("/operations/mount-configuration-snapshot", test_mount_configuration_snapshot);
     Test.add_func ("/operations/mount-restoration-status", test_mount_restoration_status);
+    Test.add_func ("/operations/kernel-mount-signatures", test_kernel_mount_signatures);
     Test.add_func ("/operations/preparation-device-identity", test_preparation_device_identity);
     Test.add_func ("/operations/crypttab-keyfile-scope", test_crypttab_keyfile_scope);
+    Test.add_func ("/operations/crypttab-option-preservation", test_crypttab_option_preservation);
     Test.add_func ("/operations/preparation-journal", test_preparation_journal);
     Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);
     Test.add_func ("/operations/create-active-dependency", test_create_partition_active_dependency);

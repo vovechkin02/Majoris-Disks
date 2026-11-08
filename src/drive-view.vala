@@ -60,6 +60,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button edit_partition;
         [GtkChild] private unowned Gtk.Button create_partition;
         [GtkChild] private unowned Gtk.Button resize_volume;
+        [GtkChild] private unowned Gtk.Button resize_encrypted;
         public signal void metadata_requested (StorageBlock block);
         public signal void ownership_requested (StorageBlock block);
         public signal void label_requested (StorageBlock block);
@@ -178,6 +179,10 @@ namespace MajorisDisks {
                 if (space != null && disk != null) create_requested (disk, space);
             });
             resize_volume.clicked.connect (() => {
+                if (selected_block != null) resize_requested (selected_block);
+            });
+            resize_encrypted.clicked.connect (() => {
+                encryption_menu.popdown ();
                 if (selected_block != null) resize_requested (selected_block);
             });
             take_ownership.clicked.connect (() => {
@@ -397,6 +402,7 @@ namespace MajorisDisks {
             edit_partition.visible = false;
             create_partition.visible = false;
             resize_volume.visible = false;
+            resize_encrypted.visible = false;
             restore_partition.visible = false;
             encryption_menu.visible = false;
             selected_block = null;
@@ -459,10 +465,11 @@ namespace MajorisDisks {
             var scheme = current?.medium?.table?.scheme;
             edit_partition.visible = delete_partition.visible && block.filesystem?.mounted != true &&
                 (scheme == "gpt" || (scheme == "dos" && block.partition?.logical != true));
-            resize_volume.visible = backend?.can_resize_logical_volume (block) == true ||
+            resize_encrypted.visible = backend?.can_resize_encrypted_mapping (block) == true;
+            resize_volume.visible = block.encrypted == null && (backend?.can_resize_logical_volume (block) == true ||
                 block.partition != null && block.available &&
                 !block.read_only && !block.system_hint && block.backing_path == "/" && block.raid_path == "/" &&
-                block.logical_volume_path == "/";
+                block.logical_volume_path == "/");
             add_volume_field ("Device", block.preferred, true);
             var part = block.partition;
             if (part != null) {

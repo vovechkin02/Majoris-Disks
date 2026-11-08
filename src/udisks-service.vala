@@ -53,6 +53,7 @@ namespace MajorisDisks {
         public bool damaged { get { return confidence != "readable"; } }
         public uint64 header_size { get; private set; }
         public uint64 data_offset { get; private set; }
+        internal uint64 encryption_sector_size;
         public bool checksummed { get; private set; }
         public bool advanced { get; private set; }
         public string file_path { get; private set; }
@@ -4008,7 +4009,7 @@ namespace MajorisDisks {
                 if (snapshot.blocks.lookup (block.path) == block && block.size == expected) return;
                 yield settle_delay (token);
             }
-            throw new IOError.TIMED_OUT ("The updated partition geometry was not published in time.");
+            throw new IOError.TIMED_OUT ("The updated block-device geometry was not published in time.");
         }
 
         private async bool prepare_unmounted (StorageBlock block, Cancellable token) throws Error {
@@ -4101,9 +4102,38 @@ namespace MajorisDisks {
             }
         }
 
-        private void capture_mount_state (StorageBlock block, StoragePreparationEntry entry) {
+        private static string[] read_mount_signatures (StorageBlock block, out bool whole_filesystem) throws Error {
+            if (block.number == 0)
+                throw new IOError.NOT_SUPPORTED ("The kernel mount source could not be identified.");
+            string mountinfo;
+            FileUtils.get_contents ("/proc/self/mountinfo", out mountinfo);
+            return KernelStorageSafety.mount_signatures (mountinfo,
+                KernelStorageSafety.device_number (block.number), out whole_filesystem);
+        }
+
+        private void capture_mount_state (StorageBlock block, StoragePreparationEntry entry) throws Error {
             entry.device_identity = StoragePreparationJournal.device_identity (block);
             entry.capture_mount_configuration (block.mount_configurations);
+            bool whole_filesystem;
+            var signatures = read_mount_signatures (block, out whole_filesystem);
+            if (entry.mount_point_count () != 1 || signatures.length != 1 || !whole_filesystem)
+                throw new IOError.NOT_SUPPORTED ("Unmount this filesystem manually before continuing. Its mount layout cannot be restored safely.");
+            if (!entry.persistent_mount) {
+                string parent = Path.get_dirname (entry.mount_point_at (0));
+                string user = Environment.get_user_name ();
+                if (parent != "/media/" + user && parent != "/run/media/" + user)
+                    throw new IOError.NOT_SUPPORTED ("Unmount this filesystem manually. Its original mount location is managed outside UDisks.");
+            }
+            entry.mount_namespace = FileUtils.read_link ("/proc/self/ns/mnt");
+            entry.mount_signature = signatures[0];
+            if (block.backing_path != "/") {
+                var backing = snapshot.blocks.lookup (block.backing_path);
+                if (backing == null || backing.encrypted?.mapping != block || backing.uuid == "")
+                    throw new IOError.NOT_SUPPORTED ("The mount's encrypted backing device could not be verified.");
+                entry.encrypted_backing_path = backing.path;
+                entry.encrypted_backing_identity = StoragePreparationJournal.device_identity (backing);
+                entry.encrypted_backing_uuid = backing.uuid;
+            }
         }
 
         private void reconcile_preparation (StoragePreparationJournal journal) {
@@ -4111,10 +4141,22 @@ namespace MajorisDisks {
                 if (!entry.prepared) continue;
                 var block = snapshot.blocks.lookup (entry.object_path);
                 if (block == null || !block.available) {
-                    entry.actual_state = "device unavailable";
+                    entry.actual_state = entry.encrypted_backing_path != "" ?
+                        "original cleartext mapping unavailable" : "device unavailable";
                     entry.restored = false;
                     if (entry.kind == StoragePreparationKind.MOUNT) entry.record_mount_restoration (null);
                     continue;
+                }
+                if (entry.encrypted_backing_path != "") {
+                    var backing = snapshot.blocks.lookup (entry.encrypted_backing_path);
+                    if (backing == null || backing.encrypted?.mapping != block ||
+                        backing.uuid != entry.encrypted_backing_uuid ||
+                        StoragePreparationJournal.device_identity (backing) != entry.encrypted_backing_identity) {
+                        entry.restoration_allowed = false;
+                        entry.actual_state = "encrypted backing identity changed";
+                        entry.record_mount_restoration (null);
+                        continue;
+                    }
                 }
                 if (!entry.matches_prepared_device (block) ||
                     (entry.kind == StoragePreparationKind.MOUNT && block.filesystem == null)) {
@@ -4129,6 +4171,19 @@ namespace MajorisDisks {
                     entry.actual_state = actual_mounts.length == 0 ? "unmounted" :
                         "mounted at " + string.joinv (", ", actual_mounts);
                     entry.record_mount_restoration (actual_mounts);
+                    if (entry.restored && entry.mount_signature != "") {
+                        try {
+                            bool whole_filesystem;
+                            var signatures = read_mount_signatures (block, out whole_filesystem);
+                            if (!whole_filesystem || signatures.length != 1 || signatures[0] != entry.mount_signature ||
+                                FileUtils.read_link ("/proc/self/ns/mnt") != entry.mount_namespace)
+                                throw new IOError.FAILED ("The restored mount differs in its kernel source, namespace or options.");
+                        } catch (Error error) {
+                            entry.restored = false;
+                            entry.mount_restoration = MountRestorationStatus.PARTIALLY_RESTORED;
+                            entry.actual_state += " with unverified mount options or namespace";
+                        }
+                    }
                 } else if (entry.kind == StoragePreparationKind.SWAP) {
                     entry.actual_state = block.swap_active ? "active" : "inactive";
                     entry.restored = block.swap_active;
@@ -4167,12 +4222,20 @@ namespace MajorisDisks {
                         }
                         if (entry.observed_mount_points.length != 0)
                             throw new IOError.FAILED ("The filesystem is already mounted, but some original mount locations are missing or have changed.");
+                        if (entry.mount_namespace != "" &&
+                            FileUtils.read_link ("/proc/self/ns/mnt") != entry.mount_namespace)
+                            throw new IOError.FAILED ("The original mount namespace is unavailable.");
                         string actual = yield restore_mount (block, token);
-                        bool exact = entry.mount_point_count () == 0;
-                        for (uint i = 0; i < entry.mount_point_count (); i++)
-                            exact |= entry.mount_point_at (i) == actual;
-                        if (!exact)
+                        if (entry.mount_point_count () != 1 || entry.mount_point_at (0) != actual)
                             throw new IOError.FAILED ("UDisks mounted the filesystem at %s instead of its previous location.".printf (actual));
+                        for (int attempt = 0; attempt < 30; attempt++) {
+                            synchronize ();
+                            reconcile_preparation (journal);
+                            if (entry.restored || !entry.restoration_allowed) break;
+                            yield settle_delay (token);
+                        }
+                        if (!entry.restored)
+                            throw new IOError.FAILED ("The original mount location and options could not be verified.");
                     } else if (entry.kind == StoragePreparationKind.SWAP) {
                         var options = new VariantBuilder (new VariantType ("a{sv}"));
                         yield require_volume (block, "Swapspace").call ("Start", new Variant.tuple ({ options.end () }),
@@ -4188,7 +4251,9 @@ namespace MajorisDisks {
             reconcile_preparation (journal);
             foreach (var entry in journal.entries ()) {
                 if (!entry.prepared || entry.restored || entry.error != "") continue;
-                entry.error = !entry.restoration_allowed ? "Automatic restoration was withheld because the original identity or configuration could not be verified." :
+                entry.error = entry.actual_state == "original cleartext mapping unavailable" ?
+                    "The original encrypted mapping is unavailable. Verify and unlock the original volume before mounting it." :
+                    !entry.restoration_allowed ? "Automatic restoration was withheld because the original identity or configuration could not be verified." :
                     entry.kind == StoragePreparationKind.MOUNT ?
                     "Not every original mount point was restored." : "The original active state was not restored.";
                 failures += entry.object_path + ": " + entry.error;
@@ -4294,6 +4359,304 @@ namespace MajorisDisks {
             if (!eligibility.allowed || eligibility.unknown || eligibility.requires_preparation)
                 throw new IOError.PERMISSION_DENIED (eligibility.reason);
             PartitionLayoutService.validate_create (disk, gap, requested_size, kind, out offset, out size);
+        }
+
+        internal bool can_resize_encrypted_mapping (StorageBlock block) {
+            var mapping = block.encrypted?.mapping;
+            if (mapping == null || !luks_header_available () || !is_luks_header_candidate (block) ||
+                block.read_only || block.backing_path != "/" || block.raid_path != "/" ||
+                block.raid_member_path != "/" || mapping.read_only || !mapping.available || mapping.backing_path != block.path ||
+                mapping.table != null || mapping.has_swap || mapping.encrypted != null ||
+                mapping.logical_sector_size == 0 ||
+                snapshot.dependencies.descendants (block).length != 2)
+                return false;
+            var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+            if (safety.system_critical || safety.unknown_dependencies) return false;
+            return mapping.filesystem == null ? mapping.type_id == "" && mapping.usage == "" :
+                mapping.type_id == "ext4" && mapping.uuid != "";
+        }
+
+        private void validate_encrypted_resize (StorageBlock block, StorageBlock mapping, string identity,
+            string mapping_identity, uint64 expected_size, string backing_identity, uint64 backing_size,
+            string backing_uuid) throws Error {
+            synchronize ();
+            if (snapshot.blocks.lookup (block.path) != block || snapshot.blocks.lookup (mapping.path) != mapping ||
+                block.encrypted?.mapping != mapping ||
+                (identity != "" && modification_identity (block) != identity) ||
+                encrypted_backing_identity (block) != backing_identity ||
+                block.size != backing_size || block.uuid != backing_uuid ||
+                StoragePreparationJournal.device_identity (mapping) != mapping_identity || mapping.size != expected_size)
+                throw new IOError.NOT_FOUND ("The encrypted backing device or cleartext mapping changed.");
+            if (!can_resize_encrypted_mapping (block))
+                throw new IOError.NOT_SUPPORTED ("The encrypted stack is no longer eligible for resizing.");
+            if (KernelStorageSafety.block_capacity (block) != backing_size ||
+                KernelStorageSafety.block_capacity (mapping) != expected_size)
+                throw new IOError.FAILED ("Kernel capacities differ from the UDisks geometry.");
+        }
+
+        internal async bool has_encrypted_resize (StorageBlock block) throws Error {
+            var proxy = require_volume (block, "Encrypted");
+            var reply = yield proxy.get_connection ().call (proxy.get_name_owner (), proxy.get_object_path (),
+                "org.freedesktop.DBus.Introspectable", "Introspect", null, new VariantType ("(s)"),
+                DBusCallFlags.NONE, 5000, backend_lifetime);
+            return has_luks_method (reply.get_child_value (0).get_string (), PREFIX + "Encrypted", "Resize");
+        }
+
+        internal async uint64 encrypted_resize_minimum (StorageBlock mapping) throws Error {
+            return yield minimum_sizes.query (mapping, backend_lifetime, true);
+        }
+
+        private string encrypted_backing_identity (StorageBlock block) {
+            var partition = block.partition;
+            uint64 offset = partition != null ? partition.offset : 0;
+            return new Variant ("(ssstss)", StoragePreparationJournal.device_identity (block),
+                partition?.uuid ?? "", block.logical_volume?.uuid ?? "", offset,
+                block.logical_volume?.group_path ?? "", block.logical_volume_path).print (false);
+        }
+
+        private DBusProxy require_encrypted_backing_resize (StorageBlock block, uint64 requested) throws Error {
+            if (block.partition != null) {
+                var disk = snapshot.blocks.lookup (block.partition.table_path);
+                if (disk == null || disk.read_only || disk.system_hint || disk.backing_path != "/" || disk.raid_path != "/" ||
+                    block.partition.uuid == "" || block.partition.container || block.partition.logical)
+                    throw new IOError.NOT_SUPPORTED ("Only an identified primary partition on a plain disk can be resized here.");
+                PartitionLayoutService.validate_resize (disk, block, requested);
+                return require_volume (block, "Partition");
+            }
+            var volume = block.logical_volume;
+            var proxy = volume == null ? null : manager?.get_interface (volume.path, PREFIX + "LogicalVolume") as DBusProxy;
+            var group = volume == null ? null : snapshot.advanced.lookup (volume.group_path) as StorageVolumeGroup;
+            var vg = group == null ? null : manager?.get_interface (group.path, PREFIX + "VolumeGroup") as DBusProxy;
+            if (proxy == null || volume == null || vg == null || group == null ||
+                !volume.active || volume.uuid == "" || volume.size != block.size)
+                throw new IOError.NOT_SUPPORTED ("Only an identified active plain logical volume can be resized here.");
+            require_independent_lv (proxy, volume);
+            if (group.extent_size == 0 || requested % group.extent_size != 0 ||
+                (requested > block.size && requested - block.size > group.free_size) ||
+                (vg.get_cached_property ("MissingPhysicalVolumes")?.n_children () ?? 1) != 0 ||
+                volume_group_has_backend_job (group, { block }))
+                throw new IOError.BUSY ("The logical-volume size is unaligned, exceeds free extents, or the group is busy.");
+            return proxy;
+        }
+
+        internal uint64 encrypted_backing_maximum (StorageBlock block, out uint64 alignment) throws Error {
+            var partition = block.partition;
+            if (partition != null) {
+                require_encrypted_backing_resize (block, block.size);
+                var disk = snapshot.blocks.lookup (partition.table_path);
+                alignment = disk.logical_sector_size;
+                return PartitionLayoutService.maximum_resize (disk, block);
+            }
+            if (block.logical_volume != null) {
+                require_encrypted_backing_resize (block, block.size);
+                var group = snapshot.advanced.lookup (block.logical_volume.group_path) as StorageVolumeGroup;
+                alignment = group.extent_size;
+                if (group.free_size > uint64.MAX - block.size)
+                    throw new IOError.INVALID_DATA ("Volume-group free capacity is invalid.");
+                return block.size + group.free_size;
+            }
+            alignment = 0;
+            return block.size;
+        }
+
+        internal async StorageOperationResult resize_encrypted_mapping (StorageBlock block,
+            LuksHeaderReview header, uint64 requested, string passphrase, uint64 backing_requested = 0) throws Error {
+            var mapping = block.encrypted?.mapping;
+            if (mapping == null || !can_resize_encrypted_mapping (block))
+                throw new IOError.NOT_SUPPORTED ("Resize requires an unlocked, supported LUKS stack.");
+            uint64 old_size = mapping.size;
+            uint64 alignment = uint64.max (header.encryption_sector_size, mapping.logical_sector_size);
+            if (header.encryption_sector_size < 512 ||
+                (header.encryption_sector_size & (header.encryption_sector_size - 1)) != 0 ||
+                (alignment & (alignment - 1)) != 0 || header.data_offset >= block.size ||
+                header.uuid != block.uuid || old_size > block.size - header.data_offset)
+                throw new IOError.INVALID_DATA ("The LUKS payload geometry could not be verified.");
+            uint64 final_backing = backing_requested == 0 ? block.size : backing_requested;
+            if (final_backing <= header.data_offset)
+                throw new IOError.INVALID_ARGUMENT ("The backing capacity must contain the LUKS header and payload.");
+            uint64 maximum = final_backing - header.data_offset;
+            maximum -= maximum % alignment;
+            if (requested == 0 || requested > maximum || requested % alignment != 0 || requested == old_size)
+                throw new IOError.INVALID_ARGUMENT ("Choose a different, sector-aligned size within the LUKS payload.");
+            bool shrink = requested < old_size;
+            bool resize_backing = final_backing != block.size;
+            if (resize_backing && (final_backing < block.size) != shrink)
+                throw new IOError.INVALID_ARGUMENT ("The backing device and cleartext mapping must resize in the same direction.");
+            bool filesystem = mapping.filesystem != null;
+            if (shrink && !filesystem)
+                throw new IOError.NOT_SUPPORTED ("A bare mapping cannot be shrunk without a verified content boundary.");
+            string mapping_identity = StoragePreparationJournal.device_identity (mapping);
+            string backing_identity = encrypted_backing_identity (block);
+            uint64 backing_size = block.size;
+            string mapping_uuid = mapping.uuid;
+            string mapping_type = mapping.type_id;
+            var result = new StorageOperationResult ();
+            StoragePreparationJournal? journal = null;
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Resize encrypted volume", block, snapshot.dependencies);
+            var token = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Validating LUKS geometry and resize support");
+                if (!(yield has_encrypted_resize (block)))
+                    throw new IOError.NOT_SUPPORTED ("UDisks does not expose Encrypted.Resize.");
+                validate_encrypted_resize (block, mapping, header.identity, mapping_identity, old_size,
+                    backing_identity, backing_size, header.uuid);
+                string dm_uuid;
+                FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (mapping.number) +
+                    "/dm/uuid", out dm_uuid);
+                if (!dm_uuid.has_prefix ("CRYPT-" + header.version + "-" + header.uuid.replace ("-", "") + "-"))
+                    throw new IOError.NOT_SUPPORTED ("The active device-mapper UUID does not match the verified LUKS header.");
+                var encrypted = require_volume (block, "Encrypted");
+                if (resize_backing) require_encrypted_backing_resize (block, final_backing);
+                DBusProxy? fs_proxy = filesystem ? require_volume (mapping, "Filesystem") : null;
+                if (filesystem) {
+                    var capability = FilesystemCapabilityService.decode (
+                        yield query_filesystem_capability ("CanResize", mapping_type), true);
+                    uint64 minimum = shrink ? yield minimum_sizes.query (mapping, token, true) : old_size;
+                    var plan = FilesystemResizePlanner.build (mapping, requested, true, capability, minimum, maximum);
+                    if (!plan.supported || (shrink && plan.online))
+                        throw new IOError.NOT_SUPPORTED (plan.reason != "" ? plan.reason : "Encrypted shrinking requires an offline filesystem.");
+                    if (plan.requires_unmount) {
+                        validate_encrypted_resize (block, mapping, header.identity, mapping_identity, old_size,
+                            backing_identity, backing_size, header.uuid);
+                        journal = yield prepare_for_modification (mapping, token);
+                    }
+                    if (shrink) {
+                        yield KernelStorageSafety.require_idle (mapping, token);
+                        yield KernelStorageSafety.require_sole_dm_dependency (block, mapping, token);
+                        if (!(yield maintenance_available (mapping_type, false)))
+                            throw new IOError.NOT_SUPPORTED ("The required filesystem check is unavailable.");
+                        validate_encrypted_resize (block, mapping, header.identity, mapping_identity, old_size,
+                            backing_identity, backing_size, header.uuid);
+                        yield check_encrypted_resize_filesystem (fs_proxy, token);
+                        validate_encrypted_resize (block, mapping, header.identity, mapping_identity, old_size,
+                            backing_identity, backing_size, header.uuid);
+                        if (mapping.filesystem?.mounted != false || mapping.uuid != mapping_uuid || mapping.type_id != mapping_type)
+                            throw new IOError.BUSY ("The filesystem changed before shrinking.");
+                        jobs.phase (job, StorageJobState.RUNNING, "Shrinking the inner filesystem");
+                        dispatched = true;
+                        yield resize_storage_layer (fs_proxy, requested, token);
+                        result.completed ("Inner filesystem shrunk");
+                        yield check_encrypted_resize_filesystem (fs_proxy, token);
+                        yield verify_lv_filesystem_size (mapping, require_volume (mapping, "Block"), requested, token);
+                        result.completed ("Shrunk filesystem geometry verified");
+                    }
+                }
+                if (shrink) yield KernelStorageSafety.require_idle (mapping, token);
+                else yield KernelStorageSafety.require_no_holders (mapping, token);
+                yield KernelStorageSafety.require_sole_dm_dependency (block, mapping, token);
+                validate_encrypted_resize (block, mapping, header.identity, mapping_identity, old_size,
+                    backing_identity, backing_size, header.uuid);
+                if (mapping.uuid != mapping_uuid || mapping.type_id != mapping_type)
+                    throw new IOError.NOT_FOUND ("The cleartext filesystem identity changed.");
+                if (resize_backing && !shrink) {
+                    var outer = require_encrypted_backing_resize (block, final_backing);
+                    jobs.phase (job, StorageJobState.RUNNING, "Growing the encrypted backing device");
+                    dispatched = true;
+                    yield resize_storage_layer (outer, final_backing, token);
+                    yield wait_for_size (block, final_backing, token);
+                    backing_size = final_backing;
+                    validate_encrypted_resize (block, mapping, "", mapping_identity, old_size,
+                        backing_identity, backing_size, header.uuid);
+                    if (block.logical_volume != null && block.logical_volume.size != final_backing)
+                        throw new IOError.FAILED ("The logical volume capacity could not be verified.");
+                    result.completed ("Backing device growth verified");
+                }
+                jobs.phase (job, StorageJobState.RUNNING, "Resizing the LUKS mapping");
+                dispatched = true;
+                var resize_options = new VariantBuilder (new VariantType ("a{sv}"));
+                if (passphrase != "") resize_options.add ("{sv}", "passphrase", new Variant.string (passphrase));
+                jobs.expect_backend (job, "encrypted-resize", block.path);
+                yield call_tracked_method (job, encrypted, "Resize",
+                    new Variant ("(t@a{sv})", requested, resize_options.end ()), token);
+                passphrase = "";
+                yield wait_for_size (mapping, requested, token);
+                validate_encrypted_resize (block, mapping, "", mapping_identity, requested,
+                    backing_identity, backing_size, header.uuid);
+                result.completed ("LUKS mapping capacity verified");
+                if (filesystem && !shrink) {
+                    if (mapping.uuid != mapping_uuid || mapping.type_id != mapping_type)
+                        throw new IOError.NOT_FOUND ("The cleartext filesystem identity changed.");
+                    jobs.phase (job, StorageJobState.RUNNING, "Growing the inner filesystem");
+                    yield resize_storage_layer (fs_proxy, 0, token);
+                    result.completed ("Inner filesystem grown");
+                    yield verify_lv_filesystem_size (mapping, require_volume (mapping, "Block"), requested, token);
+                    result.completed ("Grown filesystem geometry verified");
+                }
+                if (resize_backing && shrink) {
+                    yield KernelStorageSafety.require_idle (mapping, token);
+                    yield KernelStorageSafety.require_sole_dm_dependency (block, mapping, token);
+                    validate_encrypted_resize (block, mapping, "", mapping_identity, requested,
+                        backing_identity, backing_size, header.uuid);
+                    if (mapping.uuid != mapping_uuid || mapping.type_id != mapping_type)
+                        throw new IOError.NOT_FOUND ("The verified inner filesystem changed.");
+                    var outer = require_encrypted_backing_resize (block, final_backing);
+                    jobs.phase (job, StorageJobState.RUNNING, "Shrinking the encrypted backing device");
+                    yield resize_storage_layer (outer, final_backing, token);
+                    yield wait_for_size (block, final_backing, token);
+                    backing_size = final_backing;
+                    if (block.logical_volume != null && block.logical_volume.size != final_backing)
+                        throw new IOError.FAILED ("The logical volume capacity could not be verified.");
+                    result.completed ("Backing device shrink verified");
+                }
+                validate_encrypted_resize (block, mapping, "", mapping_identity, requested,
+                    backing_identity, backing_size, header.uuid);
+                minimum_sizes.invalidate (mapping.path);
+                result.successful = true;
+                result.status = StorageOperationStatus.SUCCEEDED;
+                result.summary = "Encrypted volume resized";
+            } catch (Error error) {
+                result.fail (dispatched ? "Encrypted resize needs attention" : "Encrypted resize did not start", error);
+                if (dispatched) {
+                    result.partial = true;
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                }
+            } finally {
+                if (journal != null && !journal.fully_restored ()) {
+                    result.restoration_attempted = true;
+                    if (result.successful || !dispatched) {
+                        jobs.phase (job, StorageJobState.FINALIZING, "Restoring the original mount");
+                        try {
+                            yield restore_preparation (journal, token);
+                            result.restoration_succeeded = true;
+                        } catch (Error error) {
+                            result.fail ("The original mount could not be restored", error);
+                            result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                        }
+                    } else {
+                        result.technical_error += "\nThe original mount was withheld after an unverified resize.";
+                    }
+                }
+                synchronize ();
+                string actual_backing = "unavailable";
+                string actual_mapping = "unavailable";
+                if (snapshot.blocks.lookup (block.path) == block && block.available)
+                    actual_backing = format_size (block.size);
+                if (block.encrypted?.mapping == mapping && mapping.available)
+                    actual_mapping = format_size (mapping.size);
+                result.actual_state = "Backing device: " + actual_backing + "; cleartext mapping: " + actual_mapping + ".";
+                if (block.encrypted?.mapping == mapping && mapping.filesystem != null && mapping.filesystem.size != 0)
+                    result.actual_state += " UDisks filesystem capacity: " + format_size (mapping.filesystem.size) + ".";
+                jobs.finish (job, result);
+                locks.release (block);
+            }
+            return result;
+        }
+
+        private static async void resize_storage_layer (DBusProxy proxy, uint64 size,
+            Cancellable token) throws Error {
+            var options = new VariantBuilder (new VariantType ("a{sv}"));
+            yield proxy.call ("Resize", new Variant ("(t@a{sv})", size, options.end ()),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
+        }
+
+        private static async void check_encrypted_resize_filesystem (DBusProxy proxy, Cancellable token) throws Error {
+            var options = new VariantBuilder (new VariantType ("a{sv}"));
+            var reply = yield proxy.call ("Check", new Variant.tuple ({ options.end () }),
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
+            if (!reply.is_of_type (new VariantType ("(b)")) || !reply.get_child_value (0).get_boolean ())
+                throw new IOError.FAILED ("The filesystem did not pass its consistency check.");
         }
 
         public async StorageOperationResult resize_volume (StorageBlock block, uint64 new_size,
@@ -5284,6 +5647,7 @@ namespace MajorisDisks {
                 var review = new LuksHeaderReview (identity, lines[1], fields[0], fields[1],
                     restore ? lines[2] : "readable", restore ? uint64.parse (lines[4]) : 0,
                     uint64.parse (fields[2]), restore && lines[3] == "checksummed", advanced, path);
+                review.encryption_sector_size = uint64.parse (fields[4]);
                 if (list_keyslots) review.keyslots = lines[2:lines.length];
                 return review;
             } catch (Error error) {
@@ -5501,14 +5865,22 @@ namespace MajorisDisks {
             return null;
         }
 
-        public async StorageEncryptionConfiguration? secret_encryption_configuration (StorageBlock block,
-            string desired_name = "") throws Error {
+        private async StorageEncryptionConfiguration? secret_encryption_configuration (StorageBlock block,
+            string desired_name = "", string just_written_keyfile = "") throws Error {
             if (block.encrypted == null || block.uuid == "")
                 throw new IOError.NOT_SUPPORTED ("Persistent encryption configuration is unavailable.");
             var selected = desired_name == "" ? block.encryption_configuration :
                 find_encryption_configuration (block, desired_name);
             if (selected == null || selected.passphrase_path == "" || selected.passphrase_path.has_prefix ("/dev/"))
                 return selected;
+            // GetSecretConfiguration reads every key referenced by this block.
+            foreach (var sibling in block.encryption_configurations) {
+                if (sibling.passphrase_path == "" || sibling.passphrase_path.has_prefix ("/dev/")) continue;
+                if (!MountOptionService.manages_crypttab_keyfile (sibling.passphrase_path))
+                    throw new IOError.NOT_SUPPORTED ("Another entry for this device has an external key source.");
+                validate_crypttab_key_path (sibling.passphrase_path, true,
+                    sibling == selected && sibling.passphrase_path == just_written_keyfile);
+            }
             var options = new VariantBuilder (new VariantType ("a{sv}"));
             var reply = yield require_volume (block, "Block").call ("GetSecretConfiguration",
                 new Variant.tuple ({ options.end () }), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
@@ -5521,74 +5893,215 @@ namespace MajorisDisks {
             return null;
         }
 
-        public async void configure_encryption (StorageBlock block, bool enabled, bool startup,
+        private bool crypttab_write_pending;
+
+        private async void refresh_crypttab_configuration (DBusProxy proxy, Cancellable token) throws Error {
+            // Read from the daemon even if the proxy missed PropertiesChanged.
+            var reply = yield proxy.get_connection ().call (proxy.get_name_owner (), proxy.get_object_path (),
+                "org.freedesktop.DBus.Properties", "Get", new Variant ("(ss)", PREFIX + "Block", "Configuration"),
+                new VariantType ("(v)"), DBusCallFlags.NONE, 5000, token);
+            var configuration = reply.get_child_value (0).get_variant ();
+            if (!configuration.is_of_type (new VariantType ("a(sa{sv})")))
+                throw new IOError.INVALID_DATA ("UDisks returned an invalid configuration record.");
+            proxy.set_cached_property ("Configuration", configuration);
+            synchronize ();
+        }
+
+        private static void validate_crypttab_key_path (string path, bool existing, bool just_written = false) throws Error {
+            if (path == "") return;
+            Posix.Stat directory;
+            if (Posix.lstat ("/etc/luks-keys", out directory) != 0) {
+                if (!existing && Posix.errno == Posix.ENOENT) return;
+                throw new IOError.PERMISSION_DENIED ("The managed keyfile directory could not be verified.");
+            }
+            if (!Posix.S_ISDIR (directory.st_mode) || directory.st_uid != 0 ||
+                (directory.st_mode & 0022) != 0)
+                throw new IOError.PERMISSION_DENIED ("The managed keyfile directory is not a protected root-owned directory.");
+            Posix.Stat file;
+            if (Posix.lstat (path, out file) != 0) {
+                if (!existing && Posix.errno == Posix.ENOENT) return;
+                // The daemon may have just created its private directory and
+                // key. Readback is authorized by GetSecretConfiguration.
+                if (just_written && Posix.errno == Posix.EACCES && (directory.st_mode & 0077) == 0) return;
+                throw new IOError.PERMISSION_DENIED ("The existing keyfile could not be verified safely.");
+            }
+            if (!existing) throw new IOError.EXISTS ("The proposed keyfile path is already in use.");
+            if (!Posix.S_ISREG (file.st_mode) || file.st_uid != 0 || file.st_nlink != 1 ||
+                (file.st_mode & 0077) != 0)
+                throw new IOError.PERMISSION_DENIED ("The existing keyfile is not a private, root-owned regular file.");
+        }
+
+        private static void check_global_crypttab (string name, string old_name, string device,
+            string old_options, string old_path, string new_path, bool replacing) throws Error {
+            Posix.Stat configuration;
+            if (Posix.lstat ("/etc/crypttab", out configuration) == 0 &&
+                (!Posix.S_ISREG (configuration.st_mode) || configuration.st_uid != 0 ||
+                (configuration.st_mode & 0022) != 0))
+                throw new IOError.PERMISSION_DENIED ("The system-wide crypttab is not a protected root-owned regular file.");
+            string contents;
+            try { FileUtils.get_contents ("/etc/crypttab", out contents); }
+            catch (FileError error) {
+                if (error is FileError.NOENT && !replacing) return;
+                throw new IOError.PERMISSION_DENIED ("The system-wide crypttab could not be checked for conflicting entries.");
+            }
+            Posix.Stat old_key = {};
+            bool compare_inode = old_path != "" && Posix.lstat (old_path, out old_key) == 0;
+            uint matches = 0;
+            foreach (var raw in contents.split ("\n")) {
+                string line = raw.strip ();
+                if (line == "" || line.has_prefix ("#")) continue;
+                string[] fields = Regex.split_simple ("[ \\t]+", line);
+                if (fields.length < 2) continue;
+                string key = fields.length > 2 && fields[2] != "none" && fields[2] != "-" ? fields[2] : "";
+                string options = fields.length > 3 ? fields[3] : "";
+                if (replacing && fields[0] == old_name && fields[1] == device &&
+                    key == old_path && options == old_options) {
+                    matches++;
+                    continue;
+                }
+                if (name != "" && fields[0] == name)
+                    throw new IOError.EXISTS ("Another crypttab entry already uses this mapping name.");
+                if (key != "" && (old_path != "" || new_path != "")) {
+                    string reference = Filename.canonicalize (key.split (":", 2)[0]);
+                    if (reference == old_path || reference == new_path)
+                        throw new IOError.BUSY ("Another crypttab entry references this keyfile.");
+                    Posix.Stat alias = {};
+                    if (compare_inode && Path.is_absolute (key) && !key.contains (":") &&
+                        Posix.stat (key, out alias) == 0 && old_key.st_ino == alias.st_ino && old_key.st_dev == alias.st_dev)
+                        throw new IOError.BUSY ("Another crypttab entry uses an alias of this keyfile.");
+                }
+            }
+            if (replacing && matches != 1)
+                throw new IOError.NOT_FOUND ("The selected crypttab record changed or is ambiguous.");
+        }
+
+        private static void reject_implicit_crypttab_key (string name) throws Error {
+            if (!MountOptionService.valid_crypttab_name (name))
+                throw new IOError.NOT_SUPPORTED ("The original mapping name cannot be verified safely.");
+            foreach (var directory in new string[] { "/etc/cryptsetup-keys.d", "/run/cryptsetup-keys.d" }) {
+                Posix.Stat key;
+                if (Posix.lstat (directory + "/" + name + ".key", out key) == 0)
+                    throw new IOError.NOT_SUPPORTED ("This mapping uses an implicitly discovered systemd keyfile.");
+                if (Posix.errno != Posix.ENOENT)
+                    throw new IOError.PERMISSION_DENIED ("Implicit systemd keyfile locations could not be checked.");
+            }
+        }
+
+        private async string crypttab_credential_ticket (StorageBlock block, int fd, StorageJob job) throws Error {
+            string output, detail;
+            int status = yield run_luks_worker (fd, "inspect", "", "", "", block.uuid, false,
+                job, -1, -1, "", "", out output, out detail);
+            var lines = output.split ("\n");
+            if (status != 0 || lines.length != 2)
+                throw new IOError.INVALID_DATA ("The selected LUKS header could not be verified.");
+            return lines[1];
+        }
+
+        private async void verify_crypttab_credential (StorageBlock block, int fd, string ticket,
+            Variant credential, StorageJob job) throws Error {
+            int pipe = credential_pipe (credential.get_bytestring ());
+            try {
+                string output, detail;
+                int status = yield run_luks_worker (fd, "identify-keyslot", "-1:-1", "", ticket,
+                    block.uuid, false, job, pipe, -1, "", "", out output, out detail);
+                if (status != 0)
+                    throw new IOError.INVALID_DATA ("The configured credential did not unlock a usable LUKS keyslot.");
+            } finally { Posix.close (pipe); }
+        }
+
+        private async string enroll_crypttab_credential (StorageBlock block, int fd, string ticket,
+            Variant current, Variant replacement, StorageJob job) throws Error {
+            int first = credential_pipe (current.get_bytestring ());
+            int second = -1;
+            try {
+                second = credential_pipe (replacement.get_bytestring ());
+                string output, detail;
+                int status = yield run_luks_worker (fd, "add-keyslot", "-1:-1", "", ticket,
+                    block.uuid, false, job, first, second, "", "", out output, out detail);
+                if (status != 0)
+                    throw new IOError.FAILED ("The new keyslot could not be verified. Refresh keyslots before retrying. " + detail);
+                return output;
+            } finally {
+                Posix.close (first);
+                if (second >= 0) Posix.close (second);
+            }
+        }
+
+        public async StorageOperationResult configure_encryption (StorageBlock block, bool enabled, bool startup,
             string mapping_name, string crypt_options, string new_passphrase, Variant? original_item,
             string confirmed_identity, string confirmed_uuid) throws Error {
             if (block.encrypted == null || block.uuid == "" || block.read_only || block.system_hint)
                 throw new IOError.NOT_SUPPORTED ("Persistent encryption configuration is unavailable for this volume.");
             if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
                 throw new IOError.NOT_FOUND ("The encrypted volume changed after the dialog was opened.");
-            if (StorageSafetyService.assess (block, snapshot.dependencies).system_critical)
-                throw new IOError.PERMISSION_DENIED ("This system-critical encryption configuration cannot be changed here.");
-            string name = mapping_name.strip ();
-            if (enabled && (name == "" || name.contains ("/") || name.contains (",") ||
-                name.contains (" ") || name.contains ("\n") || name.contains ("\r")))
+            if (crypttab_write_pending)
+                throw new IOError.BUSY ("Another encryption configuration change is in progress.");
+            string name = mapping_name;
+            if (enabled && !MountOptionService.valid_crypttab_name (name))
                 throw new IOError.INVALID_ARGUMENT ("The mapping name is invalid.");
-            string normalized = enabled ? MountOptionService.normalize_encryption (crypt_options, startup) : "";
-            var details = new VariantBuilder (new VariantType ("a{sv}"));
-            details.add ("{sv}", "name", new Variant.bytestring (name));
-            details.add ("{sv}", "options", new Variant.bytestring (normalized));
             string device = "UUID=" + block.uuid;
-            string old_name = ""; string old_path = ""; string old_secret = "";
+            string old_name = ""; string old_path = ""; string old_options = "";
             if (original_item != null) {
+                if (!original_item.is_of_type (new VariantType ("(sa{sv})")) ||
+                    original_item.get_child_value (0).get_string () != "crypttab")
+                    throw new IOError.INVALID_ARGUMENT ("The selected configuration record is not a crypttab entry.");
                 var old_details = original_item.get_child_value (1);
                 device = old_details.lookup_value ("device", VariantType.BYTESTRING)?.get_bytestring () ?? device;
                 old_name = old_details.lookup_value ("name", VariantType.BYTESTRING)?.get_bytestring () ?? "";
                 old_path = old_details.lookup_value ("passphrase-path", VariantType.BYTESTRING)?.get_bytestring () ?? "";
+                old_options = old_details.lookup_value ("options", VariantType.BYTESTRING)?.get_bytestring () ?? "";
             }
-            details.add ("{sv}", "device", new Variant.bytestring (device));
+            if (!enabled && original_item == null)
+                throw new IOError.INVALID_ARGUMENT ("Select an existing configuration to remove.");
+            if (MountOptionService.external_crypttab_options (old_options))
+                throw new IOError.NOT_SUPPORTED ("This entry uses externally managed unlocking options.");
+            string normalized = enabled ?
+                MountOptionService.normalize_encryption (crypt_options, startup, old_options) : "";
             // UDisks unlinks the old keyfile when removing or replacing a crypttab entry.
             // Only let this editor manage regular keyfiles in UDisks' dedicated directory.
-            if (old_path != "") {
-                if (old_path.has_prefix ("/dev/")) {
-                    if (enabled)
-                        throw new IOError.NOT_SUPPORTED ("UDisks cannot safely edit this device-backed key reference.");
-                } else if (!MountOptionService.manages_crypttab_keyfile (old_path))
-                    throw new IOError.NOT_SUPPORTED ("Editing or removing this entry through UDisks could delete an externally managed keyfile.");
+            if (old_path != "" && !MountOptionService.manages_crypttab_keyfile (old_path))
+                throw new IOError.NOT_SUPPORTED ("The editor cannot change an externally managed key reference.");
+            string secret_path = "";
+            if (enabled) {
+                if (old_path != "") secret_path = old_path;
+                else if (new_passphrase != "") secret_path = "/etc/luks-keys/" + name;
             }
-            if (enabled && new_passphrase == "" && old_path != "") {
-                var secret_config = yield secret_encryption_configuration (block, old_name);
-                if (secret_config != null && secret_config.name == old_name && secret_config.device == device &&
-                    secret_config.passphrase_path == old_path && secret_config.backend_item != null) {
-                    var secret_details = secret_config.backend_item.get_child_value (1);
-                    old_secret = secret_details.lookup_value ("passphrase-contents", VariantType.BYTESTRING)?.get_bytestring () ?? "";
-                } else throw new IOError.FAILED ("The existing protected key material could not be read safely.");
-                if (old_secret == "")
-                    throw new IOError.NOT_SUPPORTED ("UDisks did not return usable contents for the existing keyfile.");
-            }
-            string secret_value = new_passphrase == "" ? old_secret : new_passphrase;
-            string secret_path = secret_value == "" ? "" : old_path == "" ? "/etc/luks-keys/" + name : old_path;
-            details.add ("{sv}", "passphrase-path", new Variant.bytestring (secret_path));
-            details.add ("{sv}", "passphrase-contents", new Variant.bytestring (secret_value));
-            var item = new Variant.tuple ({ new Variant.string ("crypttab"), details.end () });
             var call_options = new VariantBuilder (new VariantType ("a{sv}"));
             var proxy = require_volume (block, "Block");
             locks.acquire (block, snapshot.dependencies);
+            crypttab_write_pending = true;
             var job = jobs.begin (enabled ? "Configure automatic unlocking" : "Remove automatic unlocking", block,
                 snapshot.dependencies);
             var result = new StorageOperationResult ();
+            bool dispatched = false;
+            bool credential_dispatched = false;
+            int credential_device = -1;
             try {
-                jobs.phase (job, StorageJobState.RUNNING, "Updating protected encryption configuration");
-                synchronize ();
+                jobs.phase (job, StorageJobState.PREPARING, "Validating encryption configuration");
+                yield refresh_crypttab_configuration (proxy, backend_lifetime);
                 if (snapshot.blocks.lookup (block.path) != block ||
                     modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
                     throw new IOError.NOT_FOUND ("The encrypted volume changed immediately before the configuration write.");
-                if (StorageSafetyService.assess (block, snapshot.dependencies).system_critical)
-                    throw new IOError.PERMISSION_DENIED ("This system-critical encryption configuration cannot be changed here.");
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies)
+                    throw new IOError.PERMISSION_DENIED ("The encryption configuration of system-critical or unresolved storage cannot be changed here.");
+                foreach (var consumer in snapshot.dependencies.descendants (block)) {
+                    var volume = consumer as StorageBlock;
+                    if (consumer is StorageRaid || (consumer as StorageLogicalVolume)?.active == true ||
+                        volume?.swap_active == true)
+                        throw new IOError.BUSY ("An active swap, RAID or logical-volume dependency prevents this change.");
+                }
                 if (original_item != null) {
                     var current = find_encryption_configuration (block, old_name);
                     if (current == null || current.backend_item == null || !current.backend_item.equal (original_item))
                         throw new IOError.NOT_FOUND ("The selected crypttab entry changed while the dialog was open.");
+                }
+                if (enabled && original_item != null && name == old_name && normalized == old_options &&
+                    new_passphrase == "") {
+                    result.successful = true;
+                    result.status = StorageOperationStatus.SUCCEEDED;
+                    result.summary = "Encryption configuration already matches";
+                    return result;
                 }
                 int key_references = 0;
                 foreach (var candidate in snapshot.blocks.get_values ()) {
@@ -5604,6 +6117,92 @@ namespace MajorisDisks {
                 }
                 if (key_references > 1)
                     throw new IOError.BUSY ("UDisks reports that multiple crypttab entries share this keyfile. Changing the entry could delete the shared keyfile.");
+                check_global_crypttab (enabled ? name : "", old_name, device, old_options, old_path,
+                    secret_path, original_item != null);
+                if (original_item != null && old_path == "") reject_implicit_crypttab_key (old_name);
+                if (enabled && secret_path == "") reject_implicit_crypttab_key (name);
+                if (enabled) {
+                    Posix.Stat mapper;
+                    string mapper_path = "/dev/mapper/" + name;
+                    if (Posix.stat (mapper_path, out mapper) == 0 &&
+                        (block.encrypted.mapping == null || (uint64) mapper.st_rdev != block.encrypted.mapping.number))
+                        throw new IOError.EXISTS ("An unrelated active mapping already uses this name.");
+                }
+                validate_crypttab_key_path (old_path, true);
+                if (secret_path != old_path) validate_crypttab_key_path (secret_path, false);
+                bool supplied_credential = new_passphrase != "";
+                Variant secret = new Variant.bytestring (new_passphrase);
+                new_passphrase = "";
+                Variant? old_credential = null;
+                if (enabled && old_path != "") {
+                    var protected_entry = yield secret_encryption_configuration (block, old_name);
+                    var protected_details = protected_entry?.backend_item?.get_child_value (1);
+                    var contents = protected_details?.lookup_value ("passphrase-contents", VariantType.BYTESTRING);
+                    if (protected_entry == null || protected_entry.device != device ||
+                        protected_entry.passphrase_path != old_path || protected_entry.options != old_options ||
+                        contents == null || contents.get_size () <= 1 ||
+                        contents.get_bytestring ().length != contents.get_size () - 1)
+                        throw new IOError.NOT_SUPPORTED ("The backend did not return a supported existing keyfile.");
+                    old_credential = contents;
+                    if (!supplied_credential) secret = contents;
+                    yield refresh_crypttab_configuration (proxy, backend_lifetime);
+                    if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
+                        modification_identity (block) != confirmed_identity ||
+                        find_encryption_configuration (block, old_name)?.backend_item?.equal (original_item) != true)
+                        throw new IOError.NOT_FOUND ("The encrypted volume or entry changed during authorization.");
+                    check_global_crypttab (name, old_name, device, old_options, old_path, secret_path, true);
+                    validate_crypttab_key_path (old_path, true);
+                }
+                bool rotate = old_credential != null && supplied_credential;
+                if (enabled && secret_path != "") {
+                    if (!luks_header_available ())
+                        throw new IOError.NOT_SUPPORTED ("The LUKS credential verifier is required for stored keyfile changes.");
+                    if (rotate && old_credential.equal (secret))
+                        throw new IOError.INVALID_ARGUMENT ("Choose a different replacement credential.");
+                    if (rotate) {
+                        require_luks_restore_idle (block, snapshot.dependencies);
+                        yield KernelStorageSafety.require_idle (block, backend_lifetime);
+                    }
+                    jobs.phase (job, StorageJobState.RUNNING, "Verifying the LUKS unlocking credential");
+                    credential_device = yield open_block (block, rotate ? "rw" : "r",
+                        Posix.O_CLOEXEC | (rotate ? Posix.O_EXCL : 0), backend_lifetime);
+                    string ticket = yield crypttab_credential_ticket (block, credential_device, job);
+                    yield verify_crypttab_credential (block, credential_device, ticket, old_credential ?? secret, job);
+                    if (rotate) {
+                        require_luks_restore_idle (block, snapshot.dependencies);
+                        yield KernelStorageSafety.require_idle (block, backend_lifetime);
+                        check_global_crypttab (name, old_name, device, old_options, old_path, secret_path, true);
+                        validate_crypttab_key_path (old_path, true);
+                        if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
+                            throw new IOError.NOT_FOUND ("The encrypted device changed before adding the replacement credential.");
+                        credential_dispatched = true;
+                        string enrolled = yield enroll_crypttab_credential (block, credential_device, ticket,
+                            old_credential, secret, job);
+                        result.completed (enrolled);
+                        ticket = yield crypttab_credential_ticket (block, credential_device, job);
+                        yield verify_crypttab_credential (block, credential_device, ticket, secret, job);
+                    }
+                    yield refresh_crypttab_configuration (proxy, backend_lifetime);
+                    if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
+                        modification_identity (block) != confirmed_identity)
+                        throw new IOError.NOT_FOUND ("The encrypted volume changed before the crypttab write.");
+                    check_global_crypttab (name, old_name, device, old_options, old_path, secret_path, original_item != null);
+                    validate_crypttab_key_path (old_path, true);
+                    if (secret_path != old_path) validate_crypttab_key_path (secret_path, false);
+                }
+                // Adapted from GNOME Disks gdu_encryption_options_dialog_get_new_crypttab.
+                // Copyright (C) 2008-2013 Red Hat, Inc.; Copyright (C) 2023 Purism SPC.
+                // SPDX-License-Identifier: GPL-2.0-or-later
+                var details = new VariantBuilder (new VariantType ("a{sv}"));
+                details.add ("{sv}", "name", new Variant.bytestring (name));
+                details.add ("{sv}", "device", new Variant.bytestring (device));
+                details.add ("{sv}", "options", new Variant.bytestring (normalized));
+                if (old_path != "")
+                    details.add ("{sv}", "passphrase-path", new Variant.bytestring (secret_path));
+                details.add ("{sv}", "passphrase-contents", secret);
+                var item = new Variant.tuple ({ new Variant.string ("crypttab"), details.end () });
+                jobs.phase (job, StorageJobState.RUNNING, "Authorizing and applying the crypttab change");
+                dispatched = true;
                 if (!enabled && original_item != null)
                     yield proxy.call ("RemoveConfigurationItem", new Variant.tuple ({ original_item, call_options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
@@ -5613,23 +6212,63 @@ namespace MajorisDisks {
                 else if (enabled)
                     yield proxy.call ("AddConfigurationItem", new Variant.tuple ({ item, call_options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
+                result.completed ("UDisks accepted the crypttab change");
+                jobs.phase (job, StorageJobState.RUNNING, "Verifying the resulting crypttab entry");
                 bool verified = false;
                 for (int attempt = 0; attempt < 50 && !verified; attempt++) {
-                    synchronize (); verified = !enabled;
+                    yield refresh_crypttab_configuration (proxy, backend_lifetime);
+                    if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
+                        modification_identity (block) != confirmed_identity)
+                        throw new IOError.NOT_FOUND ("The encrypted device changed after the configuration request.");
+                    uint requested_records = 0;
+                    uint replaced_records = 0;
                     foreach (var saved in block.encryption_configurations) {
-                        if (!enabled && original_item != null && saved.backend_item != null && saved.backend_item.equal (original_item))
-                            verified = false;
+                        if (original_item != null && saved.backend_item?.equal (original_item) == true)
+                            replaced_records++;
                         if (enabled && saved.device == device && saved.name == name &&
-                            saved.options == normalized && saved.passphrase_path == secret_path) verified = true;
+                            saved.options == normalized && saved.passphrase_path == secret_path) requested_records++;
                     }
+                    bool same_record = name == old_name && normalized == old_options && secret_path == old_path;
+                    verified = enabled ? requested_records == 1 && replaced_records == (same_record ? 1 : 0) :
+                        replaced_records == 0;
                     if (!verified) yield settle_delay (backend_lifetime);
                 }
                 if (!verified) throw new IOError.FAILED ("UDisks did not publish the requested crypttab configuration.");
+                if (secret_path != "") {
+                    var saved = yield secret_encryption_configuration (block, name, secret_path);
+                    var written = saved?.backend_item?.get_child_value (1)?.lookup_value ("passphrase-contents", VariantType.BYTESTRING);
+                    if (saved == null || saved.device != device || saved.options != normalized ||
+                        saved.passphrase_path != secret_path || written == null || !written.equal (secret))
+                        throw new IOError.FAILED ("The stored unlocking credential did not match the verified credential.");
+                    result.completed ("Stored credential verified against a working LUKS keyslot");
+                }
                 result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
-                result.summary = "Encryption configuration updated"; jobs.finish (job, result);
+                result.summary = rotate ? "Automatic unlocking credential rotated. The previous keyslot remains active. Boot-time unlocking was not tested." :
+                    "Encryption configuration updated";
+                return result;
             } catch (Error error) {
-                result.fail ("Encryption configuration was not updated", error); jobs.finish (job, result); throw error;
-            } finally { locks.release (block); }
+                string? remote_error = DBusError.get_remote_error (error);
+                bool denied = error is DBusError.ACCESS_DENIED ||
+                    (remote_error != null && remote_error.has_prefix ("org.freedesktop.UDisks2.Error.NotAuthorized"));
+                bool uncertain = (dispatched && !denied) || credential_dispatched;
+                result.fail (uncertain ? "The encryption configuration could not be verified" :
+                    "Encryption configuration change was not applied", error);
+                if (uncertain) {
+                    result.partial = true;
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    string outcome = result.completed_steps.length == 0 ? "" :
+                        string.joinv (" ", result.completed_steps) + " ";
+                    if (credential_dispatched) outcome += "The previous keyslot was retained. Review keyslots and crypttab before retrying. ";
+                    else outcome += "The configuration may have changed. Review the entry before retrying. ";
+                    throw new IOError.FAILED (outcome + error.message);
+                }
+                throw error;
+            } finally {
+                jobs.finish (job, result);
+                if (credential_device >= 0) Posix.close (credential_device);
+                crypttab_write_pending = false;
+                locks.release (block);
+            }
         }
         public async void volume_action (StorageBlock block, string method) throws Error {
             if (!available ()) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
