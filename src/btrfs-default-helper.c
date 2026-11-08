@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <dlfcn.h>
+#include "btrfs-inspect.h"
 #include <fcntl.h>
 #include <glib.h>
 #include <linux/btrfs.h>
@@ -123,8 +124,9 @@ int
 main (int argc, char **argv)
 {
     gboolean set = argc == 7 && g_str_equal (argv[1], "set-default");
+    gboolean check = argc == 7 && g_str_equal (argv[1], "check-unmounted");
     guint64 device, expected = 0, target = 0, current;
-    if (geteuid () != 0 || (!set && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
+    if (geteuid () != 0 || (!set && !check && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
         !g_path_is_absolute (argv[2]) || !g_uuid_string_is_valid (argv[3]) ||
         !g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &device, NULL) ||
         (set && (!g_ascii_string_to_unsigned (argv[5], 10, 5, G_MAXUINT64, &expected, NULL) ||
@@ -134,6 +136,24 @@ main (int argc, char **argv)
     int mount __attribute__((cleanup(close_fd))) = open_directory (argv[2]);
     if (mount < 0 || !matches_mount (mount, argv[2], device, argv[3]) || !matches_uuid (mount, argv[3]))
         return fail ("The Btrfs mount or its source identity changed.");
+
+    if (check) {
+        if (!g_ascii_string_to_unsigned (argv[5], 10, 256, G_MAXUINT64, &target, NULL) ||
+            argv[6][0] == 0 || strchr (argv[6], 47) != NULL ||
+            g_str_equal (argv[6], ".") || g_str_equal (argv[6], ".."))
+            return fail ("Invalid Btrfs subvolume identity.");
+        g_autofree char *path = g_build_filename (argv[2], argv[6], NULL);
+        gboolean read_only;
+        g_autofree char *identity = majoris_btrfs_inspect_subvolume (path, target, argv[3], NULL, &read_only);
+        if (identity == NULL)
+            return fail ("The selected Btrfs subvolume changed.");
+        int status = majoris_btrfs_mount_use (argv[3], target, argv[6]);
+        if (status == 1)
+            return fail ("The selected Btrfs subvolume is mounted.");
+        if (status != 0)
+            return fail ("Could not verify the selected subvolume across visible mount namespaces.");
+        return 0;
+    }
 
     void *library = dlopen ("libbtrfsutil.so.1", RTLD_NOW | RTLD_LOCAL);
     if (library == NULL)

@@ -28,6 +28,21 @@ namespace MajorisDisks {
         }
     }
 
+    internal class RaidMaintenanceObservation : Object {
+        public StorageJob job;
+        public DBusProxy proxy;
+        public string uuid;
+        public string action;
+        public bool reached_end;
+
+        public RaidMaintenanceObservation (StorageJob job, DBusProxy proxy, string uuid, string action) {
+            this.job = job;
+            this.proxy = proxy;
+            this.uuid = uuid;
+            this.action = action;
+        }
+    }
+
     public class UDisksService : Object {
         public const string PREFIX = "org.freedesktop.UDisks2.";
         [CCode (cname = "MAJORIS_BTRFS_DEFAULT_HELPER", cheader_filename = "btrfs-default-config.h")]
@@ -38,6 +53,9 @@ namespace MajorisDisks {
         private uint refresh_source;
         private bool connecting;
         private StorageOperationLocks locks = new StorageOperationLocks ();
+        private HashTable<string, RaidMaintenanceObservation> raid_observations =
+            new HashTable<string, RaidMaintenanceObservation> (str_hash, str_equal);
+        private HashTable<string, StorageJob> local_raid_checks = new HashTable<string, StorageJob> (str_hash, str_equal);
         private HashTable<string, DBusProxy> raid_checks = new HashTable<string, DBusProxy> (str_hash, str_equal);
         private HashTable<string, StorageJob> stopping_raid_checks = new HashTable<string, StorageJob> (str_hash, str_equal);
         private FilesystemMinimumSizeService minimum_sizes = new FilesystemMinimumSizeService ();
@@ -365,7 +383,90 @@ namespace MajorisDisks {
                 if (!snapshot.blocks.contains (old.path)) minimum_sizes.invalidate (old.path);
             synchronize_jobs ();
             synchronize_selftests ();
+            synchronize_raid_maintenance ();
             changed ();
+        }
+
+        private static string? raid_maintenance_title (string action) {
+            switch (action) {
+            case "check": return "RAID consistency check";
+            case "repair": return "RAID consistency repair";
+            case "recover": return "RAID member reconstruction";
+            case "resync": return "RAID resynchronisation";
+            case "reshape": return "RAID reshape";
+            default: return null;
+            }
+        }
+
+        private static bool verified_raid_recovery (DBusProxy proxy) {
+            uint expected = proxy.get_cached_property ("NumDevices")?.get_uint32 () ?? 0;
+            var devices = proxy.get_cached_property ("ActiveDevices");
+            if (expected == 0 || devices == null || !devices.is_of_type (new VariantType ("a(oiasta{sv})")) ||
+                proxy.get_cached_property ("Degraded")?.get_uint32 () != 0)
+                return false;
+            var slots = new HashTable<string, string> (str_hash, str_equal);
+            for (size_t i = 0; i < devices.n_children (); i++) {
+                var device = devices.get_child_value (i);
+                int slot = device.get_child_value (1).get_int32 ();
+                var states = device.get_child_value (2).get_strv ();
+                if (slot >= 0 && slot < expected && "in_sync" in states && !("faulty" in states)) {
+                    string key = slot.to_string ();
+                    slots.insert (key, key);
+                }
+            }
+            return slots.size () == expected;
+        }
+
+        private void synchronize_raid_maintenance () {
+            foreach (var path in raid_observations.get_keys ()) {
+                var observed = raid_observations.lookup (path);
+                var proxy = manager?.get_interface (path, PREFIX + "MDRaid") as DBusProxy;
+                string action = proxy?.get_cached_property ("SyncAction")?.get_string () ?? "";
+                bool same = proxy == observed.proxy && proxy?.get_cached_property ("UUID")?.get_string () == observed.uuid &&
+                    proxy?.get_cached_property ("Running")?.get_boolean () == true;
+                if (same && action == observed.action) continue;
+                var result = new StorageOperationResult ();
+                bool recovered = observed.action == "recover" || observed.action == "resync";
+                if (same && action == "idle" &&
+                    (recovered ? verified_raid_recovery (proxy) : observed.reached_end &&
+                        proxy.get_cached_property ("Degraded")?.get_uint32 () == 0)) {
+                    result.successful = true;
+                    result.summary = "RAID maintenance completed";
+                } else {
+                    result.fail ("Could not verify the RAID maintenance outcome");
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                }
+                jobs.finish (observed.job, result);
+                raid_observations.remove (path);
+            }
+
+            foreach (var entry in snapshot.advanced.get_values ()) {
+                var raid = entry as StorageRaid;
+                if (raid == null || local_raid_checks.contains (raid.path)) continue;
+                string? title = raid_maintenance_title (raid.state);
+                var proxy = manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy;
+                string uuid = proxy?.get_cached_property ("UUID")?.get_string () ?? "";
+                if (title == null || proxy == null || uuid == "" ||
+                    proxy.get_cached_property ("Running")?.get_boolean () != true)
+                    continue;
+                var observed = raid_observations.lookup (raid.path);
+                if (observed == null) {
+                    var job = jobs.begin_named (title, raid.name != "" ? raid.name : uuid, { raid.path });
+                    observed = new RaidMaintenanceObservation (job, proxy, uuid, raid.state);
+                    raid_observations.insert (raid.path, observed);
+                }
+                var completed = proxy.get_cached_property ("SyncCompleted");
+                double fraction = completed?.get_double () ?? 0.0;
+                bool valid = completed != null && fraction >= 0.0 && fraction <= 1.0;
+                observed.reached_end |= valid && fraction == 1.0;
+                uint64 rate = proxy.get_cached_property ("SyncRate")?.get_uint64 () ?? 0;
+                uint64 remaining = proxy.get_cached_property ("SyncRemainingTime")?.get_uint64 () ?? 0;
+                string phase = title;
+                if (rate > 0) phase += " · %s/s".printf (format_size (rate));
+                if (remaining > 0) phase += " · %s s remaining".printf (((remaining - 1) / TimeSpan.SECOND + 1).to_string ());
+                if (observed.job.phase != phase || observed.job.progress != fraction || observed.job.progress_valid != valid)
+                    jobs.progress (observed.job, phase, fraction, valid);
+            }
         }
 
         private static bool selftest_terminal_success (string status) {
@@ -1099,25 +1200,20 @@ namespace MajorisDisks {
                 throw new IOError.NOT_SUPPORTED ("The selected mount could not be verified as the Btrfs top level.");
         }
 
-        private async void require_unmounted_btrfs_leaf (BtrfsSubvolume subvolume, Cancellable token) throws Error {
-            uint8[] contents;
-            yield File.new_for_path ("/proc/self/mountinfo").load_contents_async (token, out contents, null);
-            string root = "/" + subvolume.path;
-            string subvolid = "subvolid=" + subvolume.id.to_string ();
-            foreach (var line in ((string) contents).split ("\n")) {
-                var sections = line.split (" - ", 2);
-                if (sections.length != 2 || !sections[1].has_prefix ("btrfs ")) continue;
-                var mount = sections[0].split (" ", 6);
-                var filesystem = sections[1].split (" ", 3);
-                if (mount.length != 6 || filesystem.length != 3)
-                    throw new IOError.INVALID_DATA ("Could not verify Btrfs mount information.");
-                string mounted_root = unescape_mount_field (mount[3]);
-                if (mounted_root == root || mounted_root.has_prefix (root + "/") ||
-                    subvolid in filesystem[2].split (","))
-                    throw new IOError.BUSY ("The selected Btrfs subvolume or an equivalent mount is active.");
-            }
+        private async void require_unmounted_btrfs_leaf (StorageBlock block, BtrfsSubvolume subvolume,
+            string uuid, Cancellable token) throws Error {
+            string[] mounts = block.filesystem?.mounts ?? new string[0];
+            if (mounts.length != 1 || !FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE) ||
+                !FileUtils.test (BTRFS_DEFAULT_HELPER, FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("The authorized Btrfs mount-namespace check is unavailable.");
+            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", BTRFS_DEFAULT_HELPER,
+                "check-unmounted", mounts[0], uuid, block.number.to_string (), subvolume.id.to_string (), subvolume.path };
+            var helper = new Subprocess.newv (argv, SubprocessFlags.STDOUT_SILENCE | SubprocessFlags.STDERR_PIPE);
+            string? diagnostic;
+            yield helper.communicate_utf8_async (null, token, null, out diagnostic);
+            if (!helper.get_successful ())
+                throw new IOError.BUSY (diagnostic?.strip () ?? "Btrfs mount usage could not be verified.");
         }
-
         [CCode (cname = "majoris_btrfs_inspect_subvolume", cheader_filename = "btrfs-inspect.h")]
         private extern static string? inspect_btrfs_subvolume (string path, uint64 id, string filesystem,
             string? origin, out bool read_only);
@@ -1157,7 +1253,7 @@ namespace MajorisDisks {
                     bool native = yield has_native_btrfs_default (proxy, lifetime);
                     if ((yield read_btrfs_default (block, proxy, native, lifetime)) == source.id)
                         throw new IOError.BUSY ("Select and verify a different default subvolume before deleting this one.");
-                    yield require_unmounted_btrfs_leaf (source, lifetime);
+
                 }
                 var rows = yield read_btrfs_subvolumes (proxy, false, lifetime);
                 bool found = false;
@@ -1188,6 +1284,13 @@ namespace MajorisDisks {
                 string? origin = null;
                 string mount = block.filesystem.mounts[0];
                 if (remove) {
+                    yield require_unmounted_btrfs_leaf (block, source, uuid, lifetime);
+                    synchronize ();
+                    if (creation_identity_changed (block, identity) || require_volume (block, "Filesystem.BTRFS") != proxy ||
+                        proxy.get_cached_property ("uuid")?.get_string () != uuid ||
+                        proxy.get_cached_property ("num_devices")?.get_uint64 () != count ||
+                        block.filesystem?.mounts.length != 1 || block.filesystem.mounts[0] != mount)
+                        throw new IOError.NOT_FOUND ("The filesystem changed while checking its mount usage.");
                     Posix.Stat parent = {};
                     if (Posix.stat (mount, out parent) != 0 || parent.st_uid != 0 || (parent.st_mode & 0022) != 0)
                         throw new IOError.NOT_SUPPORTED ("Deletion requires a root-owned top-level mount directory protected from other writers.");
@@ -1400,15 +1503,37 @@ namespace MajorisDisks {
         internal bool can_set_raid_running (StorageBlock block, bool running) {
             var raid = running ? block.raid_membership : block.raid;
             var proxy = raid != null ? manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy : null;
-            return block.available && !block.system_hint && proxy != null &&
-                proxy.get_cached_property ("Running")?.get_boolean () == !running &&
-                (!running || raid.degraded == 0);
+            if (!block.available || block.system_hint || proxy == null ||
+                proxy.get_cached_property ("Running")?.get_boolean () != !running)
+                return false;
+            if (!running) return true;
+            uint expected = proxy.get_cached_property ("NumDevices")?.get_uint32 () ?? 0;
+            int known = 0;
+            foreach (var candidate in snapshot.blocks.get_values ())
+                if (candidate.available && candidate.raid_membership == raid) known++;
+            return raid.degraded == 0 && expected > 0 && known >= expected;
+        }
+        internal bool can_start_degraded_raid (StorageBlock member) {
+            var array = member.raid_membership;
+            var proxy = array != null ? manager?.get_interface (array.path, PREFIX + "MDRaid") as DBusProxy : null;
+            if (!member.available || member.system_hint || member.read_only || member.type_id != "linux_raid_member" ||
+                member.number == 0 || array == null || array.level != "raid1" || proxy == null ||
+                proxy.get_cached_property ("Running")?.get_boolean () != false ||
+                proxy.get_cached_property ("NumDevices")?.get_uint32 () != 2)
+                return false;
+            int found = 0;
+            foreach (var candidate in snapshot.blocks.get_values ()) {
+                if (candidate.raid_path == array.path) return false;
+                if (candidate.raid_membership == array) found++;
+            }
+            return found == 1;
         }
 
-        internal async void set_raid_running (StorageBlock block, bool running, string identity) throws Error {
+        internal async void set_raid_running (StorageBlock block, bool running, string identity,
+            bool degraded = false) throws Error {
             synchronize ();
             require_volume (block, "Block");
-            if (!can_set_raid_running (block, running))
+            if (degraded ? !running || !can_start_degraded_raid (block) : !can_set_raid_running (block, running))
                 throw new IOError.NOT_SUPPORTED ("This RAID array is unavailable or in a different state.");
             var raid = running ? block.raid_membership : block.raid;
             var proxy = manager?.get_interface (raid.path, PREFIX + "MDRaid") as DBusProxy;
@@ -1424,10 +1549,11 @@ namespace MajorisDisks {
                 member_identities += modification_identity (member);
             }
             uint count = proxy.get_cached_property ("NumDevices")?.get_uint32 () ?? 0;
-            if (count == 0 || members.length < count)
+            if (count == 0 || (!degraded && members.length < count))
                 throw new IOError.BUSY ("The RAID member set could not be verified.");
             locks.acquire_members (block, members, snapshot.dependencies);
-            var job = jobs.begin (running ? "Start RAID array" : "Stop RAID array", block, snapshot.dependencies);
+            var job = jobs.begin (degraded ? "Start degraded RAID 1" : running ? "Start RAID array" : "Stop RAID array",
+                block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
             var lifetime = backend_lifetime;
             bool dispatched = false;
@@ -1437,6 +1563,7 @@ namespace MajorisDisks {
                 if (safety.system_critical || safety.unknown_dependencies || safety.mounted ||
                     (!running && safety.active_dependents))
                     throw new IOError.BUSY ("The RAID array is in use or supports the running system.");
+                if (degraded) yield KernelStorageSafety.require_idle (block, lifetime);
                 if (!running) {
                     if (proxy.get_cached_property ("SyncAction")?.get_string () != "idle" &&
                         (proxy.get_cached_property ("SyncAction")?.get_string () ?? "") != "")
@@ -1457,13 +1584,17 @@ namespace MajorisDisks {
                 foreach (var candidate in snapshot.blocks.get_values ())
                     if (candidate.raid_membership == raid) current_members++;
                 if (current_members != members.length || proxy.get_cached_property ("NumDevices")?.get_uint32 () != count ||
-                    !can_set_raid_running (block, running) || modification_identity (block) != identity ||
+                    (degraded ? !can_start_degraded_raid (block) || identity == "" ||
+                        storage_membership_identity (block, true) != identity :
+                        !can_set_raid_running (block, running) || modification_identity (block) != identity) ||
                     manager?.get_interface (raid.path, PREFIX + "MDRaid") != proxy)
                     throw new IOError.NOT_FOUND ("The selected RAID array changed after confirmation.");
                 jobs.phase (job, StorageJobState.RUNNING, running ? "Starting the array" : "Stopping the array");
                 dispatched = true;
+                var options = new VariantBuilder (new VariantType ("a{sv}"));
+                if (degraded) options.add ("{sv}", "start-degraded", new Variant.boolean (true));
                 yield call_tracked_method (job, proxy, running ? "Start" : "Stop",
-                    new Variant ("(@a{sv})", new Variant ("a{sv}", null)), lifetime);
+                    new Variant ("(@a{sv})", options.end ()), lifetime);
                 for (int i = 0; i < 100; i++) {
                     synchronize ();
                     if (proxy.get_cached_property ("UUID")?.get_string () != uuid ||
@@ -1472,9 +1603,13 @@ namespace MajorisDisks {
                     bool exposed = false;
                     foreach (var candidate in snapshot.blocks.get_values ())
                         exposed |= candidate.available && candidate.raid_path == raid.path;
-                    if (proxy.get_cached_property ("Running")?.get_boolean () == running && exposed == running) {
+                    bool recovered = !degraded || (proxy.get_cached_property ("Level")?.get_string () == "raid1" &&
+                        proxy.get_cached_property ("Degraded")?.get_uint32 () == 1 &&
+                        find_raid_member (proxy, block.path) != null);
+                    if (proxy.get_cached_property ("Running")?.get_boolean () == running && exposed == running && recovered) {
                         outcome.successful = true;
-                        outcome.summary = running ? "RAID array started" : "RAID array stopped";
+                        outcome.summary = degraded ? "RAID 1 started with reduced redundancy" :
+                            running ? "RAID array started" : "RAID array stopped";
                         return;
                     }
                     yield settle_delay (lifetime);
@@ -1626,8 +1761,26 @@ namespace MajorisDisks {
             return !("in_sync" in states) && ("spare" in states || "faulty" in states);
         }
 
+        internal bool can_replace_missing_raid_member (StorageBlock anchor) {
+            var array = anchor.raid;
+            var proxy = array != null ? manager?.get_interface (array.path, PREFIX + "MDRaid") as DBusProxy : null;
+            if (array == null || array.level != "raid1" || anchor.system_hint || anchor.read_only || proxy == null ||
+                proxy.get_cached_property ("Running")?.get_boolean () != true ||
+                proxy.get_cached_property ("SyncAction")?.get_string () != "idle" ||
+                proxy.get_cached_property ("NumDevices")?.get_uint32 () != 2 ||
+                proxy.get_cached_property ("Degraded")?.get_uint32 () != 1)
+                return false;
+            var members = proxy.get_cached_property ("ActiveDevices");
+            if (members == null || !members.is_of_type (new VariantType ("a(oiasta{sv})")) || members.n_children () != 1)
+                return false;
+            var survivor = members.get_child_value (0);
+            var states = survivor.get_child_value (2).get_strv ();
+            int slot = survivor.get_child_value (1).get_int32 ();
+            return slot >= 0 && slot < 2 && "in_sync" in states && !("faulty" in states) && !("blocked" in states);
+        }
+
         internal async void change_raid_member (StorageBlock anchor, StorageBlock member, bool add,
-            string anchor_identity, string member_identity) throws Error {
+            string anchor_identity, string member_identity, bool replacement = false) throws Error {
             synchronize ();
             require_volume (anchor, "Block");
             require_volume (member, "Block");
@@ -1641,15 +1794,22 @@ namespace MajorisDisks {
             var live = proxy.get_cached_property ("ActiveDevices");
             if (live == null || !live.is_of_type (new VariantType ("a(oiasta{sv})")))
                 throw new IOError.NOT_SUPPORTED ("UDisks did not publish the active member set.");
+            if (replacement && (!add || !can_replace_missing_raid_member (anchor)))
+                throw new IOError.NOT_SUPPORTED ("The RAID 1 array no longer has one verified missing slot.");
+            if (add && !replacement && proxy.get_cached_property ("Degraded")?.get_uint32 () != 0)
+                throw new IOError.NOT_SUPPORTED ("Use the separate recovery action for degraded arrays.");
+            uint64 replacement_number = member.number;
             StorageBlock[] locked = { member };
             for (size_t i = 0; i < live.n_children (); i++) {
                 var block = snapshot.blocks.lookup (live.get_child_value (i).get_child_value (0).get_string ());
-                if (block == null || !block.available || block.system_hint)
+                if (block == null || !block.available || block.system_hint ||
+                    (replacement && (block.size == 0 || member.size < block.size)))
                     throw new IOError.BUSY ("A RAID member could not be identified or is protected.");
                 locked += block;
             }
             locks.acquire_members (anchor, locked, snapshot.dependencies);
-            var job = jobs.begin (add ? "Add RAID member" : "Remove inactive RAID member", anchor, snapshot.dependencies);
+            var job = jobs.begin (replacement ? "Replace missing RAID member" :
+                add ? "Add RAID member" : "Remove inactive RAID member", anchor, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
             var lifetime = backend_lifetime;
             bool dispatched = false;
@@ -1665,6 +1825,8 @@ namespace MajorisDisks {
                     manager?.get_interface (array.path, PREFIX + "MDRaid") != proxy ||
                     proxy.get_cached_property ("SyncAction")?.get_string () != "idle" ||
                     proxy.get_cached_property ("ActiveDevices")?.equal (live) != true ||
+                    (replacement && !can_replace_missing_raid_member (anchor)) ||
+                    (add && !replacement && proxy.get_cached_property ("Degraded")?.get_uint32 () != 0) ||
                     (add ? !can_use_group_member (member) : !can_remove_inactive_raid_member (member)))
                     throw new IOError.BUSY ("The array or member changed after confirmation.");
                 jobs.phase (job, StorageJobState.RUNNING, add ? "Adding the device" : "Removing the inactive member");
@@ -1678,10 +1840,15 @@ namespace MajorisDisks {
                         proxy.get_cached_property ("UUID")?.get_string () != uuid)
                         break;
                     var observed = proxy.get_cached_property ("ActiveDevices");
+                    var current = snapshot.blocks.lookup (member.path);
                     if (observed != null && observed.is_of_type (new VariantType ("a(oiasta{sv})")) &&
-                        (find_raid_member (proxy, member.path) != null) == add) {
+                        current != null && current.number == replacement_number &&
+                        (find_raid_member (proxy, member.path) != null) == add &&
+                        (!replacement || proxy.get_cached_property ("SyncAction")?.get_string () == "recover" ||
+                            verified_raid_recovery (proxy))) {
                         outcome.successful = true;
-                        outcome.summary = add ? "RAID member added" : "Inactive RAID member removed";
+                        outcome.summary = replacement ? "Replacement attached to RAID 1" :
+                            add ? "RAID member added" : "Inactive RAID member removed";
                         return;
                     }
                     yield settle_delay (lifetime);
@@ -1723,6 +1890,7 @@ namespace MajorisDisks {
                 throw new IOError.NOT_FOUND ("The RAID array is no longer available.");
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("RAID consistency check", block, snapshot.dependencies);
+            local_raid_checks.insert (raid.path, job);
             var outcome = new StorageOperationResult ();
             var lifetime = backend_lifetime;
             bool requested = false;
@@ -1797,6 +1965,7 @@ namespace MajorisDisks {
                 if (requested) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                 throw error;
             } finally {
+                local_raid_checks.remove (raid.path);
                 raid_checks.remove (job.id);
                 stopping_raid_checks.remove (job.id);
                 job.cancelable = false;

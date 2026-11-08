@@ -28,6 +28,9 @@ test('nbd-helper', nbd_helper_test)
 btrfs_default_test = executable('btrfs-default-test', 'tests/btrfs-default-test.c', 'src/btrfs-inspect.c',
   include_directories: xz_include, dependencies: dependency('glib-2.0'))
 test('btrfs-default-helper', btrfs_default_test)
+test('disposable-btrfs-mount-integration', sh,
+  args: [meson.current_source_dir() / 'tests/disposable-btrfs-mount-integration.sh', btrfs_default_test],
+  timeout: 120)
 test('storage-model', layout_test)
 test('filesystem-capacity-integration', sh,
   args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test])

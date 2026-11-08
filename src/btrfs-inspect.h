@@ -4,3 +4,4 @@
 
 char *majoris_btrfs_inspect_subvolume (const char *path, guint64 id, const char *filesystem,
                                       const char *origin, gboolean *read_only);
+int majoris_btrfs_mount_use (const char *filesystem, guint64 id, const char *path);

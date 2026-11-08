@@ -30,6 +30,16 @@ test_mount_identity (void)
 int
 main (int argc, char **argv)
 {
+    if (argc == 6 && g_str_equal (argv[1], "--mount-use")) {
+        guint64 id, expected;
+        if (!g_uuid_string_is_valid (argv[2]) ||
+            !g_ascii_string_to_unsigned (argv[3], 10, 256, G_MAXUINT64, &id, NULL) ||
+            !g_ascii_string_to_unsigned (argv[5], 10, 0, 1, &expected, NULL))
+            return 2;
+        int result = majoris_btrfs_mount_use (argv[2], id, argv[4]);
+        g_print ("Btrfs mount use: %d\n", result);
+        return result == (int) expected ? 0 : 1;
+    }
     g_test_init (&argc, &argv, NULL);
     g_test_add_func ("/btrfs-default/mount-identity", test_mount_identity);
     return g_test_run ();

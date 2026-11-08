@@ -22,5 +22,5 @@ btrfs_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
 configure_file(input: 'btrfs-default-config.h.in', output: 'btrfs-default-config.h', configuration: btrfs_config)
 configure_file(input: '../data/com.majoris.disks.Btrfs.policy.in', output: 'com.majoris.disks.Btrfs.policy',
   configuration: btrfs_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
-executable('majoris-disks-btrfs-default', 'btrfs-default-helper.c',
+executable('majoris-disks-btrfs-default', ['btrfs-default-helper.c', 'btrfs-inspect.c'],
   dependencies: dependency('glib-2.0'), install: true, install_dir: get_option('libexecdir'))

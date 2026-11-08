@@ -35,9 +35,11 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button create_lvm;
         [GtkChild] private unowned Gtk.Button raid_check;
         [GtkChild] private unowned Gtk.Button raid_add;
+        [GtkChild] private unowned Gtk.Button raid_replace;
         [GtkChild] private unowned Gtk.Button raid_delete;
         [GtkChild] private unowned Gtk.Button raid_remove_spare;
         [GtkChild] private unowned Gtk.Button raid_power;
+        [GtkChild] private unowned Gtk.Button raid_recover;
         [GtkChild] private unowned Gtk.Button btrfs_subvolumes;
         [GtkChild] private unowned Gtk.Button btrfs_add;
         [GtkChild] private unowned Gtk.Button mount_options;
@@ -58,8 +60,10 @@ namespace MajorisDisks {
         public signal void lvm_create_requested (StorageBlock block);
         public signal void raid_check_requested (StorageBlock block);
         public signal void raid_member_requested (StorageBlock block, bool add);
+        public signal void raid_replace_requested (StorageBlock block);
         public signal void raid_delete_requested (StorageBlock block);
         public signal void raid_power_requested (StorageBlock block, bool running);
+        public signal void raid_recovery_requested (StorageBlock block);
         public signal void btrfs_subvolumes_requested (StorageBlock block);
         public signal void btrfs_add_requested (StorageBlock block);
         public signal void mount_options_requested (StorageBlock block);
@@ -152,11 +156,17 @@ namespace MajorisDisks {
             take_ownership.clicked.connect (() => {
                 if (target != null) ownership_requested (target);
             });
+            raid_recover.clicked.connect (() => {
+                if (selected_block != null) raid_recovery_requested (selected_block);
+            });
             raid_power.clicked.connect (() => {
                 if (selected_block != null) raid_power_requested (selected_block, selected_block.raid == null);
             });
             raid_delete.clicked.connect (() => {
                 if (selected_block != null) raid_delete_requested (selected_block);
+            });
+            raid_replace.clicked.connect (() => {
+                if (selected_block != null) raid_replace_requested (selected_block);
             });
             raid_add.clicked.connect (() => {
                 if (selected_block != null) raid_member_requested (selected_block, true);
@@ -323,9 +333,11 @@ namespace MajorisDisks {
             create_lvm.visible = false;
             raid_check.visible = false;
             raid_add.visible = false;
+            raid_replace.visible = false;
             raid_delete.visible = false;
             raid_remove_spare.visible = false;
             raid_power.visible = false;
+            raid_recover.visible = false;
             btrfs_subvolumes.visible = false;
             btrfs_add.visible = false;
             mount_options.visible = false;
@@ -361,10 +373,13 @@ namespace MajorisDisks {
             create_lvm.visible = block.available && !block.read_only && !block.system_hint &&
                 (block.volume_group?.free_size ?? 0) > 0;
             raid_check.visible = backend?.can_check_raid (block) == true;
-            raid_add.visible = block.available && !block.system_hint && block.raid?.state == "idle";
+            raid_add.visible = block.available && !block.system_hint && block.raid?.state == "idle" && block.raid?.degraded == 0;
+            raid_replace.visible = backend?.can_replace_missing_raid_member (block) == true;
             raid_remove_spare.visible = backend?.can_remove_inactive_raid_member (block) == true;
             raid_delete.visible = backend?.can_delete_stopped_raid (block) == true;
             raid_power.visible = backend?.can_set_raid_running (block, block.raid == null) == true;
+            raid_recover.visible = backend?.can_start_degraded_raid (block) == true;
+            if (raid_recover.visible) raid_power.visible = false;
             raid_power.label = block.raid == null ? "Start RAID Array" : "Stop RAID Array";
             btrfs_subvolumes.visible = backend?.has_btrfs_subvolumes (block) == true;
             btrfs_add.visible = btrfs_subvolumes.visible && !block.read_only && !block.system_hint;
