@@ -51,6 +51,10 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button lock_volume;
         [GtkChild] private unowned Gtk.Button change_passphrase;
         [GtkChild] private unowned Gtk.Button encryption_options;
+        [GtkChild] private unowned Gtk.MenuButton encryption_menu;
+        [GtkChild] private unowned Gtk.Button luks_backup;
+        [GtkChild] private unowned Gtk.Button luks_restore;
+        [GtkChild] private unowned Gtk.Button luks_recovery;
         [GtkChild] private unowned Gtk.Button take_ownership;
         [GtkChild] private unowned Gtk.Button edit_partition;
         [GtkChild] private unowned Gtk.Button create_partition;
@@ -77,11 +81,17 @@ namespace MajorisDisks {
         public signal void encryption_requested (StorageBlock block, bool unlock);
         public signal void passphrase_requested (StorageBlock block);
         public signal void encryption_options_requested (StorageBlock block);
+        internal signal void luks_header_requested (StorageBlock block, bool restore, bool advanced);
         public signal void format_requested (StorageBlock block);
         public signal void partitioning_requested (StorageBlock block, bool deleting);
         public signal void create_requested (StorageBlock disk, StorageFreeSpace gap);
         public signal void resize_requested (StorageBlock block);
         private StorageBlock? selected_block;
+
+        private void request_luks_header (bool restore, bool advanced) {
+            encryption_menu.popdown ();
+            if (selected_block != null) luks_header_requested (selected_block, restore, advanced);
+        }
         public signal void check_requested (StorageBlock block, bool repair);
         public UDisksService? backend { private get; set; }
         private uint maintenance_generation;
@@ -225,8 +235,17 @@ namespace MajorisDisks {
             mount_options.clicked.connect (() => { if (target != null) mount_options_requested (target); });
             unlock_volume.clicked.connect (() => { if (selected_block != null) encryption_requested (selected_block, true); });
             lock_volume.clicked.connect (() => { if (selected_block != null) encryption_requested (selected_block, false); });
-            change_passphrase.clicked.connect (() => { if (selected_block != null) passphrase_requested (selected_block); });
-            encryption_options.clicked.connect (() => { if (selected_block != null) encryption_options_requested (selected_block); });
+            change_passphrase.clicked.connect (() => {
+                encryption_menu.popdown ();
+                if (selected_block != null) passphrase_requested (selected_block);
+            });
+            encryption_options.clicked.connect (() => {
+                encryption_menu.popdown ();
+                if (selected_block != null) encryption_options_requested (selected_block);
+            });
+            luks_backup.clicked.connect (() => request_luks_header (false, false));
+            luks_restore.clicked.connect (() => request_luks_header (true, false));
+            luks_recovery.clicked.connect (() => request_luks_header (true, true));
             format_volume.clicked.connect (() => {
                 if (selected_block != null) format_requested (selected_block);
             });
@@ -373,6 +392,7 @@ namespace MajorisDisks {
             create_partition.visible = false;
             resize_volume.visible = false;
             restore_partition.visible = false;
+            encryption_menu.visible = false;
             selected_block = null;
             usage.label = "";
             foreach (var field in metadata) properties.remove (field);
@@ -482,6 +502,20 @@ namespace MajorisDisks {
             lock_volume.visible = block.encrypted?.mapping != null && block.available && !block.system_hint;
             change_passphrase.visible = block.encrypted != null && block.available && !block.read_only && !block.system_hint;
             encryption_options.visible = change_passphrase.visible && block.uuid != "";
+            luks_backup.visible = UDisksService.is_luks_header_candidate (block);
+            luks_restore.visible = luks_backup.visible;
+            luks_recovery.visible = UDisksService.is_luks_recovery_candidate (block);
+            bool header_available = UDisksService.luks_header_available ();
+            luks_backup.sensitive = header_available;
+            luks_restore.sensitive = header_available && !block.read_only && !block.system_hint &&
+                block.encrypted?.mapping == null;
+            luks_recovery.sensitive = header_available;
+            luks_backup.tooltip_text = header_available ? null : "The libcryptsetup header worker is unavailable.";
+            luks_recovery.tooltip_text = luks_backup.tooltip_text;
+            luks_restore.tooltip_text = !header_available ? luks_backup.tooltip_text :
+                !luks_restore.sensitive ? "Restore requires a locked, writable volume outside the running system." : null;
+            encryption_menu.label = luks_recovery.visible ? "Advanced Recovery" : "Encryption";
+            encryption_menu.visible = change_passphrase.visible || luks_backup.visible || luks_recovery.visible;
             if (target != block) add_volume_field ("Mapped device", target.preferred, true);
             var fs = target.filesystem;
             if (fs != null) {

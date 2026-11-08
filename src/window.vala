@@ -137,6 +137,8 @@ namespace MajorisDisks {
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
+            drive_view.luks_header_requested.connect ((block, restore, advanced) =>
+                show_luks_header.begin (block, restore, advanced));
             drive_view.encryption_options_requested.connect (edit_encryption_options);
             drive_view.detach_image_requested.connect (detach_image);
             drive_view.backup_requested.connect (choose_backup);
@@ -852,6 +854,53 @@ namespace MajorisDisks {
             });
             confirmation.present (this);
         }
+        private async void show_luks_header (StorageBlock block, bool restore, bool advanced) {
+            if (pending.contains (block.path)) return;
+            string identity = backend.modification_identity (block);
+            string device = block.preferred;
+            var chooser = new Gtk.FileDialog ();
+            File? source = null;
+            pending.insert (block.path, block);
+            try {
+                if (restore) {
+                    chooser.title = "Select a LUKS Header Backup";
+                    source = yield chooser.open (this, null);
+                }
+                var review = yield backend.review_luks_header (block, identity, source, advanced);
+                string details = "%s · %s\n%s · %s".printf (device, format_size (block.size),
+                    review.version, review.uuid);
+                File? destination = null;
+                if (restore) {
+                    string confirmation = advanced ? device + " " + review.uuid : device;
+                    var dialog = new LuksHeaderRestoreDialog (confirmation, advanced);
+                    dialog.body = details + "\n" + source.get_parse_name () + "\n\n" +
+                        (review.damaged ? "The current header is unreadable. Recovery evidence matches this target." :
+                            "The current header is readable and its critical metadata matches.") + "\n\n" + dialog.body;
+                    if (!review.checksummed)
+                        dialog.body += "\n\nThis file has no saved checksum. Majoris verified its structure and layout, " +
+                            "but could not independently check the keyslot bytes for corruption.";
+                    string response = yield dialog.choose (this, null);
+                    if (response != "restore") return;
+                } else {
+                    var dialog = new LuksHeaderBackupDialog ();
+                    dialog.body = details + "\n\n" + dialog.body;
+                    string response = yield dialog.choose (this, null);
+                    if (response != "choose") return;
+                    chooser.title = "Save a LUKS Header Backup";
+                    chooser.initial_name = review.uuid + ".luks-header";
+                    destination = yield chooser.save (this, null);
+                }
+                var result = yield backend.execute_luks_header (block, review, destination);
+                show_check_message (result.successful ? "LUKS Header Operation Complete" : "LUKS Header Operation",
+                    result.summary + (result.technical_error == "" ? "" : "\n\n" + result.technical_error));
+            } catch (Error error) {
+                if (!(error is Gtk.DialogError.DISMISSED) && !(error is Gtk.DialogError.CANCELLED))
+                    show_check_message ("LUKS Header Operation Not Started", operation_error (error));
+            } finally {
+                pending.remove (block.path);
+            }
+        }
+
         private void change_passphrase (StorageBlock block) {
             if (pending.contains (block.path)) return;
             string identity = backend.modification_identity (block);
@@ -1820,6 +1869,20 @@ namespace MajorisDisks {
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/hardware-action-confirmation-dialog.ui")]
     public class HardwareActionConfirmationDialog : Adw.AlertDialog {}
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/luks-header-backup-dialog.ui")]
+    internal class LuksHeaderBackupDialog : Adw.AlertDialog {}
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/luks-header-restore-dialog.ui")]
+    internal class LuksHeaderRestoreDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow confirmation;
+
+        public LuksHeaderRestoreDialog (string target, bool advanced) {
+            if (advanced) confirmation.title = "Type the device path, a space, and the LUKS UUID";
+            set_response_enabled ("restore", false);
+            confirmation.changed.connect (() => set_response_enabled ("restore", confirmation.text == target));
+        }
+    }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/change-passphrase-dialog.ui")]
     public class ChangePassphraseDialog : Adw.AlertDialog {

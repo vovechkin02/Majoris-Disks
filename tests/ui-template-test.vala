@@ -61,6 +61,48 @@ private void test_lvm_poll () throws Error {
     if (failure != null) throw failure;
 }
 
+private void test_luks_capabilities_and_safety () throws Error {
+    string old_daemon = "<node><interface name='org.freedesktop.UDisks2.Block'><method name='OpenDevice'/></interface></node>";
+    string new_daemon = "<node><interface name='org.freedesktop.UDisks2.Block'><method name='RestoreEncryptedHeader'/></interface>" +
+        "<interface name='org.freedesktop.UDisks2.Encrypted'><method name='HeaderBackup'/></interface></node>";
+    assert (!UDisksService.has_luks_method (old_daemon, "org.freedesktop.UDisks2.Block", "RestoreEncryptedHeader"));
+    assert (!UDisksService.has_luks_method (old_daemon, "org.freedesktop.UDisks2.Encrypted", "HeaderBackup"));
+    assert (UDisksService.has_luks_method (new_daemon, "org.freedesktop.UDisks2.Block", "RestoreEncryptedHeader"));
+    assert (UDisksService.has_luks_method (new_daemon, "org.freedesktop.UDisks2.Encrypted", "HeaderBackup"));
+
+    var outcome = new StorageOperationResult ();
+    UDisksService.record_luks_worker_failure (outcome, 2, true, "Backup rejected");
+    assert (outcome.status == StorageOperationStatus.FAILED && !outcome.partial);
+    UDisksService.record_luks_worker_failure (outcome, 3, true, "Readback mismatch");
+    assert (outcome.status == StorageOperationStatus.NEEDS_ATTENTION && outcome.partial);
+    assert (outcome.summary == "Modification attempted but verification failed");
+    UDisksService.record_luks_worker_failure (outcome, -1, true, "");
+    assert (outcome.status == StorageOperationStatus.NEEDS_ATTENTION && outcome.summary == "Outcome uncertain");
+
+    var block = new StorageBlock ("/test/luks");
+    block.available = true;
+    block.type_id = "crypto_TCRYPT";
+    block.encrypted = new StorageEncryptedVolume ();
+    block.uuid = Uuid.string_random ();
+    assert (!UDisksService.is_luks_header_candidate (block));
+    block.type_id = "crypto_LUKS";
+    assert (UDisksService.is_luks_header_candidate (block));
+    var graph = new StorageDependencyService ();
+    UDisksService.require_luks_restore_idle (block, graph);
+    var mapping = new StorageBlock ("/test/mapper");
+    block.encrypted.mapping = mapping;
+    try {
+        UDisksService.require_luks_restore_idle (block, graph);
+        assert_not_reached ();
+    } catch (IOError error) { assert (error is IOError.BUSY); }
+    block.encrypted.mapping = null;
+    block.system_hint = true;
+    try {
+        UDisksService.require_luks_restore_idle (block, graph);
+        assert_not_reached ();
+    } catch (IOError error) { assert (error is IOError.PERMISSION_DENIED); }
+}
+
 private void test_restore_rejects_parent_image (UDisksService backend, StorageBlock disk, StorageBlock partition)
     throws Error {
     string path;
@@ -151,6 +193,8 @@ public static int main (string[] args) {
     var drive = new StorageDrive ("/test/drive"); drive.medium = disk; drive.name = "Test drive";
     var app = new Gtk.Application ("com.majoris.disks.TemplateTest", ApplicationFlags.NON_UNIQUE);
     app.register (null);
+    try { test_luks_capabilities_and_safety (); }
+    catch (Error error) { critical ("%s", error.message); return 1; }
     test_advanced_navigation (app);
     var partition = block.partition;
     var job = backend.jobs.begin ("Test", block, backend.snapshot.dependencies);
@@ -166,6 +210,7 @@ public static int main (string[] args) {
         new JobRow (backend, job), new JobsPopover (backend), new ActiveJobsDialog (),
         new MountOptionsDialog (block, "identity"), new UnlockVolumeDialog (block),
         new LockVolumeConfirmationDialog (), new ChangePassphraseDialog (block),
+        new LuksHeaderBackupDialog (), new LuksHeaderRestoreDialog ("/dev/test", true),
         new HardwareActionConfirmationDialog (),
         new EncryptionOptionsDialog (block, "identity"), new SmartDialog (backend, drive, health_report),
         new DriveSettingsDialog (drive), new HealthPreferences (), new BenchmarkDialog (backend, drive), new DiskImageConfirmation (), new BlankDiskImageDialog (), new VirtualImageDialog ()
@@ -178,7 +223,8 @@ public static int main (string[] args) {
         "delete-confirmation-dialog.ui", "format-disk-dialog.ui", "format-volume-dialog.ui",
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
         "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui",
-        "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui", "encryption-options-dialog.ui",
+         "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui",
+        "luks-header-backup-dialog.ui", "luks-header-restore-dialog.ui", "encryption-options-dialog.ui",
         "smart-dialog.ui", "hardware-action-confirmation-dialog.ui", "drive-settings-dialog.ui", "health-preferences.ui", "benchmark-dialog.ui", "disk-image-confirmation.ui", "create-blank-image-dialog.ui", "virtual-image-dialog.ui"
     };
     foreach (var name in resources) {

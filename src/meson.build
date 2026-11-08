@@ -24,3 +24,13 @@ configure_file(input: '../data/com.majoris.disks.Btrfs.policy.in', output: 'com.
   configuration: btrfs_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
 btrfs_default_helper = executable('majoris-disks-btrfs-default', ['btrfs-default-helper.c', 'btrfs-inspect.c'],
   dependencies: dependency('glib-2.0'), install: true, install_dir: get_option('libexecdir'))
+
+luks_config = configuration_data()
+luks_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
+configure_file(input: 'luks-header-config.h.in', output: 'luks-header-config.h', configuration: luks_config)
+cryptsetup_dep = dependency('libcryptsetup', version: '>=2.6', required: false)
+if cryptsetup_dep.found()
+  luks_header_worker = executable('majoris-disks-luks-header', 'luks-header-worker.c',
+    dependencies: [cryptsetup_dep, blkid_c, dependency('json-glib-1.0')],
+    install: true, install_dir: get_option('libexecdir'))
+endif

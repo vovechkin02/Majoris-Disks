@@ -44,6 +44,29 @@ namespace MajorisDisks {
         }
     }
 
+    internal class LuksHeaderReview : Object {
+        public string identity { get; private set; }
+        public string ticket { get; private set; }
+        public string version { get; private set; }
+        public string uuid { get; private set; }
+        public bool damaged { get; private set; }
+        public bool checksummed { get; private set; }
+        public bool advanced { get; private set; }
+        public string file_path { get; private set; }
+
+        internal LuksHeaderReview (string identity, string ticket, string version, string uuid,
+            bool damaged, bool checksummed, bool advanced, string file_path) {
+            this.identity = identity;
+            this.ticket = ticket;
+            this.version = version;
+            this.uuid = uuid;
+            this.damaged = damaged;
+            this.checksummed = checksummed;
+            this.advanced = advanced;
+            this.file_path = file_path;
+        }
+    }
+
     public class UDisksService : Object {
         public const string PREFIX = "org.freedesktop.UDisks2.";
         [CCode (cname = "MAJORIS_BTRFS_DEFAULT_HELPER", cheader_filename = "btrfs-default-config.h")]
@@ -5023,6 +5046,278 @@ namespace MajorisDisks {
                 result.fail ("The encrypted volume could not be locked", error); jobs.finish (job, result); throw error;
             } finally { locks.release (block); }
         }
+        [CCode (cname = "LUKS_HEADER_WORKER", cheader_filename = "luks-header-config.h")]
+        private extern const string LUKS_HEADER_WORKER;
+        [CCode (cname = "F_DUPFD_CLOEXEC", cheader_filename = "fcntl.h")]
+        private extern const int DUPFD_CLOEXEC;
+
+        public static bool luks_header_available () {
+            return FileUtils.test (LUKS_HEADER_WORKER, FileTest.IS_EXECUTABLE);
+        }
+
+        public static bool is_luks_header_candidate (StorageBlock block) {
+            return block.available && !block.ignored && block.encrypted != null &&
+                block.type_id == "crypto_LUKS" && Uuid.string_is_valid (block.uuid);
+        }
+
+        public static bool is_luks_recovery_candidate (StorageBlock block) {
+            return block.available && !block.ignored && !block.read_only && !block.system_hint &&
+                block.type_id == "" && block.usage == "" && block.encrypted == null &&
+                block.filesystem == null && block.table == null && !block.has_swap;
+        }
+
+        internal static bool has_luks_method (string xml, string interface_name, string method) throws Error {
+            var node = new DBusNodeInfo.for_xml (xml);
+            return node.lookup_interface (interface_name)?.lookup_method (method) != null;
+        }
+
+        private async void detect_luks_methods (DBusProxy proxy, Cancellable token) throws Error {
+            var reply = yield proxy.get_connection ().call (proxy.get_name_owner (), proxy.get_object_path (),
+                "org.freedesktop.DBus.Introspectable", "Introspect", null, new VariantType ("(s)"),
+                DBusCallFlags.NONE, 5000, token);
+            string xml = reply.get_child_value (0).get_string ();
+            // UDisks 2.11's methods take paths and cannot bind a restore to the
+            // checked exclusive FD. HeaderBackup in 2.11 also lacks a Polkit
+            // check. Use the authorized FD transport even when these exist.
+            if (has_luks_method (xml, "org.freedesktop.UDisks2.Encrypted", "HeaderBackup") ||
+                has_luks_method (xml, "org.freedesktop.UDisks2.Block", "RestoreEncryptedHeader"))
+                debug ("UDisks advertises path-based LUKS header methods; using authorized device descriptors.");
+            if (!has_luks_method (xml, "org.freedesktop.UDisks2.Block", "OpenDevice"))
+                throw new IOError.NOT_SUPPORTED ("UDisks does not expose authorized device descriptors.");
+        }
+
+        private string luks_source_binding (StorageBlock block) {
+            var drive = block.physical_drive;
+            var partition = block.partition;
+            if (drive != null && (drive.wwn != "" || drive.serial != "")) {
+                if (partition != null && partition.uuid == "") return "";
+                return Checksum.compute_for_string (ChecksumType.SHA256,
+                    new Variant ("(ssstt)", drive.wwn, drive.serial, partition?.uuid ?? "",
+                        partition?.offset ?? 0, block.size).print (false));
+            }
+            if (block.loop != null && block.loop.backing_file != "")
+                return "loop:" + Checksum.compute_for_string (ChecksumType.SHA256, block.loop.backing_file);
+            return "";
+        }
+
+        private void validate_luks_target (StorageBlock block, string identity, bool restore, bool advanced)
+            throws Error {
+            synchronize ();
+            if (!luks_header_available ())
+                throw new IOError.NOT_SUPPORTED ("Install Majoris Disks with the libcryptsetup header worker.");
+            if (!block.available || snapshot.blocks.lookup (block.path) != block ||
+                modification_identity (block) != identity)
+                throw new IOError.NOT_FOUND ("The selected device changed after it was confirmed.");
+            if (!(advanced ? is_luks_recovery_candidate (block) : is_luks_header_candidate (block)))
+                throw new IOError.NOT_SUPPORTED ("The selected volume does not support this header operation.");
+            if (restore) require_luks_restore_idle (block, snapshot.dependencies);
+        }
+
+        internal static void require_luks_restore_idle (StorageBlock block, StorageDependencyService graph)
+            throws Error {
+            // GNOME Disks' ensure-unused flow walks dependent objects before
+            // dispatch. Recovery requires an already idle stack because
+            // closing mappings would change the confirmed dependency graph.
+            var safety = StorageSafetyService.assess (block, graph);
+            if (safety.system_critical || block.ignored || block.read_only)
+                throw new IOError.PERMISSION_DENIED ("Use offline recovery for protected or system storage.");
+            if (safety.mounted || safety.active_dependents || block.swap_active ||
+                block.encrypted?.mapping != null)
+                throw new IOError.BUSY ("Unmount filesystems, deactivate swap and lock the volume before restoring.");
+            if (safety.unknown_dependencies || block.table != null || block.partition?.container == true ||
+                block.backing_path != "/" || block.raid_path != "/" || block.raid_member_path != "/" ||
+                block.logical_volume_path != "/" || block.physical_volume_group_path != "/" ||
+                graph.descendants (block).length != 1)
+                throw new IOError.NOT_SUPPORTED ("Recovery requires a plain block device with no dependent storage.");
+        }
+
+        private async int run_luks_worker (int fd, string operation, string path, string binding,
+            string expected, string uuid, bool advanced, StorageJob job,
+            out string output, out string detail) throws Error {
+            var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+            int duplicate = Posix.fcntl (fd, DUPFD_CLOEXEC, 4);
+            output = "";
+            detail = "";
+            if (duplicate < 0) {
+                detail = "Could not pass the verified device descriptor.";
+                return 2;
+            }
+            launcher.take_fd (duplicate, 3);
+            string[] argv = { LUKS_HEADER_WORKER, operation, path, binding, expected, uuid,
+                advanced ? "advanced" : "normal" };
+            Subprocess? process = null;
+            try { process = launcher.spawnv (argv); }
+            catch (Error error) { detail = error.message; return 2; }
+            finally { launcher.close (); }
+            var messages = new DataInputStream (process.get_stdout_pipe ());
+            var diagnostics = new DataInputStream (process.get_stderr_pipe ());
+            var result = new StringBuilder ();
+            string? line;
+            while ((line = yield messages.read_line_async ()) != null) {
+                switch (line) {
+                    case "phase:verify-backup":
+                        jobs.phase (job, StorageJobState.FINALIZING, "Verifying the backup");
+                        break;
+                    case "phase:write-header":
+                        jobs.phase (job, StorageJobState.RUNNING, "Restoring header and keyslots");
+                        break;
+                    case "phase:verify-restore":
+                        jobs.phase (job, StorageJobState.FINALIZING, "Reading back the restored header");
+                        break;
+                    default:
+                        result.append (line).append_c ('\n');
+                        break;
+                }
+            }
+            detail = (yield diagnostics.read_line_async ()) ?? "";
+            yield process.wait_async ();
+            output = result.str.strip ();
+            return process.get_if_exited () ? process.get_exit_status () : -1;
+        }
+
+        internal async LuksHeaderReview review_luks_header (StorageBlock block, string identity,
+            File? backup_file = null, bool advanced = false) throws Error {
+            bool restore = backup_file != null;
+            string? path = restore ? backup_file.get_path () : "";
+            if (path == null) throw new IOError.INVALID_ARGUMENT ("Choose a local backup file.");
+            validate_luks_target (block, identity, restore, advanced);
+            locks.acquire (block, snapshot.dependencies);
+            var lifetime = backend_lifetime;
+            var job = jobs.begin ("Validate LUKS header", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            int fd = -1;
+            try {
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the device and available backend");
+                if (restore) yield KernelStorageSafety.require_idle (block, job.cancellable);
+                yield detect_luks_methods (require_volume (block, "Block"), job.cancellable);
+                jobs.phase (job, StorageJobState.PREPARING, "Authorizing read-only device access");
+                fd = yield open_block (block, "r", Posix.O_CLOEXEC, job.cancellable);
+                validate_luks_target (block, identity, restore, advanced);
+                job.cancellable.set_error_if_cancelled ();
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.RUNNING, "Reading and validating LUKS metadata");
+                string output, detail;
+                int status = yield run_luks_worker (fd, restore ? "preview" : "inspect", path,
+                    luks_source_binding (block), "", block.uuid, advanced, job, out output, out detail);
+                if (status != 0) throw new IOError.INVALID_DATA (detail != "" ? detail : "The header could not be verified.");
+                validate_luks_target (block, identity, restore, advanced);
+                var lines = output.split ("\n");
+                var fields = lines[0].split (" ");
+                if (lines.length != (restore ? 4 : 2) || fields.length != 8)
+                    throw new IOError.INVALID_DATA ("The header verifier returned an invalid response.");
+                outcome.successful = true;
+                outcome.summary = "LUKS header validation complete";
+                return new LuksHeaderReview (identity, lines[1], fields[0], fields[1],
+                    restore && lines[2] == "damaged", restore && lines[3] == "checksummed", advanced, path);
+            } catch (Error error) {
+                outcome.fail ("Header operation not started", error);
+                throw error;
+            } finally {
+                if (fd >= 0) Posix.close (fd);
+                lifetime.disconnect (disconnected);
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+        }
+
+        internal static void record_luks_worker_failure (StorageOperationResult outcome, int status,
+            bool restore, string detail) {
+            outcome.fail (status == 2 ? "Failed before modification" :
+                status == 3 ? (restore ? "Modification attempted but verification failed" :
+                    "Backup published with uncertain durability") : "Outcome uncertain");
+            outcome.technical_error = detail;
+            if (status != 2) {
+                outcome.partial = true;
+                outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+            }
+        }
+
+        internal async StorageOperationResult execute_luks_header (StorageBlock block,
+            LuksHeaderReview review, File? destination = null) throws Error {
+            bool restore = destination == null;
+            string? path = restore ? review.file_path : destination.get_path ();
+            if (path == null || path == "" || (restore == (review.file_path == "")))
+                throw new IOError.INVALID_ARGUMENT ("Choose a local header backup file.");
+            validate_luks_target (block, review.identity, restore, review.advanced);
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin (restore ? "Restore LUKS header" : "Back up LUKS header", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            int fd = -1;
+            bool dispatched = false;
+            try {
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the selected volume and its dependencies");
+                if (restore) yield KernelStorageSafety.require_idle (block, job.cancellable);
+                jobs.phase (job, StorageJobState.PREPARING, "Authorizing device access");
+                fd = yield open_block (block, restore ? "rw" : "r",
+                    Posix.O_CLOEXEC | (restore ? Posix.O_EXCL : 0), job.cancellable);
+                if (restore) yield KernelStorageSafety.require_idle (block, job.cancellable);
+                validate_luks_target (block, review.identity, restore, review.advanced);
+                job.cancellable.set_error_if_cancelled ();
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.RUNNING, restore ?
+                    "Validating, restoring and reading back the header" : "Creating and verifying the backup");
+                dispatched = true;
+                string output, detail;
+                int status = yield run_luks_worker (fd, restore ? "restore" : "backup", path,
+                    luks_source_binding (block), review.ticket, block.uuid, review.advanced, job, out output, out detail);
+                Posix.close (fd);
+                fd = -1;
+                if (status != 0) {
+                    record_luks_worker_failure (outcome, status, restore, detail);
+                } else {
+                    outcome.successful = true;
+                    outcome.summary = restore ? "Header restored and verified. Use credentials from the restored header." :
+                        "Verified LUKS header saved to " + path;
+                    if (!restore && output != "recovery")
+                        outcome.summary += "\nDamaged-header recovery information could not be recorded.";
+                    if (!restore && output == "no-xattrs")
+                        outcome.summary += "\nThe destination does not retain the backup checksum as a file attribute.";
+                }
+                if (restore && status != 2) {
+                    jobs.phase (job, StorageJobState.FINALIZING, "Refreshing the UDisks device snapshot");
+                    try {
+                        var proxy = require_volume (block, "Block");
+                        yield proxy.call ("Rescan", new Variant ("(@a{sv})", new VariantBuilder (VariantType.VARDICT).end ()),
+                            DBusCallFlags.NONE, 10000, lifetime);
+                        for (int attempt = 0; attempt < 30; attempt++) {
+                            synchronize ();
+                            if (snapshot.blocks.lookup (block.path) == block && is_luks_header_candidate (block) &&
+                                block.uuid.down () == review.uuid.down ()) break;
+                            Timeout.add (100, () => { execute_luks_header.callback (); return Source.REMOVE; });
+                            yield;
+                        }
+                        if (outcome.successful && (snapshot.blocks.lookup (block.path) != block ||
+                            !is_luks_header_candidate (block) || block.uuid.down () != review.uuid.down ()))
+                            throw new IOError.FAILED ("UDisks has not published the verified header.");
+                    } catch (Error error) {
+                        if (outcome.successful) {
+                            outcome.fail ("Header verified on disk, but the device snapshot could not be reconciled", error);
+                            outcome.partial = true;
+                            outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                        }
+                    }
+                }
+            } catch (Error error) {
+                outcome.fail (dispatched ? "Outcome uncertain" : "Header operation not started", error);
+                if (dispatched) {
+                    outcome.partial = true;
+                    outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                }
+            } finally {
+                if (fd >= 0) Posix.close (fd);
+                lifetime.disconnect (disconnected);
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+            return outcome;
+        }
+
+
         public async void change_passphrase (StorageBlock block, string current_passphrase,
             string new_passphrase, string confirmed_identity) throws Error {
             if (block.encrypted == null || block.read_only || block.system_hint)

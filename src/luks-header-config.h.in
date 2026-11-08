@@ -1,0 +1,3 @@
+#ifndef LUKS_HEADER_WORKER
+#define LUKS_HEADER_WORKER "@LIBEXECDIR@/majoris-disks-luks-header"
+#endif

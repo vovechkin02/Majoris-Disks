@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <template class="MajorisDisksLuksHeaderBackupDialog" parent="AdwAlertDialog">
+    <property name="heading">Back Up LUKS Header</property>
+    <property name="body">This backup contains the encryption header and keyslots. Older passwords that worked when it was created may remain usable with this backup. Store it securely and separately from the encrypted device.</property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="choose" appearance="suggested">Choose Backup Location…</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

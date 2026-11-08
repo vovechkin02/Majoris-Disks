@@ -54,6 +54,16 @@ test('disposable-partition-image-integration', imaging_test, args: ['--partition
 test('disposable-partition-xz-integration', imaging_test, args: ['--partition', '--xz'], timeout: 180)
 test('disposable-nbd-integration', imaging_test, args: ['--nbd'], timeout: 300)
 test('virtual-image-growth', imaging_test, args: ['--grow'], timeout: 120)
+if cryptsetup_dep.found()
+  luks_service_test = executable('luks-header-service-test', 'tests/luks-header-service-test.vala',
+    storage_model_sources, 'src/udisks-service.vala',
+    include_directories: xz_include,
+    c_args: ['-DLUKS_HEADER_WORKER="' + luks_header_worker.full_path() + '"'],
+    dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+  test('luks-header-integration', sh,
+    args: [meson.current_source_dir() / 'tests/luks-header-integration.sh', luks_header_worker, luks_service_test],
+    timeout: 240)
+endif
 test('disposable-loop-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],
   timeout: 120)
