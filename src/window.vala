@@ -2,6 +2,19 @@ namespace MajorisDisks {
     [GtkTemplate (ui = "/com/majoris/disks/ui/window.ui")]
     public class DisksWindow : Adw.ApplicationWindow {
         [GtkChild] private unowned Gtk.ListBox sidebar;
+        [GtkChild] private unowned Gtk.ListBox advanced_sidebar;
+        [GtkChild] private unowned Gtk.ScrolledWindow advanced_view;
+        [GtkChild] private unowned Adw.PreferencesGroup advanced_summary;
+        [GtkChild] private unowned Adw.PreferencesGroup advanced_members;
+        [GtkChild] private unowned Adw.ActionRow advanced_details;
+        [GtkChild] private unowned Adw.ActionRow advanced_jobs;
+        [GtkChild] private unowned Adw.ActionRow advanced_manage;
+        [GtkChild] private unowned Adw.ActionRow advanced_maintenance;
+        [GtkChild] private unowned Adw.ActionRow advanced_recovery;
+        private string selected_storage = "";
+        private StorageBlock? advanced_context;
+        private StorageDevice? advanced_device;
+        private VolumeRow[] member_rows = {};
         [GtkChild] private unowned Gtk.Button refresh_button;
         [GtkChild] private unowned Adw.NavigationSplitView split;
         [GtkChild] private unowned Gtk.Stack states;
@@ -9,7 +22,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned DriveView drive_view;
         [GtkChild] private unowned Adw.ToastOverlay notifications;
         [GtkChild] private unowned Gtk.MenuButton jobs_button;
-        private UDisksService backend = new UDisksService ();
+        private UDisksService backend;
         private string selected = "";
         private string? requested_drive;
         private bool updating;
@@ -20,8 +33,9 @@ namespace MajorisDisks {
             typeof (DriveView).ensure ();
         }
 
-        public DisksWindow (Gtk.Application app) {
+        public DisksWindow (Gtk.Application app, UDisksService? service = null) {
             Object (application: app);
+            backend = service ?? new UDisksService ();
             sidebar.bind_model (backend.snapshot.devices, (item) => new DeviceRow ((StorageDrive) item));
             sidebar.set_header_func ((row, before) => {
                 var current = (DeviceRow) row;
@@ -33,8 +47,39 @@ namespace MajorisDisks {
             sidebar.row_selected.connect ((row) => {
                 if (updating || row == null) return;
                 selected = ((DeviceRow) row).drive.path;
+                selected_storage = "";
+                advanced_sidebar.unselect_all ();
                 show_selection ();
                 split.show_content = true;
+            });
+            advanced_sidebar.set_header_func ((row, before) => {
+                row.set_header (before == null ? new SidebarGroupHeading ("Advanced Storage") : null);
+            });
+            advanced_sidebar.row_selected.connect ((row) => {
+                if (updating || row == null) return;
+                selected_storage = storage_key (((VolumeRow) row).device);
+                sidebar.unselect_all ();
+                show_selection ();
+                split.show_content = true;
+            });
+            advanced_manage.activated.connect (() => {
+                var context = advanced_context;
+                if (context == null) return;
+                if (advanced_device is StorageVolumeGroup) manage_logical_volumes (context);
+                else if (advanced_device is StorageRaid) confirm_raid_power (context, context.raid == null);
+                else list_btrfs_subvolumes (context);
+            });
+            advanced_maintenance.activated.connect (() => {
+                var context = advanced_context;
+                if (context == null) return;
+                if (advanced_device is StorageRaid) start_raid_check (context);
+                else show_btrfs_allocation (context);
+            });
+            advanced_recovery.activated.connect (() => {
+                var context = advanced_context;
+                if (context == null) return;
+                if (advanced_device is StorageRaid) confirm_degraded_raid (context);
+                else manage_btrfs_balance (context);
             });
             var create_vg = new SimpleAction ("create-vg", null);
             var create_raid = new SimpleAction ("create-raid", null);
@@ -105,6 +150,7 @@ namespace MajorisDisks {
             jobs_button.popover = jobs_popover;
             backend.jobs.changed.connect (() => {
                 jobs_popover.update ();
+                update_advanced_jobs ();
                 jobs_button.visible = backend.jobs.jobs.get_n_items () != 0;
             });
             backend.select_requested.connect ((path) => drive_view.select_identity (path));
@@ -1386,19 +1432,189 @@ namespace MajorisDisks {
                     if (DriveHealth.identity (row.drive) != requested_drive) continue;
                     chosen = row;
                     requested_drive = null;
+                    selected_storage = "";
                     split.show_content = true;
                     break;
                 }
             }
             if (chosen == null) chosen = sidebar.get_row_at_index (0) as DeviceRow;
             sidebar.invalidate_headers ();
-            sidebar.select_row (chosen);
-            if (chosen != null || backend.available ()) selected = chosen?.drive.path ?? "";
+            var advanced_row = update_advanced_rows ();
+            sidebar.select_row (advanced_row == null ? chosen : null);
+            advanced_sidebar.select_row (advanced_row);
+            if (chosen != null || backend.available ()) selected = chosen != null ? chosen.drive.path : "";
             updating = false;
             show_selection ();
         }
 
+        private static string storage_key (StorageDevice device) {
+            var block = device as StorageBlock;
+            return block != null && block.uuid != "" ? "btrfs:" + block.uuid : device.path;
+        }
+
+        private VolumeRow? update_advanced_rows () {
+            var objects = new HashTable<string, StorageDevice> (str_hash, str_equal);
+            foreach (var item in backend.snapshot.advanced.get_values ())
+                if (item is StorageVolumeGroup || item is StorageRaid) objects.insert (storage_key (item), item);
+            foreach (var block in backend.snapshot.blocks.get_values ()) {
+                if (block.ignored || block.type_id != "btrfs") continue;
+                string key = storage_key (block);
+                var prior = objects.lookup (key) as StorageBlock;
+                bool mounted = block.filesystem?.mounted == true;
+                bool prior_mounted = prior?.filesystem?.mounted == true;
+                if (prior == null || (mounted && !prior_mounted) ||
+                    (mounted == prior_mounted && strcmp (block.path, prior.path) < 0))
+                    objects.insert (key, block);
+            }
+
+            var items = objects.get_values ();
+            items.sort ((a, b) => {
+                int order = a.name.collate (b.name);
+                return order != 0 ? order : strcmp (storage_key (a), storage_key (b));
+            });
+            VolumeRow? chosen = null;
+            int index = 0;
+            foreach (var item in items) {
+                var row = advanced_sidebar.get_row_at_index (index++) as VolumeRow;
+                if (row == null) {
+                    row = new VolumeRow (item);
+                    advanced_sidebar.append (row);
+                } else row.update (item);
+                if (item is StorageVolumeGroup) row.subtitle = "LVM Volume Group";
+                else if (item is StorageRaid) row.subtitle = "RAID Array";
+                else row.subtitle = "Btrfs Filesystem";
+                if (storage_key (item) == selected_storage) chosen = row;
+            }
+            Gtk.ListBoxRow? extra;
+            while ((extra = advanced_sidebar.get_row_at_index (index)) != null)
+                advanced_sidebar.remove (extra);
+            advanced_sidebar.visible = index != 0;
+            if (chosen == null) selected_storage = "";
+            return chosen;
+        }
+
+        private void update_advanced_jobs () {
+            string[] phases = {};
+            if (advanced_device != null) {
+                var jobs = backend.jobs.jobs;
+                for (uint i = 0; i < jobs.get_n_items (); i++) {
+                    var job = (StorageJob) jobs.get_item (i);
+                    if (StorageJobManager.terminal (job.state)) continue;
+                    bool matches = advanced_device.path in job.affected;
+                    foreach (var row in member_rows)
+                        matches |= row.device.path in job.affected;
+                    if (matches) {
+                        string progress = job.progress_valid ? " (%.0f%%)".printf (job.progress * 100.0) : "";
+                        phases += job.operation + " · " + job.phase + progress;
+                    }
+                }
+            }
+            advanced_jobs.subtitle = phases.length == 0 ? "None reported for this object" : string.joinv (" · ", phases);
+        }
+
+        private void show_advanced_storage (StorageDevice item) {
+            advanced_device = item;
+            advanced_context = null;
+            advanced_summary.title = item.name != "" ? item.name : "Storage Object";
+            advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible = false;
+            foreach (var row in member_rows) advanced_members.remove (row);
+            member_rows = {};
+
+            var group = item as StorageVolumeGroup;
+            var array = item as StorageRaid;
+            var filesystem = item as StorageBlock;
+            var blocks = backend.snapshot.blocks.get_values ();
+            blocks.sort ((a, b) => strcmp (a.path, b.path));
+            foreach (var block in blocks) {
+                bool member = group != null ? block.volume_group == group :
+                    array != null ? block.raid_membership == array || block.raid == array :
+                    block.type_id == "btrfs" && storage_key (block) == storage_key (item);
+                if (!member) continue;
+                add_advanced_member (block);
+                if (block.ignored || !block.available) continue;
+                if (group != null && !block.system_hint &&
+                    (advanced_context == null || strcmp (block.path, advanced_context.path) < 0))
+                    advanced_context = block;
+                if (array != null && (advanced_context == null ||
+                    (advanced_context.raid != array && (block.raid == array ||
+                        (!backend.can_start_degraded_raid (advanced_context) && backend.can_start_degraded_raid (block))))))
+                    advanced_context = block;
+            }
+
+            if (group != null) {
+                advanced_details.title = "LVM Volume Group";
+                advanced_details.subtitle = "%s available of %s".printf (format_size (group.free_size), format_size (group.size));
+                var volumes = backend.snapshot.advanced.get_values ();
+                volumes.sort ((a, b) => strcmp (a.path, b.path));
+                foreach (var candidate in volumes) {
+                    var lv = candidate as StorageLogicalVolume;
+                    if (lv != null && lv.group_path == group.path) add_advanced_member (lv);
+                }
+                advanced_manage.title = "Manage Logical Volumes";
+                advanced_manage.visible = advanced_context != null;
+            } else if (array != null) {
+                advanced_details.title = "RAID Array";
+                advanced_details.subtitle = "%s · %s · %u missing members".printf (array.level, array.state, array.degraded);
+                var context = advanced_context;
+                if (context != null) {
+                    bool start = context.raid == null;
+                    advanced_manage.title = start ? "Start RAID Array" : "Stop RAID Array";
+                    advanced_manage.visible = backend.can_set_raid_running (context, start);
+                    advanced_maintenance.title = "Check RAID Array";
+                    advanced_maintenance.visible = backend.can_check_raid (context);
+                    advanced_recovery.title = "Start Degraded RAID Array";
+                    advanced_recovery.visible = backend.can_start_degraded_raid (context);
+                }
+            } else if (filesystem != null) {
+                advanced_context = filesystem;
+                advanced_details.title = "Btrfs Filesystem";
+                advanced_details.subtitle = filesystem.filesystem?.mounted == true ?
+                    string.joinv (", ", filesystem.filesystem.mounts) : "Unmounted";
+                advanced_manage.title = "Manage Subvolumes";
+                advanced_maintenance.title = "View Allocation";
+                advanced_recovery.title = "Balance and Scrub";
+                advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible =
+                    backend.has_btrfs_subvolumes (filesystem);
+            }
+            update_advanced_jobs ();
+            drive_view.clear ();
+            states.visible_child = advanced_view;
+        }
+
+        private void add_advanced_member (StorageDevice device) {
+            var row = new VolumeRow (device);
+            var block = device as StorageBlock;
+            var lv = device as StorageLogicalVolume;
+            if (block != null && block.preferred != "") row.title = block.preferred;
+            if (lv != null) {
+                row.subtitle = "%s · %s".printf (format_size (lv.size), lv.active ? "Active" : "Inactive");
+                if (lv.lvm_type == "pool") {
+                    var usage = new ThinPoolUsage (backend.snapshot, lv);
+                    row.subtitle = "%s data capacity · %s".printf (format_size (usage.physical_size),
+                        usage.active ? "Active" : "Inactive");
+                    row.subtitle += usage.virtual_known ?
+                        "\n%s provisioned virtually".printf (format_size (usage.virtual_size)) :
+                        "\nVirtual provisioning unavailable";
+                    row.subtitle += usage.usage_known ?
+                        "\nData %.1f%% used · Metadata %.1f%% used".printf (usage.data_ratio * 100.0,
+                            usage.metadata_ratio * 100.0) :
+                        "\nData and metadata usage unavailable";
+                }
+            }
+            row.selectable = false;
+            row.activatable = false;
+            member_rows += row;
+            advanced_members.add (row);
+        }
+
         private void show_selection () {
+            var advanced_row = advanced_sidebar.get_selected_row () as VolumeRow;
+            if (advanced_row != null) {
+                show_advanced_storage (advanced_row.device);
+                return;
+            }
+            advanced_device = null;
+            advanced_context = null;
             var row = sidebar.get_selected_row () as DeviceRow;
             if (row == null) {
                 drive_view.clear ();

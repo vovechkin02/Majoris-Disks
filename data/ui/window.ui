@@ -16,7 +16,9 @@
 <property name="content"><object class="AdwNavigationSplitView" id="split">
 <property name="sidebar"><object class="AdwNavigationPage"><property name="title">Devices</property><property name="child">
 <object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar"><child type="start"><object class="GtkMenuButton"><property name="icon-name">open-menu-symbolic</property><property name="menu-model">application_menu</property></object></child><child type="end"><object class="GtkButton" id="refresh_button"><property name="label">Refresh</property></object></child></object></child>
-<property name="content"><object class="GtkScrolledWindow"><property name="child"><object class="GtkListBox" id="sidebar"><style><class name="navigation-sidebar"/></style></object></property></object></property>
+<property name="content"><object class="GtkScrolledWindow"><property name="child"><object class="GtkBox"><property name="orientation">vertical</property><child><object class="GtkListBox" id="sidebar"><style><class name="navigation-sidebar"/></style></object></child>
+<child><object class="GtkListBox" id="advanced_sidebar"><style><class name="navigation-sidebar"/></style></object></child>
+</object></property></object></property>
 </object></property></object></property>
 <property name="content"><object class="AdwNavigationPage"><property name="title">Storage</property><property name="child">
 <object class="AdwToolbarView"><child type="top"><object class="AdwHeaderBar">
@@ -25,6 +27,22 @@
 <object class="AdwToastOverlay" id="notifications"><property name="child"><object class="GtkStack" id="states">
 <child><object class="AdwStatusPage" id="status"><property name="title">Connecting to UDisks…</property><property name="icon-name">drive-harddisk-symbolic</property></object></child>
 <child><object class="MajorisDisksDriveView" id="drive_view"/></child>
+<child><object class="GtkScrolledWindow" id="advanced_view">
+<property name="hscrollbar-policy">never</property><property name="child">
+<object class="AdwClamp"><property name="child">
+<object class="AdwPreferencesPage">
+<child><object class="AdwPreferencesGroup" id="advanced_summary">
+<child><object class="AdwActionRow" id="advanced_details"><property name="use-markup">false</property></object></child>
+<child><object class="AdwActionRow" id="advanced_jobs"><property name="title">Active Jobs</property><property name="use-markup">false</property></object></child>
+</object></child>
+<child><object class="AdwPreferencesGroup"><property name="title">Management</property>
+<child><object class="AdwActionRow" id="advanced_manage"><property name="activatable">True</property></object></child>
+<child><object class="AdwActionRow" id="advanced_maintenance"><property name="activatable">True</property></object></child>
+<child><object class="AdwActionRow" id="advanced_recovery"><property name="activatable">True</property></object></child>
+</object></child>
+<child><object class="AdwPreferencesGroup" id="advanced_members"><property name="title">Members and Volumes</property></object></child>
+</object></property></object></property>
+</object></child>
 </object></property></object></property></object>
 </property></object></property></object></property>
     <child>

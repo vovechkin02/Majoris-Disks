@@ -83,6 +83,41 @@ private void test_restore_rejects_parent_image (UDisksService backend, StorageBl
     }
 }
 
+private void test_advanced_navigation (Gtk.Application app) {
+    var backend = new UDisksService ();
+    var window = new DisksWindow (app, backend);
+    var drive = new StorageDrive ("/test/drive") { name = "Drive" };
+    var group = new StorageVolumeGroup ("/test/group") { name = "Group" };
+    var array = new StorageRaid ("/test/array") { name = "Array" };
+    var first = new StorageBlock ("/test/btrfs1") { name = "Btrfs", type_id = "btrfs", uuid = "test-fsid" };
+    var second = new StorageBlock ("/test/btrfs2") { name = "Btrfs", type_id = "btrfs", uuid = "test-fsid" };
+    backend.snapshot.publish ({ drive });
+    backend.snapshot.advanced.insert (group.path, group);
+    backend.snapshot.advanced.insert (array.path, array);
+    backend.snapshot.blocks.insert (first.path, first);
+    backend.snapshot.blocks.insert (second.path, second);
+    backend.changed ();
+
+    var sidebar = (Gtk.ListBox) window.get_template_child (typeof (DisksWindow), "sidebar");
+    var advanced = (Gtk.ListBox) window.get_template_child (typeof (DisksWindow), "advanced_sidebar");
+    var states = (Gtk.Stack) window.get_template_child (typeof (DisksWindow), "states");
+    var overview = (Gtk.Widget) window.get_template_child (typeof (DisksWindow), "advanced_view");
+    assert (advanced.get_row_at_index (3) == null);
+    assert (((VolumeRow) advanced.get_row_at_index (1)).device == first);
+    var group_row = (VolumeRow) advanced.get_row_at_index (2);
+    assert (group_row.device == group);
+    advanced.select_row (group_row);
+    assert (states.visible_child == overview && sidebar.get_selected_row () == null);
+    backend.snapshot.advanced.remove (array.path);
+    backend.changed ();
+    assert (((VolumeRow) advanced.get_selected_row ()).device == group);
+    backend.snapshot.advanced.remove (group.path);
+    backend.changed ();
+    assert (advanced.get_selected_row () == null && states.visible_child != overview);
+    assert (sidebar.get_selected_row () != null);
+    window.destroy ();
+}
+
 public static int main (string[] args) {
     string? display = Environment.get_variable ("DISPLAY");
     try { test_lvm_poll (); }
@@ -116,6 +151,7 @@ public static int main (string[] args) {
     var drive = new StorageDrive ("/test/drive"); drive.medium = disk; drive.name = "Test drive";
     var app = new Gtk.Application ("com.majoris.disks.TemplateTest", ApplicationFlags.NON_UNIQUE);
     app.register (null);
+    test_advanced_navigation (app);
     var partition = block.partition;
     var job = backend.jobs.begin ("Test", block, backend.snapshot.dependencies);
     var health_report = new StorageHealthReport ();

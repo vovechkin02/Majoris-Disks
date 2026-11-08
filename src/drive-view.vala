@@ -273,7 +273,7 @@ namespace MajorisDisks {
                 drive.ata_write_cache_supported || drive.ata_read_lookahead_supported ||
                 (drive.ata_power_management && drive.rotation != 0);
             detach_image_button.visible = drive.medium?.loop != null || drive.medium?.virtual_attachment != null;
-            backup_drive.visible = drive.medium?.size > 0;
+            backup_drive.visible = disk != null && disk.size > 0;
             restore_drive.visible = false;
             if (disk != null && disk.available && disk.size > 0 && backend != null) {
                 var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.IMAGE_RESTORE,
@@ -338,7 +338,7 @@ namespace MajorisDisks {
         }
 
         private void show_volume (VolumeRow? row) {
-            selected = row?.device.path ?? "";
+            selected = row != null ? row.device.path : "";
             map.select (selected);
             properties.visible = row != null;
             target = null;
