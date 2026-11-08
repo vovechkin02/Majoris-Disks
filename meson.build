@@ -40,7 +40,7 @@ test('filesystem-capacity-udisks', sh,
 xvfb = find_program('xvfb-run', required: false)
 if xvfb.found()
   ui_test = executable('ui-template-test', 'tests/ui-template-test.vala',
-    storage_model_sources + files('src/udisks-service.vala', 'src/window.vala',
+    storage_model_sources + luks_ui_sources + files('src/udisks-service.vala', 'src/window.vala',
       'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala', 'src/health-preferences.vala', 'src/benchmark-dialog.vala'),
     resources, include_directories: xz_include, dependencies: deps)
   test('ui-templates', xvfb, args: ['-a', ui_test])
@@ -60,9 +60,12 @@ if cryptsetup_dep.found()
     include_directories: xz_include,
     c_args: ['-DLUKS_HEADER_WORKER="' + luks_header_worker.full_path() + '"'],
     dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+  luks_worker_faults = shared_module('luks-worker-faults', 'tests/luks-worker-faults.c',
+    dependencies: meson.get_compiler('c').find_library('dl'))
   test('luks-header-integration', sh,
     args: [meson.current_source_dir() / 'tests/luks-header-integration.sh', luks_header_worker, luks_service_test],
-    timeout: 240)
+    env: ['MAJORIS_TEST_FAULT_LIBRARY=' + luks_worker_faults.full_path()],
+    depends: luks_worker_faults, timeout: 300)
 endif
 test('disposable-loop-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],

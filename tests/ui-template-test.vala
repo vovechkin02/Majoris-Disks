@@ -79,6 +79,12 @@ private void test_luks_capabilities_and_safety () throws Error {
     UDisksService.record_luks_worker_failure (outcome, -1, true, "");
     assert (outcome.status == StorageOperationStatus.NEEDS_ATTENTION && outcome.summary == "Outcome uncertain");
 
+    int pipe = UDisksService.credential_pipe ("fixture passphrase");
+    uint8[] buffer = new uint8[32];
+    assert (Posix.read (pipe, buffer, buffer.length) == 18);
+    assert (Posix.read (pipe, buffer, buffer.length) == 0);
+    Posix.close (pipe);
+
     var block = new StorageBlock ("/test/luks");
     block.available = true;
     block.type_id = "crypto_TCRYPT";
@@ -196,11 +202,12 @@ public static int main (string[] args) {
     try { test_luks_capabilities_and_safety (); }
     catch (Error error) { critical ("%s", error.message); return 1; }
     test_advanced_navigation (app);
+    var window = new DisksWindow (app);
     var partition = block.partition;
     var job = backend.jobs.begin ("Test", block, backend.snapshot.dependencies);
     var health_report = new StorageHealthReport ();
     Object[] instances = {
-        new PartitionMap (), new PartitionSegment (), new DriveView (), new DisksWindow (app),
+        new PartitionMap (), new PartitionSegment (), new DriveView (), window,
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
         new DriveInformationDialog (drive, block), new InformationRow ("Test", "Value", false),
         new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new BtrfsBalanceDialog (true), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
@@ -211,6 +218,9 @@ public static int main (string[] args) {
         new MountOptionsDialog (block, "identity"), new UnlockVolumeDialog (block),
         new LockVolumeConfirmationDialog (), new ChangePassphraseDialog (block),
         new LuksHeaderBackupDialog (), new LuksHeaderRestoreDialog ("/dev/test", true),
+        new LuksKeyslotsDialog (new LuksHeaderReview ("identity", "ticket", "LUKS2",
+            Uuid.string_random (), "readable", 0, 0, false, false, ""), false),
+        new LuksCredentialDialog ("add", -1, {}, false, window),
         new HardwareActionConfirmationDialog (),
         new EncryptionOptionsDialog (block, "identity"), new SmartDialog (backend, drive, health_report),
         new DriveSettingsDialog (drive), new HealthPreferences (), new BenchmarkDialog (backend, drive), new DiskImageConfirmation (), new BlankDiskImageDialog (), new VirtualImageDialog ()
@@ -224,7 +234,7 @@ public static int main (string[] args) {
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
         "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui",
          "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui",
-        "luks-header-backup-dialog.ui", "luks-header-restore-dialog.ui", "encryption-options-dialog.ui",
+        "luks-header-backup-dialog.ui", "luks-header-restore-dialog.ui", "luks-keyslots-dialog.ui", "luks-credential-dialog.ui", "encryption-options-dialog.ui",
         "smart-dialog.ui", "hardware-action-confirmation-dialog.ui", "drive-settings-dialog.ui", "health-preferences.ui", "benchmark-dialog.ui", "disk-image-confirmation.ui", "create-blank-image-dialog.ui", "virtual-image-dialog.ui"
     };
     foreach (var name in resources) {

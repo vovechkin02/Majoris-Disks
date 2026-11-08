@@ -2,7 +2,7 @@
 <interface>
   <template class="MajorisDisksLuksHeaderRestoreDialog" parent="AdwAlertDialog">
     <property name="heading">Restore LUKS Header?</property>
-    <property name="body">This replaces the target’s header and keyslots. Only credentials in the restored header may work afterward. Restoring to the wrong target can permanently prevent access to its data.</property>
+    <property name="body">This replaces the target’s header and keyslots. The backup contains historical keyslots. Only credentials in the restored header may work afterward. Restoring to the wrong target can permanently prevent access to its data.</property>
     <property name="extra-child">
       <object class="AdwPreferencesGroup">
         <child>

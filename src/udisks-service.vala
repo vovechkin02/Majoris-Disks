@@ -49,18 +49,24 @@ namespace MajorisDisks {
         public string ticket { get; private set; }
         public string version { get; private set; }
         public string uuid { get; private set; }
-        public bool damaged { get; private set; }
+        public string confidence { get; private set; }
+        public bool damaged { get { return confidence != "readable"; } }
+        public uint64 header_size { get; private set; }
+        public uint64 data_offset { get; private set; }
         public bool checksummed { get; private set; }
         public bool advanced { get; private set; }
         public string file_path { get; private set; }
+        public string[] keyslots = {};
 
         internal LuksHeaderReview (string identity, string ticket, string version, string uuid,
-            bool damaged, bool checksummed, bool advanced, string file_path) {
+            string confidence, uint64 header_size, uint64 data_offset, bool checksummed, bool advanced, string file_path) {
             this.identity = identity;
             this.ticket = ticket;
             this.version = version;
             this.uuid = uuid;
-            this.damaged = damaged;
+            this.confidence = confidence;
+            this.header_size = header_size;
+            this.data_offset = data_offset;
             this.checksummed = checksummed;
             this.advanced = advanced;
             this.file_path = file_path;
@@ -5133,9 +5139,10 @@ namespace MajorisDisks {
 
         private async int run_luks_worker (int fd, string operation, string path, string binding,
             string expected, string uuid, bool advanced, StorageJob job,
+            int first, int second, string first_file, string second_file,
             out string output, out string detail) throws Error {
             var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
-            int duplicate = Posix.fcntl (fd, DUPFD_CLOEXEC, 4);
+            int duplicate = Posix.fcntl (fd, DUPFD_CLOEXEC, 6);
             output = "";
             detail = "";
             if (duplicate < 0) {
@@ -5145,6 +5152,15 @@ namespace MajorisDisks {
             launcher.take_fd (duplicate, 3);
             string[] argv = { LUKS_HEADER_WORKER, operation, path, binding, expected, uuid,
                 advanced ? "advanced" : "normal" };
+            if (operation.has_suffix ("-keyslot")) {
+                if (!pass_luks_credential (launcher, first, 4) || !pass_luks_credential (launcher, second, 5)) {
+                    launcher.close ();
+                    detail = "Could not pass the credential descriptors.";
+                    return 2;
+                }
+                argv += first_file;
+                argv += second_file;
+            }
             Subprocess? process = null;
             try { process = launcher.spawnv (argv); }
             catch (Error error) { detail = error.message; return 2; }
@@ -5152,16 +5168,35 @@ namespace MajorisDisks {
             var messages = new DataInputStream (process.get_stdout_pipe ());
             var diagnostics = new DataInputStream (process.get_stderr_pipe ());
             var result = new StringBuilder ();
+            bool staged = false;
+            bool writing = false;
+            bool verifying = false;
             string? line;
             while ((line = yield messages.read_line_async ()) != null) {
                 switch (line) {
                     case "phase:verify-backup":
                         jobs.phase (job, StorageJobState.FINALIZING, "Verifying the backup");
                         break;
+                    case "phase:staged":
+                        staged = true;
+                        jobs.phase (job, StorageJobState.RUNNING, "Staged and verified metadata");
+                        break;
                     case "phase:write-header":
+                        writing = true;
+                        verifying = false;
                         jobs.phase (job, StorageJobState.RUNNING, "Restoring header and keyslots");
                         break;
+                    case "phase:write-keyslots":
+                        writing = true;
+                        verifying = false;
+                        jobs.phase (job, StorageJobState.RUNNING, "Writing keyslot metadata");
+                        break;
+                    case "phase:verify-keyslots":
+                        verifying = true;
+                        jobs.phase (job, StorageJobState.FINALIZING, "Verifying keyslots and credential on disk");
+                        break;
                     case "phase:verify-restore":
+                        verifying = true;
                         jobs.phase (job, StorageJobState.FINALIZING, "Reading back the restored header");
                         break;
                     default:
@@ -5172,18 +5207,55 @@ namespace MajorisDisks {
             detail = (yield diagnostics.read_line_async ()) ?? "";
             yield process.wait_async ();
             output = result.str.strip ();
-            return process.get_if_exited () ? process.get_exit_status () : -1;
+            if (process.get_if_exited ()) return process.get_exit_status ();
+            if (writing) {
+                detail = verifying ? "The write was synchronized. The worker stopped during readback verification." :
+                    "The worker stopped after announcing a device write. The header may be partially modified.";
+                return -1;
+            }
+            if (operation == "restore" || operation.has_suffix ("-keyslot")) {
+                detail = staged ? "The worker stopped after staging and before starting a device write." :
+                    "The worker stopped before starting a device write.";
+                return 2;
+            }
+            return -1;
+        }
+
+        private static bool pass_luks_credential (SubprocessLauncher launcher, int fd, int target) {
+            if (fd < 0) return true; // The worker will read a selected keyfile.
+            int duplicate = Posix.fcntl (fd, DUPFD_CLOEXEC, 6);
+            if (duplicate < 0) return false;
+            launcher.take_fd (duplicate, target);
+            return true;
+        }
+
+        [CCode (cname = "pipe2", cheader_filename = "unistd.h")]
+        private static extern int credential_pipe_open ([CCode (array_length = false)] int[] fds, int flags);
+
+        internal static int credential_pipe (string text) throws Error {
+            int[] fds = new int[2];
+            if (text.length == 0 || text.length > 4096)
+                throw new IOError.INVALID_ARGUMENT ("A passphrase must contain 1–4096 bytes.");
+            if (credential_pipe_open (fds, Posix.O_CLOEXEC | Posix.O_NONBLOCK) < 0)
+                throw new IOError.FAILED ("Could not prepare a private credential pipe.");
+            ssize_t written = Posix.write (fds[1], text.data, text.length);
+            Posix.close (fds[1]);
+            if (written != text.length) {
+                Posix.close (fds[0]);
+                throw new IOError.FAILED ("Could not transfer the complete credential.");
+            }
+            return fds[0];
         }
 
         internal async LuksHeaderReview review_luks_header (StorageBlock block, string identity,
-            File? backup_file = null, bool advanced = false) throws Error {
+            File? backup_file = null, bool advanced = false, bool list_keyslots = false) throws Error {
             bool restore = backup_file != null;
             string? path = restore ? backup_file.get_path () : "";
             if (path == null) throw new IOError.INVALID_ARGUMENT ("Choose a local backup file.");
             validate_luks_target (block, identity, restore, advanced);
             locks.acquire (block, snapshot.dependencies);
             var lifetime = backend_lifetime;
-            var job = jobs.begin ("Validate LUKS header", block, snapshot.dependencies);
+            var job = jobs.begin (list_keyslots ? "List LUKS keyslots" : "Validate LUKS header", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
             ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
             int fd = -1;
@@ -5199,18 +5271,21 @@ namespace MajorisDisks {
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.RUNNING, "Reading and validating LUKS metadata");
                 string output, detail;
-                int status = yield run_luks_worker (fd, restore ? "preview" : "inspect", path,
-                    luks_source_binding (block), "", block.uuid, advanced, job, out output, out detail);
+                int status = yield run_luks_worker (fd, list_keyslots ? "list-keyslots" : restore ? "preview" : "inspect", path,
+                    luks_source_binding (block), "", block.uuid, advanced, job, -1, -1, "", "", out output, out detail);
                 if (status != 0) throw new IOError.INVALID_DATA (detail != "" ? detail : "The header could not be verified.");
                 validate_luks_target (block, identity, restore, advanced);
                 var lines = output.split ("\n");
                 var fields = lines[0].split (" ");
-                if (lines.length != (restore ? 4 : 2) || fields.length != 8)
+                if ((list_keyslots ? lines.length < 3 : lines.length != (restore ? 5 : 2)) || fields.length != 8)
                     throw new IOError.INVALID_DATA ("The header verifier returned an invalid response.");
                 outcome.successful = true;
                 outcome.summary = "LUKS header validation complete";
-                return new LuksHeaderReview (identity, lines[1], fields[0], fields[1],
-                    restore && lines[2] == "damaged", restore && lines[3] == "checksummed", advanced, path);
+                var review = new LuksHeaderReview (identity, lines[1], fields[0], fields[1],
+                    restore ? lines[2] : "readable", restore ? uint64.parse (lines[4]) : 0,
+                    uint64.parse (fields[2]), restore && lines[3] == "checksummed", advanced, path);
+                if (list_keyslots) review.keyslots = lines[2:lines.length];
+                return review;
             } catch (Error error) {
                 outcome.fail ("Header operation not started", error);
                 throw error;
@@ -5237,6 +5312,8 @@ namespace MajorisDisks {
         internal async StorageOperationResult execute_luks_header (StorageBlock block,
             LuksHeaderReview review, File? destination = null) throws Error {
             bool restore = destination == null;
+            if (restore && review.confidence == "unestablished")
+                throw new IOError.NOT_SUPPORTED ("The backup cannot be linked to this unreadable target. Use offline expert recovery.");
             string? path = restore ? review.file_path : destination.get_path ();
             if (path == null || path == "" || (restore == (review.file_path == "")))
                 throw new IOError.INVALID_ARGUMENT ("Choose a local header backup file.");
@@ -5264,7 +5341,7 @@ namespace MajorisDisks {
                 dispatched = true;
                 string output, detail;
                 int status = yield run_luks_worker (fd, restore ? "restore" : "backup", path,
-                    luks_source_binding (block), review.ticket, block.uuid, review.advanced, job, out output, out detail);
+                    luks_source_binding (block), review.ticket, block.uuid, review.advanced, job, -1, -1, "", "", out output, out detail);
                 Posix.close (fd);
                 fd = -1;
                 if (status != 0) {
@@ -5273,10 +5350,11 @@ namespace MajorisDisks {
                     outcome.successful = true;
                     outcome.summary = restore ? "Header restored and verified. Use credentials from the restored header." :
                         "Verified LUKS header saved to " + path;
-                    if (!restore && output != "recovery")
-                        outcome.summary += "\nDamaged-header recovery information could not be recorded.";
-                    if (!restore && output == "no-xattrs")
-                        outcome.summary += "\nThe destination does not retain the backup checksum as a file attribute.";
+                    if (!restore) {
+                        outcome.summary += "\nCompanion manifest saved to " + path + ".majoris.json";
+                        if (output == "header-only")
+                            outcome.summary += "\nA stable source identity could not be recorded.";
+                    }
                 }
                 if (restore && status != 2) {
                     jobs.phase (job, StorageJobState.FINALIZING, "Refreshing the UDisks device snapshot");
@@ -5317,6 +5395,62 @@ namespace MajorisDisks {
             return outcome;
         }
 
+
+        internal async StorageOperationResult manage_luks_keyslots (StorageBlock block,
+            LuksHeaderReview review, string operation, int slot, int retained,
+            int first, int second, string first_file, string second_file) throws Error {
+            bool write = operation != "identify-keyslot";
+            if (write && !(operation == "add-keyslot" || operation == "change-keyslot" || operation == "remove-keyslot"))
+                throw new IOError.INVALID_ARGUMENT ("Unsupported LUKS credential operation.");
+            if (review.keyslots.length == 0)
+                throw new IOError.INVALID_ARGUMENT ("Review the keyslots before making changes.");
+            validate_luks_target (block, review.identity, write, false);
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin (write ? "Manage LUKS credentials" : "Verify LUKS credential", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            int fd = -1;
+            bool dispatched = false;
+            try {
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.PREPARING, "Checking storage dependencies and authorizing device access");
+                if (write) yield KernelStorageSafety.require_idle (block, job.cancellable);
+                fd = yield open_block (block, write ? "rw" : "r",
+                    Posix.O_CLOEXEC | (write ? Posix.O_EXCL : 0), job.cancellable);
+                if (write) yield KernelStorageSafety.require_idle (block, job.cancellable);
+                validate_luks_target (block, review.identity, write, false);
+                job.cancellable.set_error_if_cancelled ();
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.RUNNING, write ? "Checking credentials and staging keyslots" : "Checking the credential");
+                dispatched = true;
+                string output, detail;
+                int status = yield run_luks_worker (fd, operation, "%d:%d".printf (slot, retained), "",
+                    review.ticket, review.uuid, false, job, first, second, first_file, second_file,
+                    out output, out detail);
+                if (status == 0) {
+                    outcome.successful = true;
+                    outcome.summary = output;
+                } else if (write) {
+                    record_luks_worker_failure (outcome, status, true, detail);
+                } else {
+                    outcome.fail ("Credential verification failed");
+                    outcome.technical_error = detail;
+                }
+            } catch (Error error) {
+                outcome.fail (dispatched && write ? "Keyslot outcome uncertain" : "Keyslot operation not started", error);
+                if (dispatched && write) {
+                    outcome.partial = true;
+                    outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                }
+            } finally {
+                if (fd >= 0) Posix.close (fd);
+                lifetime.disconnect (disconnected);
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
+            return outcome;
+        }
 
         public async void change_passphrase (StorageBlock block, string current_passphrase,
             string new_passphrase, string confirmed_identity) throws Error {

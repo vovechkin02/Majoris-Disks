@@ -7,12 +7,14 @@
 #include <json-glib/json-glib.h>
 #include <libcryptsetup.h>
 #include <linux/fs.h>
+#include <linux/loop.h>
 #include <linux/openat2.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
@@ -23,7 +25,6 @@
  * Cryptsetup operates on private regular files, never on a reopened device path. */
 #define DEVICE 3
 #define LIMIT (136 * 1024 * 1024)
-#define PROOF "user.majoris.luks-source"
 #define CHECKSUM "user.majoris.luks-sha256"
 #define SOURCE_SIZE "user.majoris.luks-source-size"
 
@@ -234,67 +235,110 @@ static gboolean has_other_signature(int fd, guint64 capacity)
     return result != 1;
 }
 
-/* The xattr is a portable-with-xattrs association, not an authentication
- * secret. Match both the device binding and independently sampled ciphertext. */
-static char *source_proof(const char *binding, const char *backup_hash,
-    const Header *header, guint64 capacity)
+/* This binding is evidence of device identity only. Never read ciphertext
+ * for provenance. Loop identity includes the backing inode and byte range. */
+static char *portable_binding(const char *binding)
 {
-    const size_t sample_size = 4096;
-    guint64 span = capacity - header->offset;
-    if (!*binding || span < 16 * sample_size || header->offset % sample_size)
-        return NULL;
-    g_autoptr(GChecksum) sum = g_checksum_new(G_CHECKSUM_SHA256);
-    guint64 sequence;
-    g_autofree char *boot = NULL;
-    if (g_str_has_prefix(binding, "loop:") &&
-        (ioctl(DEVICE, BLKGETDISKSEQ, &sequence) ||
-         !g_file_get_contents("/proc/sys/kernel/random/boot_id", &boot, NULL, NULL)))
-        return NULL;
-    g_autofree char *prefix = g_strdup_printf("majoris-luks-v1:%s:%s:%" G_GUINT64_FORMAT
-        ":%s:%" G_GUINT64_FORMAT, binding, backup_hash, capacity, boot ? boot : "", boot ? sequence : 0);
-    g_checksum_update(sum, (const guchar *) prefix, strlen(prefix));
-    guint8 *sample = NULL;
-    if (posix_memalign((void **) &sample, sample_size, sample_size))
-        return NULL;
-    int flags = fcntl(DEVICE, F_GETFL);
-    if (flags < 0 || fcntl(DEVICE, F_SETFL, flags | O_DIRECT)) {
-        free(sample);
-        return NULL;
-    }
-    guint varied = 0;
-    gboolean readable = TRUE;
-    guint64 last_block = (span - sample_size) / sample_size;
-    for (guint i = 0; i < 8; i++) {
-        guint64 offset = header->offset + (last_block * i / 7) * sample_size;
-        if (!read_at(DEVICE, sample, sample_size, offset)) {
-            readable = FALSE;
-            break;
-        }
-        for (guint j = 1; j < sample_size; j++) {
-            if (sample[j] != sample[0]) {
-                varied++;
-                break;
-            }
-        }
-        g_checksum_update(sum, sample, sample_size);
-    }
-    free(sample);
-    if (fcntl(DEVICE, F_SETFL, flags))
-        return NULL;
-    return readable && varied ? g_strdup(g_checksum_get_string(sum)) : NULL;
+    if (!g_str_has_prefix(binding, "loop:"))
+        return g_strdup(binding);
+    struct loop_info64 loop;
+    if (ioctl(DEVICE, LOOP_GET_STATUS64, &loop) || !loop.lo_inode)
+        return g_strdup("");
+    g_autofree char *identity = g_strdup_printf("%s:%llu:%llu:%llu:%llu", binding,
+        (unsigned long long) loop.lo_device, (unsigned long long) loop.lo_inode,
+        (unsigned long long) loop.lo_offset, (unsigned long long) loop.lo_sizelimit);
+    return g_compute_checksum_for_string(G_CHECKSUM_SHA256, identity, -1);
+}
+
+#define MANIFEST_SUFFIX ".majoris.json"
+#define MANIFEST_LIMIT 8192
+#define MANIFEST_FORMAT "majoris-luks-header-manifest"
+
+static char *manifest_data(const Header *header, const char *hash, const char *binding,
+    guint64 capacity, unsigned logical_sector)
+{
+    /* All strings are fixed identifiers, hexadecimal hashes or validated UUIDs. */
+    return g_strdup_printf(
+        "{\n  \"format\": \"%s\",\n  \"version\": 1,\n"
+        "  \"header_sha256\": \"%s\",\n  \"luks_type\": \"%s\",\n"
+        "  \"luks_uuid\": \"%s\",\n  \"source_capacity_bytes\": %" G_GUINT64_FORMAT ",\n"
+        "  \"data_offset_bytes\": %" G_GUINT64_FORMAT ",\n  \"logical_sector_bytes\": %u,\n"
+        "  \"device_binding\": \"%s\"\n}\n",
+        MANIFEST_FORMAT, hash, crypt_get_type(header->cd), crypt_get_uuid(header->cd),
+        capacity, header->offset, logical_sector, binding);
+}
+
+static gboolean integer_matches(JsonObject *object, const char *name, guint64 expected)
+{
+    JsonNode *node = json_object_get_member(object, name);
+    return node && JSON_NODE_HOLDS_VALUE(node) && json_node_get_value_type(node) == G_TYPE_INT64 &&
+        json_node_get_int(node) >= 0 && (guint64) json_node_get_int(node) == expected;
+}
+
+static gboolean valid_binding(const char *binding)
+{
+    return binding && (!*binding ||
+        (strlen(binding) == 64 && strspn(binding, "0123456789abcdef") == 64));
+}
+
+static void count_manifest_member(JsonParser *parser, JsonObject *object, const char *name, unsigned *count)
+{
+    (void) parser;
+    (void) object;
+    (void) name;
+    (*count)++;
+}
+
+/* 0: absent, -1: invalid/incompatible, 1: structurally valid, 2: identity match. */
+static int read_manifest(int directory, const char *name, const Header *header,
+    const char *hash, const char *binding, guint64 capacity, unsigned logical_sector,
+    char **manifest_hash)
+{
+    auto_fd fd = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    struct stat st;
+    char buffer[MANIFEST_LIMIT];
+    unsigned members = 0;
+    g_autoptr(JsonParser) parser = json_parser_new ();
+    g_signal_connect(parser, "object-member", G_CALLBACK(count_manifest_member), &members);
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > sizeof buffer || !read_at(fd, buffer, st.st_size, 0) ||
+        memchr(buffer, 0, st.st_size) || !json_parser_load_from_data(parser, buffer, st.st_size, NULL))
+        return -1;
+    JsonNode *root = json_parser_get_root(parser);
+    JsonObject *object = root && JSON_NODE_HOLDS_OBJECT(root) ? json_node_get_object(root) : NULL;
+    if (!object || members != 9 || json_object_get_size(object) != 9 ||
+        g_strcmp0(string_member(object, "format"), MANIFEST_FORMAT) ||
+        !integer_matches(object, "version", 1) ||
+        g_strcmp0(string_member(object, "header_sha256"), hash) ||
+        g_strcmp0(string_member(object, "luks_type"), crypt_get_type(header->cd)) ||
+        g_strcmp0(string_member(object, "luks_uuid"), crypt_get_uuid(header->cd)) ||
+        !integer_matches(object, "source_capacity_bytes", capacity) ||
+        !integer_matches(object, "data_offset_bytes", header->offset) ||
+        !integer_matches(object, "logical_sector_bytes", logical_sector))
+        return -1;
+    const char *saved = string_member(object, "device_binding");
+    if (!valid_binding(saved))
+        return -1;
+    *manifest_hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar *) buffer, st.st_size);
+    return *saved && !strcmp(saved, binding) ? 2 : 1;
 }
 
 static int create_backup(const char *destination, const char *binding, const Header *source,
-    int snapshot, guint64 capacity)
+    int snapshot, guint64 capacity, unsigned logical_sector)
 {
     g_autofree char *parent = g_path_get_dirname(destination);
     g_autofree char *name = g_path_get_basename(destination);
+    g_autofree char *manifest_name = g_strconcat(name, MANIFEST_SUFFIX, NULL);
     auto_fd directory = open_path(parent, O_DIRECTORY | O_RDONLY);
     struct stat existing, original_directory;
     if (directory < 0 || fstat(directory, &original_directory) || !strcmp(name, ".") || !strcmp(name, ".."))
         return fail(2, "Choose a local backup directory without symbolic links.");
     if (fstatat(directory, name, &existing, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
         return fail(2, "The backup destination already exists or cannot be checked.");
+    if (fstatat(directory, manifest_name, &existing, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+        return fail(2, "The companion manifest already exists or cannot be checked.");
     struct statvfs space;
     if (fstatvfs(directory, &space) || space.f_bavail < (source->extent + 4095 + MAX(space.f_frsize, 1) - 1) / MAX(space.f_frsize, 1))
         return fail(2, "The destination has insufficient or unknown free space.");
@@ -329,14 +373,15 @@ static int create_backup(const char *destination, const char *binding, const Hea
     g_autofree char *after = checksum(DEVICE, source->extent);
     if (!expected || g_strcmp0(expected, actual) || !before || g_strcmp0(before, after))
         return fail(2, "The source or backup changed during verification.");
-    g_autofree char *proof = source_proof(binding, actual, source, capacity);
-    g_autofree char *size = g_strdup_printf("%" G_GUINT64_FORMAT, capacity);
-    gboolean checksummed = fsetxattr(output, CHECKSUM, actual, strlen(actual), XATTR_CREATE) == 0;
-    if (checksummed && fsetxattr(output, SOURCE_SIZE, size, strlen(size), XATTR_CREATE))
-        return fail(2, "Could not record the original device capacity.");
-    gboolean recovery = checksummed && proof && fsetxattr(output, PROOF, proof, strlen(proof), XATTR_CREATE) == 0;
-    if (fsync(output))
-        return fail(2, "Could not synchronize the verified backup file.");
+    g_autofree char *manifest = manifest_data(source, actual, binding, capacity, logical_sector);
+    auto_fd metadata = openat(directory, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+    size_t manifest_size = strlen(manifest);
+    g_autofree char *verified_manifest = g_malloc(manifest_size);
+    if (metadata < 0 || fchmod(metadata, 0600) ||
+        TEMP_FAILURE_RETRY(write(metadata, manifest, manifest_size)) != (ssize_t) manifest_size ||
+        !read_at(metadata, verified_manifest, manifest_size, 0) ||
+        memcmp(manifest, verified_manifest, manifest_size) || fsync(metadata) || fsync(output))
+        return fail(2, "Could not write, verify and synchronize both backup files.");
     auto_fd current_directory = open_path(parent, O_DIRECTORY | O_RDONLY);
     if (current_directory < 0 || fstat(current_directory, &existing) ||
         original_directory.st_dev != existing.st_dev || original_directory.st_ino != existing.st_ino)
@@ -346,7 +391,228 @@ static int create_backup(const char *destination, const char *binding, const Hea
         return fail(2, "Could not publish the verified backup without overwriting a file.");
     if (fsync(directory))
         return fail(3, "The verified file was published, but directory durability could not be confirmed.");
-    puts(recovery ? "recovery" : checksummed ? "header-only" : "no-xattrs");
+    g_autofree char *metadata_path = fd_path(metadata);
+    if (linkat(AT_FDCWD, metadata_path, directory, manifest_name, AT_SYMLINK_FOLLOW))
+        return fail(3, "The raw header is durable, but the companion manifest could not be published.");
+    if (fsync(directory))
+        return fail(3, "The raw header is durable, but manifest durability could not be confirmed.");
+    puts(*binding ? "device-identity" : "header-only");
+    return 0;
+}
+
+#define KEYFILE_LIMIT (1024 * 1024)
+#define PASSPHRASE_LIMIT 4096
+
+typedef struct {
+    char *data;
+    size_t size;
+    size_t allocated;
+} Secret;
+
+static void secret_clear(Secret *secret)
+{
+    if (secret->data)
+        explicit_bzero(secret->data, secret->allocated);
+    g_free(secret->data);
+}
+
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(Secret, secret_clear)
+
+/* Passphrase pipes have exactly one writer and close at the end of the
+ * credential. Keyfiles are read as binary, including embedded NUL bytes. */
+static gboolean read_secret(Secret *secret, int pipe_fd, const char *path)
+{
+    auto_fd file = -1;
+    size_t limit = PASSPHRASE_LIMIT;
+    if (*path) {
+        file = open_path(path, O_RDONLY | O_NONBLOCK);
+        struct stat st;
+        if (file < 0 || fstat(file, &st) || !S_ISREG(st.st_mode) ||
+            st.st_size <= 0 || st.st_size > KEYFILE_LIMIT)
+            return FALSE;
+        limit = st.st_size;
+        pipe_fd = file;
+    }
+    secret->allocated = limit + 1;
+    secret->data = g_malloc(secret->allocated);
+    while (secret->size <= limit) {
+        ssize_t count = TEMP_FAILURE_RETRY(read(pipe_fd, secret->data + secret->size,
+            secret->allocated - secret->size));
+        if (count < 0)
+            return FALSE;
+        if (!count)
+            return secret->size && (file < 0 || secret->size == limit);
+        secret->size += count;
+    }
+    return FALSE;
+}
+
+static gboolean usable_slot(struct crypt_device *cd, int slot)
+{
+    crypt_keyslot_info state = crypt_keyslot_status(cd, slot);
+    return state == CRYPT_SLOT_ACTIVE || state == CRYPT_SLOT_ACTIVE_LAST;
+}
+
+static gboolean token_bound(struct crypt_device *cd, int slot)
+{
+    for (int token = 0; token < crypt_token_max(crypt_get_type(cd)); token++) {
+        if (crypt_token_is_assigned(cd, token, slot) != -ENOENT)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void list_slots(const Header *header, const char *identity)
+{
+    struct crypt_device *cd = header->cd;
+    const char *type = crypt_get_type(cd);
+    int slots = crypt_keyslot_max(type);
+    printf("%s\n%s\n", header->description, identity);
+    for (int slot = 0; slot < slots; slot++) {
+        crypt_keyslot_info status = crypt_keyslot_status(cd, slot);
+        const char *state = usable_slot(cd, slot) ? "active" :
+            status == CRYPT_SLOT_INACTIVE ? "inactive" :
+            status == CRYPT_SLOT_UNBOUND ? "unbound" : "unsupported";
+        const char *priority = "unavailable";
+        if (!strcmp(type, CRYPT_LUKS2) && usable_slot(cd, slot)) {
+            switch (crypt_keyslot_get_priority(cd, slot)) {
+                case CRYPT_SLOT_PRIORITY_IGNORE: priority = "ignore"; break;
+                case CRYPT_SLOT_PRIORITY_NORMAL: priority = "normal"; break;
+                case CRYPT_SLOT_PRIORITY_PREFER: priority = "prefer"; break;
+                default: break;
+            }
+        }
+        printf("slot %d %s %s %d\n", slot, state, priority, token_bound(cd, slot));
+    }
+    for (int token = 0; token < crypt_token_max(type); token++) {
+        const char *name = NULL;
+        crypt_token_info status = crypt_token_status(cd, token, &name);
+        if (status == CRYPT_TOKEN_INVALID || status == CRYPT_TOKEN_INACTIVE)
+            continue;
+        /* Treat token types as untrusted metadata and never emit token JSON. */
+        g_autofree char *label = g_strndup(name ? name : "", 128);
+        g_strcanon(label, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-", '?');
+        gboolean known = status == CRYPT_TOKEN_INTERNAL || !strcmp(label, "systemd-tpm2") ||
+            !strcmp(label, "systemd-fido2") || !strcmp(label, "systemd-pkcs11") || !strcmp(label, "clevis");
+        printf("token %d %s %s", token, *label ? label : "unknown", known ? "recognised" : "unsupported");
+        for (int slot = 0; slot < slots; slot++) {
+            if (!crypt_token_is_assigned(cd, token, slot))
+                printf(" %d", slot);
+        }
+        putchar('\n');
+    }
+}
+
+static int verify_secret(struct crypt_device *cd, int slot, const Secret *secret)
+{
+    return crypt_activate_by_passphrase(cd, NULL, slot, secret->data, secret->size, 0);
+}
+
+static int commit_slots(int snapshot, const Header *live, const char *before,
+    int removed, int remaining, const Secret *secret, const gboolean *slots)
+{
+    g_autofree char *staged = checksum(snapshot, live->extent);
+    g_autofree char *current = checksum(DEVICE, live->extent);
+    if (!staged || g_strcmp0(current, before))
+        return 2;
+    puts("phase:staged");
+    if (puts("phase:write-keyslots") == EOF || fflush(stdout))
+        return 2;
+    if (!transfer(snapshot, DEVICE, live->extent, NULL) || fsync(DEVICE))
+        return 3;
+    puts("phase:verify-keyslots");
+    auto_fd readback = memfd_create("majoris-luks-readback", MFD_CLOEXEC);
+    g_auto(Header) verified = {0};
+    struct stat st;
+    if (readback < 0 || fstat(snapshot, &st) || ftruncate(readback, st.st_size) ||
+        !transfer(DEVICE, readback, live->extent, NULL))
+        return 3;
+    g_autofree char *written = checksum(readback, live->extent);
+    if (g_strcmp0(written, staged) || load_header(readback, &verified) != 1 ||
+        strcmp(verified.description, live->description) || verified.extent != live->extent ||
+        verify_secret(verified.cd, remaining, secret) != remaining)
+        return 3;
+    if (removed >= 0 && crypt_keyslot_status(verified.cd, removed) != CRYPT_SLOT_INACTIVE)
+        return 3;
+    for (int slot = 0; slot < crypt_keyslot_max(crypt_get_type(verified.cd)); slot++) {
+        if (slot != removed && slots[slot] && !usable_slot(verified.cd, slot))
+            return 3;
+    }
+    return 0;
+}
+
+static int modify_slots(int snapshot, Header *live, const char *operation, const char *selection,
+    const char *before, const char *first_file, const char *second_file)
+{
+    struct crypt_device *cd = live->cd;
+    const char *type = crypt_get_type(cd);
+    int count = crypt_keyslot_max(type);
+    gboolean replace = !strcmp(operation, "change-keyslot");
+    gboolean remove = !strcmp(operation, "remove-keyslot");
+    gboolean add = !replace && !remove;
+    int selected, retained;
+    char suffix;
+    if (sscanf(selection, "%d:%d%c", &selected, &retained, &suffix) != 2 ||
+        selected < CRYPT_ANY_SLOT || selected >= count || retained < CRYPT_ANY_SLOT || retained >= count ||
+        (!add && (selected < 0 || !usable_slot(cd, selected) || token_bound(cd, selected))) ||
+        (remove && (retained < 0 || retained == selected || !usable_slot(cd, retained) ||
+         (!strcmp(type, CRYPT_LUKS2) && crypt_keyslot_get_priority(cd, retained) == CRYPT_SLOT_PRIORITY_IGNORE))))
+        return fail(2, "Choose eligible keyslots. Token-associated slots require their own management tools.");
+
+    g_autofree gboolean *active = g_new(gboolean, count);
+    int free_slot = -1;
+    for (int slot = 0; slot < count; slot++) {
+        active[slot] = usable_slot(cd, slot);
+        if (free_slot < 0 && crypt_keyslot_status(cd, slot) == CRYPT_SLOT_INACTIVE)
+            free_slot = slot;
+    }
+    if (!remove && free_slot < 0)
+        return fail(2, "A free keyslot is required to verify a new credential before replacing an existing one.");
+    g_auto(Secret) current = {0}, other = {0};
+    if (!read_secret(&current, 4, first_file) || !read_secret(&other, 5, second_file))
+        return fail(2, "A credential was missing, unreadable or exceeded the supported size.");
+    if (!remove && current.size == other.size && !memcmp(current.data, other.data, current.size))
+        return fail(2, "Choose a new credential different from the current credential.");
+    int authorizing = verify_secret(cd, selected, &current);
+    if (authorizing < 0 || !usable_slot(cd, authorizing))
+        return fail(2, "The current credential did not unlock the requested keyslot.");
+
+    g_autofree char *after_add = NULL;
+    if (!remove) {
+        int new_slot = crypt_keyslot_add_by_passphrase(cd, free_slot, current.data, current.size,
+            other.data, other.size);
+        if (new_slot != free_slot || verify_secret(cd, new_slot, &other) != new_slot)
+            return fail(2, "The new credential could not be staged and verified. The device was not written.");
+        if (replace && !strcmp(type, CRYPT_LUKS2)) {
+            crypt_keyslot_priority priority = crypt_keyslot_get_priority(cd, selected);
+            if (priority == CRYPT_SLOT_PRIORITY_INVALID || crypt_keyslot_set_priority(cd, new_slot, priority) < 0)
+                return fail(2, "The replacement keyslot priority could not be preserved.");
+        }
+        after_add = checksum(snapshot, live->extent);
+        int result = after_add ? commit_slots(snapshot, live, before, -1, new_slot, &other, active) : 2;
+        if (result)
+            return fail(result, result == 2 ? "The live header changed before writing." :
+                "The new credential write was attempted but could not be verified. Refresh the keyslots.");
+        if (!replace) {
+            printf("Added and verified keyslot %d.\n", new_slot);
+            return 0;
+        }
+        active[new_slot] = TRUE;
+        retained = new_slot;
+    } else if (verify_secret(cd, retained, &other) != retained) {
+        return fail(2, "The remaining credential must unlock a different active keyslot.");
+    }
+
+    if (crypt_keyslot_destroy(cd, selected) < 0 || verify_secret(cd, retained, &other) != retained)
+        return fail(replace ? 3 : 2, replace ?
+            "The new credential was verified on disk. Removing the original could not be staged." :
+            "Removal could not be staged while preserving the remaining credential.");
+    int result = commit_slots(snapshot, live, replace ? after_add : before, selected, retained, &other, active);
+    if (result)
+        return fail(replace ? 3 : result, result == 2 ?
+            "The live header changed before removal. Refresh the keyslots." :
+            "A removal write was attempted but could not be verified. Refresh the keyslots.");
+    printf("Removed keyslot %d and verified remaining keyslot %d.\n", selected, retained);
     return 0;
 }
 
@@ -356,16 +622,22 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, NULL, _IOLBF, 0);
     crypt_set_log_callback(NULL, quiet, NULL);
-    if (argc != 7)
+    crypt_token_external_disable();
+    if (argc != 7 && argc != 9)
         return fail(2, "Invalid header worker request.");
-    const char *operation = argv[1], *path = argv[2], *binding = argv[3];
+    const char *operation = argv[1], *path = argv[2];
     const char *expected = argv[4], *expected_uuid = argv[5];
     gboolean advanced = !strcmp(argv[6], "advanced");
     gboolean restore = !strcmp(operation, "restore");
     gboolean inspect = !strcmp(operation, "inspect");
     gboolean backup = !strcmp(operation, "backup");
     gboolean preview = !strcmp(operation, "preview");
-    if (!(restore || inspect || backup || preview))
+    gboolean slots = !strcmp(operation, "list-keyslots");
+    gboolean mutation = !strcmp(operation, "add-keyslot") || !strcmp(operation, "change-keyslot") ||
+        !strcmp(operation, "remove-keyslot");
+    gboolean identify = !strcmp(operation, "identify-keyslot");
+    if (!(restore || inspect || backup || preview || slots || mutation || identify) ||
+        ((mutation || identify) ? argc != 9 : argc != 7) || ((slots || mutation || identify) && advanced))
         return fail(2, "Unsupported header worker operation.");
     struct stat device;
     guint64 capacity, sequence;
@@ -376,6 +648,9 @@ int main(int argc, char **argv)
         !sequence || capacity > G_MAXINT64 || capacity < 4096)
         return fail(2, "The block device size or kernel identity could not be verified.");
 
+    g_autofree char *binding = portable_binding(argv[3]);
+    if (!valid_binding(binding))
+        return fail(2, "Invalid device binding.");
     guint64 scanned = MIN(capacity, LIMIT);
     auto_fd snapshot = memfd_create("majoris-luks-device", MFD_CLOEXEC);
     if (snapshot < 0 || ftruncate(snapshot, capacity) || !transfer(DEVICE, snapshot, scanned, NULL))
@@ -391,12 +666,34 @@ int main(int argc, char **argv)
             return fail(2, "The live LUKS UUID does not match the selected volume.");
     }
 
-    guint64 checked = state == 1 ? live.extent : scanned;
+    guint64 checked = state == 1 ? live.extent : 0;
     g_autofree char *observed = checksum(snapshot, checked);
     if (!observed)
         return fail(2, "The device metadata fingerprint could not be calculated.");
     g_autofree char *identity = g_strdup_printf("%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT ":%s",
         sequence, capacity, observed);
+    if (slots) {
+        list_slots(&live, identity);
+        return 0;
+    }
+    if (identify || mutation) {
+        if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0))
+            return fail(2, "Could not protect the credential worker from process dumps.");
+        int flags = fcntl(DEVICE, F_GETFL);
+        if (flags < 0 || (mutation && (flags & O_ACCMODE) != O_RDWR) || strcmp(identity, expected))
+            return fail(2, "The selected device or keyslots changed after confirmation.");
+        if (identify) {
+            g_auto(Secret) credential = {0};
+            if (!read_secret(&credential, 4, argv[7]))
+                return fail(2, "The credential was missing, unreadable or exceeded the supported size.");
+            int slot = verify_secret(live.cd, CRYPT_ANY_SLOT, &credential);
+            if (slot < 0 || !usable_slot(live.cd, slot))
+                return fail(2, "The credential did not unlock an active keyslot with normal unlocking priority.");
+            printf("The credential unlocked keyslot %d.\n", slot);
+            return 0;
+        }
+        return modify_slots(snapshot, &live, operation, path, observed, argv[7], argv[8]);
+    }
     if (inspect) {
         printf("%s\n%s\n", live.description, identity);
         return 0;
@@ -404,10 +701,15 @@ int main(int argc, char **argv)
     if (backup) {
         if (strcmp(identity, expected))
             return fail(2, "The selected device or its header changed after confirmation.");
-        return create_backup(path, binding, &live, snapshot, capacity);
+        return create_backup(path, binding, &live, snapshot, capacity, logical_sector);
     }
 
-    auto_fd input = open_path(path, O_RDONLY | O_NONBLOCK);
+    g_autofree char *parent = g_path_get_dirname(path);
+    g_autofree char *name = g_path_get_basename(path);
+    g_autofree char *manifest_name = g_strconcat(name, MANIFEST_SUFFIX, NULL);
+    auto_fd directory = open_path(parent, O_DIRECTORY | O_RDONLY);
+    auto_fd input = directory < 0 ? -1 :
+        openat(directory, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     struct stat st;
     if (input < 0 || fstat(input, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > LIMIT)
         return fail(2, "Select a complete local LUKS backup file without symbolic links.");
@@ -437,21 +739,34 @@ int main(int argc, char **argv)
             memcmp(saved_size, actual_size, size_length))) ||
         (size_length < 0 && errno != ENODATA && errno != ENOTSUP))
         return fail(2, "The target capacity does not match the original device size.");
-    if (state == 0) {
-        char proof[65] = {0};
-        g_autofree char *actual = source_proof(binding, backup_hash, &saved, capacity);
-        if (!actual || fgetxattr(input, PROOF, proof, sizeof proof) != 64 || strcmp(actual, proof) ||
-            has_other_signature(DEVICE, capacity))
-            return fail(2, "The unreadable target cannot be linked to this backup, or it contains another storage signature.");
+    g_autofree char *manifest_hash = NULL;
+    int provenance = read_manifest(directory, manifest_name, &saved, backup_hash,
+        binding, capacity, logical_sector, &manifest_hash);
+    if (provenance < 0)
+        return fail(2, "The companion manifest is invalid or incompatible with the backup and target.");
+    if (!state && has_other_signature(DEVICE, capacity))
+        return fail(2, "The unreadable target contains a conflicting storage signature or could not be probed.");
+    if (!state) {
+        checked = saved.extent;
+        g_free(observed);
+        observed = checksum(snapshot, checked);
+        if (!observed)
+            return fail(2, "The damaged metadata could not be checksummed.");
+        g_free(identity);
+        identity = g_strdup_printf("%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT ":%s",
+            sequence, capacity, observed);
     }
-    g_autofree char *ticket = g_strdup_printf("%s:%s:%d:%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT ":%" G_GINT64_FORMAT ":%ld",
-        identity, backup_hash, state, (guint64) st.st_dev, (guint64) st.st_ino,
-        (gint64) st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+    const char *confidence = state ? "readable" : provenance == 2 ? "device-identity" : "unestablished";
+    g_autofree char *ticket = g_strdup_printf("%s:%s:%s:%s", identity, backup_hash,
+        manifest_hash ? manifest_hash : "-", confidence);
     if (preview) {
-        printf("%s\n%s\n%s\n%s\n", saved.description, ticket,
-            state ? "readable" : "damaged", hash_size == 64 ? "checksummed" : "structure-only");
+        printf("%s\n%s\n%s\n%s\n%" G_GINT64_FORMAT "\n", saved.description, ticket,
+            confidence, provenance || hash_size == 64 ? "checksummed" : "structure-only",
+            (gint64) st.st_size);
         return 0;
     }
+    if (!state && provenance != 2)
+        return fail(2, "The backup cannot be linked to this unreadable target. Use offline expert recovery.");
     if (strcmp(ticket, expected))
         return fail(2, "The target or backup changed after confirmation.");
 
@@ -469,7 +784,9 @@ int main(int argc, char **argv)
     if (!staged || g_strcmp0(staged, original_backup) || !current ||
         strcmp(current, observed))
         return fail(2, "The staged header or the current target failed verification before writing.");
-    puts("phase:write-header");
+    puts("phase:staged");
+    if (puts("phase:write-header") == EOF || fflush(stdout))
+        return fail(2, "Could not report write initiation. The target was not modified.");
     if (!transfer(snapshot, DEVICE, saved.extent, NULL) || fsync(DEVICE))
         return fail(3, "A header write was attempted and could not be synchronized. The target may be partially modified.");
     puts("phase:verify-restore");

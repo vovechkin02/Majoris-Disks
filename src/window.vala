@@ -137,6 +137,7 @@ namespace MajorisDisks {
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
+            drive_view.luks_keyslots_requested.connect ((block) => manage_luks_credentials.begin (block));
             drive_view.luks_header_requested.connect ((block, restore, advanced) =>
                 show_luks_header.begin (block, restore, advanced));
             drive_view.encryption_options_requested.connect (edit_encryption_options);
@@ -871,11 +872,22 @@ namespace MajorisDisks {
                     review.version, review.uuid);
                 File? destination = null;
                 if (restore) {
+                    if (block.partition != null && block.partition.uuid != "")
+                        details += "\nPartition UUID " + block.partition.uuid;
+                    details += "\nHeader size %s · Data offset %s".printf (
+                        format_size (review.header_size), format_size (review.data_offset));
+                    if (review.confidence == "unestablished") {
+                        show_check_message ("Source Identity Cannot Be Established", details +
+                            "\n\nThe current header is unreadable. The backup has a supported structure, " +
+                            "but its source cannot be established from the companion manifest. " +
+                            "Use offline expert recovery.");
+                        return;
+                    }
                     string confirmation = advanced ? device + " " + review.uuid : device;
                     var dialog = new LuksHeaderRestoreDialog (confirmation, advanced);
                     dialog.body = details + "\n" + source.get_parse_name () + "\n\n" +
-                        (review.damaged ? "The current header is unreadable. Recovery evidence matches this target." :
-                            "The current header is readable and its critical metadata matches.") + "\n\n" + dialog.body;
+                        (review.damaged ? "Device-identity-supported recovery. The current header is unreadable. The recorded source identity matches this device. This does not establish that the backup decrypts its data." :
+                            "Matching readable header. The LUKS UUID, layout and volume-key digest match.") + "\n\n" + dialog.body;
                     if (!review.checksummed)
                         dialog.body += "\n\nThis file has no saved checksum. Majoris verified its structure and layout, " +
                             "but could not independently check the keyslot bytes for corruption.";
@@ -901,7 +913,55 @@ namespace MajorisDisks {
             }
         }
 
+        private async void manage_luks_credentials (StorageBlock block) {
+            if (pending.contains (block.path)) return;
+            pending.insert (block.path, block);
+            try {
+                while (true) {
+                    var review = yield backend.review_luks_header (block, backend.modification_identity (block),
+                        null, false, true);
+                    bool writable = true;
+                    try { UDisksService.require_luks_restore_idle (block, backend.snapshot.dependencies); }
+                    catch (Error error) { writable = false; }
+                    var manager = new LuksKeyslotsDialog (review, writable);
+                    string action = yield manager.choose (this, null);
+                    if (action == "close") return;
+                    var dialog = new LuksCredentialDialog (action, manager.selected_slot,
+                        manager.remaining_slots (), block.encryption_configurations.length > 0, this);
+                    int first = -1;
+                    int second = -1;
+                    try {
+                        if ((yield dialog.choose (this, null)) != "apply") continue;
+                        first = dialog.take_credential (true);
+                        if (action != "identify") second = dialog.take_credential (false);
+                        var result = yield backend.manage_luks_keyslots (block, review, action + "-keyslot",
+                            action == "add" ? -1 : manager.selected_slot, dialog.retained_slot,
+                            first, second, dialog.current_file, dialog.other_file);
+                        var message = new Adw.AlertDialog (
+                            result.successful ? (action == "identify" ? "LUKS Credential Verified" : "LUKS Credentials Updated") :
+                                "LUKS Credential Operation",
+                            result.summary + (result.technical_error == "" ? "" : "\n\n" + result.technical_error));
+                        message.add_response ("close", "Close");
+                        message.close_response = "close";
+                        yield message.choose (this, null);
+                    } finally {
+                        dialog.clear_credentials ();
+                        if (first >= 0) Posix.close (first);
+                        if (second >= 0) Posix.close (second);
+                    }
+                }
+            } catch (Error error) {
+                show_check_message ("LUKS Credential Manager", operation_error (error));
+            } finally {
+                pending.remove (block.path);
+            }
+        }
+
         private void change_passphrase (StorageBlock block) {
+            if (UDisksService.luks_header_available () && UDisksService.is_luks_header_candidate (block)) {
+                manage_luks_credentials.begin (block);
+                return;
+            }
             if (pending.contains (block.path)) return;
             string identity = backend.modification_identity (block);
             var dialog = new ChangePassphraseDialog (block);
