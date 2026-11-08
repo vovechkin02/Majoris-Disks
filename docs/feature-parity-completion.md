@@ -149,3 +149,15 @@ On Debian 13.5, `meson compile -C build/feature-closure` and a staged `meson ins
 ## Platform scope
 
 Use mount paths and fstab for persistent volume assignment, LVM/mdraid for Linux storage sets, Btrfs/LVM snapshots for Linux snapshot workflows, and LUKS for Linux encryption. Native drive letters, LDM, BitLocker management, APFS/FileVault and proprietary DMG/sparsebundle formats are excluded.
+
+## Partition resize and ATA settings follow-up
+
+| Register ID | Implementation | Verification | Final result |
+|---|---|---|---|
+| FS-02, FS-03 | The partition resize planner rejects XFS shrink and fails closed when a filesystem minimum cannot be measured. The operation refreshes the shrink minimum after preparation and revalidates device identity, geometry and mount state. Offline shrink of an already unmounted ext or NTFS filesystem still requires a check. The dialog keeps submission disabled at the current size and distinguishes unmounted, online and partition-only work. | `storage-model` exercises the planner's online and offline paths, including XFS rejection. `ui-templates` instantiates the dialog. | Partial. Growth and shrink with live UDisks and data-integrity checks remain open, as do layered LUKS/LVM paths. |
+| FS-02, FS-03, FS-05 | The online shrink path retains the holder check and resizes the filesystem before the partition. Btrfs is gated on a mounted single-device filesystem, rejects missing members and ambiguous paths, and reads raw member capacity before changing the partition boundary and again during final verification. The service requires the requested partition size to appear in UDisks before advancing. | `storage-model` covers raw member capacity, similarly named paths, missing members and multiple device rows. | Partial. Live Btrfs resize and device geometry verification remain open. |
+| ATA settings | The standby, APM and AAM subtitles now pass formatted strings to GTK while those strings are still allocated. | GDB traced an invalid UTF-8 warning to an early free in the Vala-generated C. `G_DEBUG=fatal-warnings xvfb-run -a build/resize-closure/ui-template-test` passed after the fix. | UI smoke passed. Applying settings to real ATA hardware remains unverified. |
+
+The online shrink branch adapts the sequencing of `online_resize_no_repair` from GNOME Disks' `gdu-resize-volume-dialog.c`, copyright © 2017 Kai Lüke, GPL-2.0-or-later. Btrfs reports filesystem device capacity separately from the containing block device capacity. [Btrfs filesystem manual](https://btrfs.readthedocs.io/en/stable/btrfs-filesystem.html)
+
+Debian 13.5 WSL passed `meson setup build/resize-closure`, `meson compile -C build/resize-closure` and the staged install. The schema post-install hook was skipped under `DESTDIR`. `meson test -C build/resize-closure --print-errorlogs` passed six tests, skipped nine and reported zero failures. The six passing tests were `storage-model`, `ui-templates`, `native-xz`, `nbd-helper`, `btrfs-default-helper` and `filesystem-capacity-integration` in file-backed mode. The eight opt-in live tests and `virtual-image-growth` skipped. No physical-disk operations or live destructive resize tests ran.

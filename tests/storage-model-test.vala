@@ -422,7 +422,16 @@ private void test_resize_planner_safety () {
     FilesystemCapability capability = {}; capability.supported = true;
     capability.modes = FilesystemResizeMode.OFFLINE_SHRINK | FilesystemResizeMode.OFFLINE_GROW;
     var safe = FilesystemResizePlanner.build (block, 800, true, capability, 700, 2000);
-    assert (safe.supported && safe.direction == ResizeDirection.SHRINK && safe.requires_unmount && safe.requires_check);
+    assert (safe.supported && safe.direction == ResizeDirection.SHRINK && !safe.requires_unmount && safe.requires_check);
+    block.filesystem.mounts = { "/mnt/test" };
+    var offline = FilesystemResizePlanner.build (block, 800, true, capability, 700, 2000);
+    assert (offline.supported && offline.requires_unmount && offline.requires_check);
+    capability.modes |= FilesystemResizeMode.ONLINE_SHRINK;
+    var online = FilesystemResizePlanner.build (block, 800, true, capability, 700, 2000);
+    assert (online.supported && online.online && !online.requires_unmount && !online.requires_check);
+    block.type_id = "xfs";
+    assert (!FilesystemResizePlanner.build (block, 800, true, capability, 700, 2000).supported);
+    block.type_id = "ext4";
     assert (!FilesystemResizePlanner.build (block, 600, true, capability, 700, 2000).supported);
     assert (!FilesystemResizePlanner.build (block, 800, false, capability, 0, 2000).supported);
     block.filesystem = null; block.type_id = ""; block.usage = "";
@@ -537,10 +546,14 @@ private void test_minimum_size_parsers () {
     } catch (Error error) { assert_not_reached (); }
     try { FilesystemMinimumSizeService.parse_first_number ("not available"); assert_not_reached (); }
     catch (Error error) { assert (error is IOError.INVALID_DATA); }
-    assert (FilesystemMinimumSizeService.btrfs_single_device (
-        "devid    1 size 1 path /dev/test1", "/dev/test1"));
-    assert (!FilesystemMinimumSizeService.btrfs_single_device (
-        "devid 1 path /dev/test1\ndevid 2 path /dev/test2", "/dev/test1"));
+    assert (FilesystemMinimumSizeService.single_btrfs_capacity (
+        "Total devices 1 FS bytes used 123\n\tdevid    1 size 4096 used 1024 path /dev/test1", "/dev/test1") == 4096);
+    assert (FilesystemMinimumSizeService.single_btrfs_capacity (
+        "Total devices 1 FS bytes used 123\ndevid 1 size 4096 path /dev/test10", "/dev/test1") == 0);
+    assert (FilesystemMinimumSizeService.single_btrfs_capacity (
+        "Total devices 2 FS bytes used 123\ndevid 1 size 4096 path /dev/test1\n*** Some devices missing", "/dev/test1") == 0);
+    assert (FilesystemMinimumSizeService.single_btrfs_capacity (
+        "Total devices 1 FS bytes used 123\ndevid 1 size 4096 path /dev/test1\ndevid 2 size 4096 path /dev/test2", "/dev/test1") == 0);
 }
 
 private void test_preparation_journal () {

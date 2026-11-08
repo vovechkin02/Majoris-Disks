@@ -3917,7 +3917,7 @@ namespace MajorisDisks {
         }
 
         public async FilesystemResizePlan resize_plan (StorageBlock block, uint64 requested,
-            bool resize_filesystem) throws Error {
+            bool resize_filesystem, bool refresh_minimum = false) throws Error {
             var part = block.partition;
             var disk = part == null ? null : snapshot.blocks.lookup (part.table_path);
             if (disk == null) throw new IOError.NOT_SUPPORTED ("Only a partition can be resized.");
@@ -3929,10 +3929,16 @@ namespace MajorisDisks {
             if (resize_filesystem && block.filesystem != null) {
                 capability = FilesystemCapabilityService.decode (
                     yield query_filesystem_capability ("CanResize", block.type_id), true);
+                if (capability.supported && block.type_id.down () == "btrfs")
+                    yield FilesystemMinimumSizeService.query_single_btrfs_capacity (block, backend_lifetime);
                 if (requested < block.size && capability.supported &&
                     (capability.offline_shrink || capability.online_shrink)) {
-                    try { minimum = uint64.max (minimum, yield minimum_sizes.query (block, backend_lifetime)); }
-                    catch (Error error) { minimum_error = error; }
+                    try {
+                        minimum = uint64.max (minimum, yield minimum_sizes.query (block, backend_lifetime, refresh_minimum));
+                    } catch (Error error) {
+                        minimum = 0;
+                        minimum_error = error;
+                    }
                 } else minimum = block.size;
             }
             var plan = FilesystemResizePlanner.build (block, requested, resize_filesystem,
@@ -3966,12 +3972,11 @@ namespace MajorisDisks {
             throw new IOError.TIMED_OUT ("UDisks did not publish the new partition in time.");
         }
 
-        private async void wait_for_size (StorageBlock block, uint64 expected, bool at_least,
+        private async void wait_for_size (StorageBlock block, uint64 expected,
             Cancellable token) throws Error {
             for (int attempt = 0; attempt < 100; attempt++) {
                 synchronize ();
-                if (snapshot.blocks.lookup (block.path) == block &&
-                    (at_least ? block.size >= expected : block.size <= expected)) return;
+                if (snapshot.blocks.lookup (block.path) == block && block.size == expected) return;
                 yield settle_delay (token);
             }
             throw new IOError.TIMED_OUT ("The updated partition geometry was not published in time.");
@@ -4299,6 +4304,10 @@ namespace MajorisDisks {
                 Error? offline_measurement_error = null;
                 var plan = yield resize_plan (block, new_size, resize_filesystem);
                 if (!plan.supported) throw new IOError.NOT_SUPPORTED (plan.reason);
+                synchronize ();
+                if (modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The volume changed after confirmation.");
+                validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                 if (resize_filesystem) {
                     filesystem = require_volume (block, "Filesystem");
                     if (plan.requires_unmount) {
@@ -4326,9 +4335,17 @@ namespace MajorisDisks {
                 }
                 journal.operation_started = true;
                 validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
-                plan = yield resize_plan (block, new_size, resize_filesystem);
+                plan = yield resize_plan (block, new_size, resize_filesystem, true);
                 if (!plan.supported) throw new IOError.NOT_SUPPORTED (plan.reason);
+                synchronize ();
+                if (modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The volume changed while preparing the resize.");
+                validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
+                PartitionLayoutService.validate_resize (disk, block, new_size);
+                if (resize_filesystem && (block.filesystem?.mounted ?? false) != plan.online)
+                    throw new IOError.BUSY ("The filesystem mount state changed while preparing the resize.");
                 var options = new VariantBuilder (new VariantType ("a{sv}"));
+                bool btrfs = resize_filesystem && block.type_id.down () == "btrfs";
                 if (shrinking && resize_filesystem) {
                     if (plan.requires_check) {
                         if (!(yield maintenance_available (block.type_id, false)))
@@ -4349,6 +4366,12 @@ namespace MajorisDisks {
                     yield filesystem.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed ("Filesystem shrunk");
+                    if (btrfs) {
+                        uint64 capacity = yield FilesystemMinimumSizeService.query_single_btrfs_capacity (block, token);
+                        if (capacity > new_size)
+                            throw new IOError.FAILED ("The Btrfs filesystem still exceeds the requested size; the partition was left unchanged.");
+                        synchronize ();
+                    }
                     if (plan.requires_check) {
                         options = new VariantBuilder (new VariantType ("a{sv}"));
                         var verified = yield filesystem.call ("Check", new Variant.tuple ({ options.end () }),
@@ -4358,14 +4381,18 @@ namespace MajorisDisks {
                         result.completed ("Resized filesystem verified");
                     }
                     validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
-                    yield KernelStorageSafety.require_idle (block, token);
+                    PartitionLayoutService.validate_resize (disk, block, new_size);
+                    // Adapted from GNOME Disks online_resize_no_repair (GPL-2.0-or-later).
+                    // Copyright (C) 2017 Kai Lüke
+                    if (plan.online) yield KernelStorageSafety.require_no_holders (block, token);
+                    else yield KernelStorageSafety.require_idle (block, token);
                     options = new VariantBuilder (new VariantType ("a{sv}"));
                     jobs.phase (job, StorageJobState.RUNNING, "Shrinking partition");
                     journal.backend_invoked = true;
                     yield partition.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed ("Partition shrunk");
-                    yield wait_for_size (block, new_size, false, token);
+                    yield wait_for_size (block, new_size, token);
                 } else {
                     validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                     if (plan.online) yield KernelStorageSafety.require_no_holders (block, token);
@@ -4375,7 +4402,7 @@ namespace MajorisDisks {
                     yield partition.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed (shrinking ? "Partition shrunk" : "Partition grown");
-                    yield wait_for_size (block, new_size, !shrinking, token);
+                    yield wait_for_size (block, new_size, token);
                     if (resize_filesystem) {
                         validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                         if (plan.online) yield KernelStorageSafety.require_no_holders (block, token);
@@ -4438,7 +4465,16 @@ namespace MajorisDisks {
                             format_size (block.size) + ".";
                         result.completed ("Offline filesystem capacity verified");
                     } else {
-                        uint64 capacity = yield mounted_filesystem_capacity (block, backend_lifetime);
+                        uint64 capacity;
+                        if (btrfs) {
+                            capacity = yield FilesystemMinimumSizeService.query_single_btrfs_capacity (block, backend_lifetime);
+                            synchronize ();
+                            validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
+                            if (block.size != new_size)
+                                throw new IOError.FAILED ("The partition geometry changed during filesystem capacity verification.");
+                        } else {
+                            capacity = yield mounted_filesystem_capacity (block, backend_lifetime);
+                        }
                         if (capacity == 0) {
                             string detail = offline_measurement_error == null ?
                                 "the filesystem was not mounted" : offline_measurement_error.message;

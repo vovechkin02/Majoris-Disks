@@ -1768,16 +1768,28 @@ namespace MajorisDisks {
                 read_lookahead_intent != StorageSettingIntent.UNCHANGED;
             set_response_enabled ("apply", changed);
             int standby_code = (int) standby.value;
-            standby.subtitle = standby_code == 0 ? "Never enter standby" : standby_code <= 240 ?
-                "%d minutes %d seconds".printf ((standby_code * 5) / 60, (standby_code * 5) % 60) :
-                "Special ATA timeout value %d".printf (standby_code);
+            if (standby_code == 0)
+                standby.subtitle = "Never enter standby";
+            else if (standby_code <= 240)
+                standby.subtitle = "%d minutes %d seconds".printf ((standby_code * 5) / 60, (standby_code * 5) % 60);
+            else
+                standby.subtitle = "Special ATA timeout value %d".printf (standby_code);
             int apm_code = (int) apm.value;
-            apm.subtitle = apm_code == 255 ? "APM disabled" : apm_code <= 127 ?
-                "%d · power saving with spin-down permitted".printf (apm_code) :
-                "%d · performance, spin-down not permitted".printf (apm_code);
+            if (apm_code == 255)
+                apm.subtitle = "APM disabled";
+            else if (apm_code <= 127)
+                apm.subtitle = "%d · power saving with spin-down permitted".printf (apm_code);
+            else
+                apm.subtitle = "%d · performance, spin-down not permitted".printf (apm_code);
             int aam_code = (int) aam.value;
-            aam.subtitle = aam_code < 128 ? "AAM disabled" : aam_code == 128 ?
-                "128 · quietest" : aam_code == 254 ? "254 · fastest" : aam_code.to_string ();
+            switch (aam_code) {
+                case 128: aam.subtitle = "128 · quietest"; break;
+                case 254: aam.subtitle = "254 · fastest"; break;
+                default:
+                    if (aam_code < 128) aam.subtitle = "AAM disabled";
+                    else aam.subtitle = aam_code.to_string ();
+                    break;
+            }
         }
         private void setup_integer (Variant configuration, string key, Adw.SwitchRow enabled,
             Adw.SpinRow value, int fallback) {
@@ -2705,7 +2717,7 @@ namespace MajorisDisks {
             closed.connect (() => backend.disconnect (changed_handler));
             validate ();
         }
-        private async void probe (uint generation, uint64 requested, bool with_filesystem) {
+        private async void probe (uint generation, uint64 requested, bool with_filesystem, bool can_submit) {
             try {
                 var plan = yield backend.resize_plan (block, requested, with_filesystem);
                 if (generation != validation_generation) return;
@@ -2715,12 +2727,21 @@ namespace MajorisDisks {
                 string direction = plan.direction == ResizeDirection.SHRINK ? "Shrink" :
                     plan.direction == ResizeDirection.GROW ? "Grow" : "No size change";
                 mode_row.subtitle = plan.supported ? "%s · %s".printf (direction,
-                    plan.online ? "online" : plan.requires_unmount ? "offline after unmount" : "partition only") : "Unavailable";
-                explanation_row.subtitle = plan.supported ? (plan.requires_check ?
-                    "The filesystem will be unmounted, checked, resized, and restored." :
-                    plan.online ? "The mounted filesystem supports this operation online." :
-                    "The operation fits the verified partition boundary.") : plan.reason;
-                set_response_enabled ("resize", plan.supported);
+                    plan.online ? "online" : plan.requires_unmount ? "offline after unmount" :
+                    plan.resize_filesystem ? "offline" : "partition only") : "Unavailable";
+                if (!can_submit)
+                    explanation_row.subtitle = "Choose a different size.";
+                else if (!plan.supported)
+                    explanation_row.subtitle = plan.reason;
+                else if (plan.requires_unmount)
+                    explanation_row.subtitle = plan.requires_check ?
+                        "The filesystem will be unmounted, checked, resized, and remounted." :
+                        "The filesystem will be unmounted for the resize and then remounted.";
+                else
+                    explanation_row.subtitle = plan.requires_check ?
+                        "The unmounted filesystem will be checked before resizing." :
+                        "The operation fits the verified partition boundary.";
+                set_response_enabled ("resize", can_submit && plan.supported);
             } catch (Error error) {
                 if (generation != validation_generation) return;
                 minimum_row.subtitle = "Unavailable";
@@ -2736,11 +2757,11 @@ namespace MajorisDisks {
             if (!changed) {
                 explanation_row.subtitle = "Choose a different size.";
                 uint64 shrink_probe = block.size > sector ? block.size - sector : block.size;
-                probe.begin (generation, shrink_probe, filesystem_row.active);
+                probe.begin (generation, shrink_probe, filesystem_row.active, false);
                 return;
             }
             explanation_row.subtitle = "Checking the current device state…";
-            probe.begin (generation, new_size, filesystem_row.active);
+            probe.begin (generation, new_size, filesystem_row.active, true);
         }
     }
 

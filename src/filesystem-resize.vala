@@ -26,13 +26,13 @@ namespace MajorisDisks {
             foreach (var key in cache.get_keys ()) if (key.has_prefix (object_path + "\n")) cache.remove (key);
         }
 
-        public async uint64 query (StorageBlock block, Cancellable token) throws Error {
+        public async uint64 query (StorageBlock block, Cancellable token, bool refresh = false) throws Error {
             string mounts = block.filesystem == null ? "" : string.joinv ("\n", block.filesystem.mounts);
             string key = "%s\n%s\n%s\n%s\n%s\n%s\n%" + uint64.FORMAT + "\n%" + uint64.FORMAT + "\n%s";
             key = key.printf (block.path, block.preferred, block.physical_drive?.serial ?? "",
                 block.physical_drive?.wwn ?? "", block.uuid, block.type_id, block.number, block.size, mounts);
             var cached = cache.lookup (key);
-            if (cached != null && get_monotonic_time () - cached.recorded < 60 * TimeSpan.SECOND)
+            if (!refresh && cached != null && get_monotonic_time () - cached.recorded < 60 * TimeSpan.SECOND)
                 return cached.size;
             uint64 minimum;
             switch (block.type_id.down ()) {
@@ -52,9 +52,6 @@ namespace MajorisDisks {
                     var fs = block.filesystem;
                     if (fs == null || !fs.mounted)
                         throw new IOError.NOT_SUPPORTED ("Btrfs minimum size can only be queried while mounted.");
-                    string topology = yield run ({ "btrfs", "filesystem", "show", "--raw", fs.mounts[0] }, token);
-                    if (!btrfs_single_device (topology, block.preferred))
-                        throw new IOError.NOT_SUPPORTED ("Automatic Btrfs member shrinking is limited to verified single-device filesystems.");
                     minimum = validated_boundary (parse_first_number (yield run ({ "btrfs", "inspect-internal", "min-dev-size", fs.mounts[0] }, token)), block, false);
                     break;
                 default:
@@ -66,10 +63,42 @@ namespace MajorisDisks {
             return minimum;
         }
 
-        public static bool btrfs_single_device (string output, string device) {
-            int devices = 0;
-            foreach (var line in output.split ("\n")) if (line.strip ().has_prefix ("devid")) devices++;
-            return devices == 1 && output.contains (device);
+        public static async uint64 query_single_btrfs_capacity (StorageBlock block, Cancellable token) throws Error {
+            var fs = block.filesystem;
+            if (fs == null || !fs.mounted)
+                throw new IOError.NOT_SUPPORTED ("Btrfs resize requires a mounted single-device filesystem.");
+            string mount = fs.mounts[0];
+            string device = block.preferred;
+            string topology = yield run ({ "btrfs", "filesystem", "show", "--raw", mount }, token);
+            uint64 capacity = single_btrfs_capacity (topology, device);
+            if (block.filesystem != fs || !fs.mounted || fs.mounts[0] != mount ||
+                block.preferred != device || capacity == 0)
+                throw new IOError.NOT_SUPPORTED ("Btrfs resize requires a verified single-device filesystem with no missing members.");
+            return capacity;
+        }
+
+        public static uint64 single_btrfs_capacity (string output, string device) {
+            bool single = false;
+            uint64 capacity = 0;
+            foreach (var raw_line in output.split ("\n")) {
+                string line = raw_line.strip ();
+                if (line.has_prefix ("Total devices ")) {
+                    string count = line.substring ("Total devices ".length).split (" ", 2)[0];
+                    if (single || count != "1") return 0;
+                    single = true;
+                } else if (line.has_prefix ("devid ") || line.has_prefix ("devid\t")) {
+                    int path = line.index_of (" path ");
+                    int size = line.index_of (" size ");
+                    if (capacity != 0 || size < 0 || path <= size ||
+                        line.substring (path + " path ".length) != device)
+                        return 0;
+                    string bytes = line.substring (size + " size ".length).split (" ", 2)[0];
+                    if (!uint64.try_parse (bytes, out capacity) || capacity == 0) return 0;
+                } else if (line.contains ("devices missing")) {
+                    return 0;
+                }
+            }
+            return single && device != "" ? capacity : 0;
         }
 
         private static uint64 validated_boundary (uint64 reported, StorageBlock block, bool estimate) throws Error {
@@ -403,13 +432,17 @@ namespace MajorisDisks {
             if (!resize_filesystem || block.filesystem == null) { plan.supported = true; return plan; }
             if (!capability.supported) { plan.reason = capability.reason; return plan; }
             if (plan.direction == ResizeDirection.SHRINK) {
+                if (block.type_id.down () == "xfs") {
+                    plan.reason = "XFS shrinking is unavailable.";
+                    return plan;
+                }
                 if (minimum_size == 0) { plan.reason = "A reliable minimum filesystem size is unavailable."; return plan; }
                 plan.online = plan.mounted && capability.online_shrink;
                 bool offline = capability.offline_shrink;
                 if (!plan.online && !offline) { plan.reason = plan.mounted ?
                     "This filesystem cannot be safely shrunk while mounted." : "This filesystem does not support offline shrinking."; return plan; }
-                plan.requires_unmount = !plan.online;
-                plan.requires_check = plan.requires_unmount && requires_check (block.type_id);
+                plan.requires_unmount = plan.mounted && !plan.online;
+                plan.requires_check = !plan.online && requires_check (block.type_id);
             } else {
                 plan.online = plan.mounted && capability.online_grow;
                 bool offline = capability.offline_grow;
