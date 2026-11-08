@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <glib.h>
 #include <linux/btrfs.h>
+#include <linux/btrfs_tree.h>
+#include <errno.h>
 #include <linux/openat2.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
@@ -120,13 +122,73 @@ fail (const char *message)
     return 1;
 }
 
+static int
+check_empty_member (int mount, const char *filesystem, dev_t target, guint64 expected)
+{
+    struct btrfs_ioctl_fs_info_args info = { 0 };
+    struct statvfs state;
+    if (expected < 2 || ioctl (mount, BTRFS_IOC_FS_INFO, &info) != 0 || info.num_devices != expected ||
+        fstatvfs (mount, &state) != 0 || (state.f_flag & ST_RDONLY) || system_filesystem (filesystem))
+        return fail ("The Btrfs filesystem is protected, read-only, or its membership changed.");
+    g_autofree char *uuid = g_ascii_strdown (filesystem, -1);
+    g_autofree char *operation_file = g_strdup_printf ("/sys/fs/btrfs/%s/exclusive_operation", uuid);
+    g_autofree char *operation = NULL;
+    if (!g_file_get_contents (operation_file, &operation, NULL, NULL) || !g_str_equal (g_strstrip (operation), "none"))
+        return fail ("Another exclusive Btrfs operation is active or its state is unknown.");
+
+    const guint slots = 64;
+    g_autofree struct btrfs_ioctl_space_args *spaces =
+        g_malloc0 (sizeof *spaces + slots * sizeof (struct btrfs_ioctl_space_info));
+    spaces->space_slots = slots;
+    if (ioctl (mount, BTRFS_IOC_SPACE_INFO, spaces) != 0 || spaces->total_spaces == 0 || spaces->total_spaces >= slots)
+        return fail ("Could not verify Btrfs allocation profiles.");
+    for (guint64 i = 0; i < spaces->total_spaces; i++) {
+        guint64 profile = spaces->spaces[i].flags & BTRFS_BLOCK_GROUP_PROFILE_MASK;
+        if (profile != 0 && profile != BTRFS_BLOCK_GROUP_DUP)
+            return fail ("Only single and DUP allocation profiles are supported for empty-member removal.");
+    }
+
+    g_autofree char *devinfo = g_strdup_printf ("/sys/fs/btrfs/%s/devinfo", uuid);
+    g_autoptr(GDir) devices = g_dir_open (devinfo, 0, NULL);
+    if (devices == NULL)
+        return fail ("Could not verify the kernel Btrfs member list.");
+    const char *entry;
+    guint64 count = 0;
+    gboolean found = FALSE;
+    while ((entry = g_dir_read_name (devices)) != NULL) {
+        guint64 id;
+        if (!g_ascii_string_to_unsigned (entry, 10, 1, G_MAXUINT64, &id, NULL))
+            return fail ("The kernel Btrfs member list is invalid.");
+        struct btrfs_ioctl_dev_info_args device = { .devid = id };
+        struct stat block;
+        if (ioctl (mount, BTRFS_IOC_DEV_INFO, &device) != 0 ||
+            memchr (device.path, 0, sizeof device.path) == NULL ||
+            stat ((const char *) device.path, &block) != 0 || !S_ISBLK (block.st_mode) ||
+            !filesystem_member (uuid, block.st_rdev))
+            return fail ("A Btrfs member is missing or changed.");
+        struct btrfs_ioctl_scrub_args scrub = { .devid = id };
+        if (ioctl (mount, BTRFS_IOC_SCRUB_PROGRESS, &scrub) == 0 || errno != ENOTCONN)
+            return fail ("A Btrfs scrub is active or its state is unknown.");
+        count++;
+        if (block.st_rdev == target) {
+            if (found || device.bytes_used != 0)
+                return fail ("The selected member still holds allocated Btrfs chunks.");
+            found = TRUE;
+        }
+    }
+    if (!found || count != expected)
+        return fail ("Could not verify all Btrfs members and the removal target.");
+    return 0;
+}
+
 int
 main (int argc, char **argv)
 {
     gboolean set = argc == 7 && g_str_equal (argv[1], "set-default");
     gboolean check = argc == 7 && g_str_equal (argv[1], "check-unmounted");
+    gboolean check_member = argc == 7 && g_str_equal (argv[1], "check-empty-member");
     guint64 device, expected = 0, target = 0, current;
-    if (geteuid () != 0 || (!set && !check && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
+    if (geteuid () != 0 || (!set && !check && !check_member && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
         !g_path_is_absolute (argv[2]) || !g_uuid_string_is_valid (argv[3]) ||
         !g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &device, NULL) ||
         (set && (!g_ascii_string_to_unsigned (argv[5], 10, 5, G_MAXUINT64, &expected, NULL) ||
@@ -137,6 +199,13 @@ main (int argc, char **argv)
     if (mount < 0 || !matches_mount (mount, argv[2], device, argv[3]) || !matches_uuid (mount, argv[3]))
         return fail ("The Btrfs mount or its source identity changed.");
 
+    if (check_member) {
+        guint64 member, count;
+        if (!g_ascii_string_to_unsigned (argv[5], 10, 1, G_MAXUINT64, &member, NULL) || member == device ||
+            !g_ascii_string_to_unsigned (argv[6], 10, 2, G_MAXUINT64, &count, NULL))
+            return fail ("Invalid Btrfs removal candidate.");
+        return check_empty_member (mount, argv[3], (dev_t) member, count);
+    }
     if (check) {
         if (!g_ascii_string_to_unsigned (argv[5], 10, 256, G_MAXUINT64, &target, NULL) ||
             argv[6][0] == 0 || strchr (argv[6], 47) != NULL ||

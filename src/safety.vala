@@ -19,6 +19,10 @@ namespace MajorisDisks {
         public uint64 size;
         public string uuid = "";
         public double data_allocated_ratio = -1;
+        public double metadata_allocated_ratio = -1;
+        public string lvm_type = "";
+        public string thin_pool_path = "/";
+        public string origin_path = "/";
         public StorageLogicalVolume (string path) { base (path); }
     }
 

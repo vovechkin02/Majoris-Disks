@@ -30,6 +30,22 @@ test_mount_identity (void)
 int
 main (int argc, char **argv)
 {
+    if (argc == 5 && g_str_equal (argv[1], "--allocation")) {
+        guint64 expected;
+        if (!g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &expected, NULL))
+            return 2;
+        g_autoptr(GVariant) report = majoris_btrfs_allocation (argv[2], argv[3]);
+        if (report == NULL)
+            return 1;
+        guint64 logical, count;
+        g_autoptr(GVariant) allocations = NULL;
+        g_autoptr(GVariant) members = NULL;
+        g_variant_get (report, "(tt@a(stt)@a(tttt))", &logical, &count, &allocations, &members);
+        g_print ("Btrfs allocation: %zu profiles, %zu members\n",
+            g_variant_n_children (allocations), g_variant_n_children (members));
+        return logical > 0 && count == expected && g_variant_n_children (allocations) >= 2 &&
+            g_variant_n_children (members) == expected ? 0 : 1;
+    }
     if (argc == 6 && g_str_equal (argv[1], "--mount-use")) {
         guint64 id, expected;
         if (!g_uuid_string_is_valid (argv[2]) ||

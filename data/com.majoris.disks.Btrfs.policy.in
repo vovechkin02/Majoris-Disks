@@ -3,8 +3,8 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <action id="com.majoris.disks.btrfs-default">
-    <description>Verify Btrfs mounts and manage the default subvolume</description>
-    <message>Authentication is required to verify Btrfs mount usage or manage the default subvolume</message>
+    <description>Verify Btrfs storage and manage the default subvolume</description>
+    <message>Authentication is required to verify Btrfs mount or member safety, or manage the default subvolume</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>auth_admin</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/majoris-disks-btrfs-default</annotate>
   </action>

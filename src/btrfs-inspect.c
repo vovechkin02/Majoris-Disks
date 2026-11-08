@@ -3,6 +3,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <linux/btrfs.h>
+#include <linux/btrfs_tree.h>
+#include <sys/statvfs.h>
 #include <linux/openat2.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -154,4 +156,84 @@ majoris_btrfs_mount_use (const char *filesystem, guint64 id, const char *path)
         }
     }
     return 0;
+}
+
+static const char *
+allocation_profile (guint64 flags)
+{
+    switch (flags & BTRFS_BLOCK_GROUP_PROFILE_MASK) {
+    case 0: return "single";
+    case BTRFS_BLOCK_GROUP_DUP: return "DUP";
+    case BTRFS_BLOCK_GROUP_RAID0: return "RAID 0";
+    case BTRFS_BLOCK_GROUP_RAID1: return "RAID 1";
+    case BTRFS_BLOCK_GROUP_RAID10: return "RAID 10";
+    case BTRFS_BLOCK_GROUP_RAID5: return "RAID 5";
+    case BTRFS_BLOCK_GROUP_RAID6: return "RAID 6";
+    case BTRFS_BLOCK_GROUP_RAID1C3: return "RAID 1C3";
+    case BTRFS_BLOCK_GROUP_RAID1C4: return "RAID 1C4";
+    default: return "unknown profile";
+    }
+}
+
+GVariant *
+majoris_btrfs_allocation (const char *path, const char *filesystem)
+{
+    struct open_how how = { .flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC, .resolve = RESOLVE_NO_SYMLINKS };
+    int fd = syscall (SYS_openat2, AT_FDCWD, path, &how, sizeof how);
+    if (fd < 0)
+        return NULL;
+    struct btrfs_ioctl_fs_info_args fs = { 0 };
+    struct statvfs vfs;
+    const guint slots = 64;
+    g_autofree struct btrfs_ioctl_space_args *spaces =
+        g_malloc0 (sizeof *spaces + slots * sizeof (struct btrfs_ioctl_space_info));
+    spaces->space_slots = slots;
+    gboolean valid = ioctl (fd, BTRFS_IOC_FS_INFO, &fs) == 0 && fstatvfs (fd, &vfs) == 0 &&
+        vfs.f_frsize > 0 && vfs.f_blocks <= G_MAXUINT64 / vfs.f_frsize &&
+        ioctl (fd, BTRFS_IOC_SPACE_INFO, spaces) == 0 &&
+        spaces->total_spaces > 0 && spaces->total_spaces < slots;
+    g_autofree char *uuid = format_uuid (fs.fsid);
+    if (!valid || g_ascii_strcasecmp (uuid, filesystem) != 0) {
+        close (fd);
+        return NULL;
+    }
+
+    GVariantBuilder allocations = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(stt)"));
+    for (guint64 i = 0; i < spaces->total_spaces; i++) {
+        struct btrfs_ioctl_space_info *row = &spaces->spaces[i];
+        const guint64 types = row->flags & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
+        const char *kind;
+        switch (types) {
+        case BTRFS_BLOCK_GROUP_DATA: kind = "Data"; break;
+        case BTRFS_BLOCK_GROUP_METADATA: kind = "Metadata"; break;
+        case BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA: kind = "Data and metadata"; break;
+        case BTRFS_BLOCK_GROUP_SYSTEM: kind = "System"; break;
+        default: continue;
+        }
+        g_autofree char *label = g_strdup_printf ("%s (%s)", kind, allocation_profile (row->flags));
+        g_variant_builder_add (&allocations, "(stt)", label, row->total_bytes, row->used_bytes);
+    }
+
+    GVariantBuilder members = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(tttt)"));
+    g_autofree char *devinfo = g_strdup_printf ("/sys/fs/btrfs/%s/devinfo", uuid);
+    g_autoptr(GDir) devices = g_dir_open (devinfo, 0, NULL);
+    const char *entry;
+    while (devices != NULL && (entry = g_dir_read_name (devices)) != NULL) {
+        guint64 id;
+        if (!g_ascii_string_to_unsigned (entry, 10, 1, G_MAXUINT64, &id, NULL))
+            continue;
+        struct btrfs_ioctl_dev_info_args device = { .devid = id };
+        struct stat block;
+        if (ioctl (fd, BTRFS_IOC_DEV_INFO, &device) != 0 ||
+            memchr (device.path, 0, sizeof device.path) == NULL ||
+            stat ((const char *) device.path, &block) != 0 || !S_ISBLK (block.st_mode) ||
+            device.bytes_used > device.total_bytes)
+            continue;
+        g_variant_builder_add (&members, "(tttt)", id, (guint64) block.st_rdev,
+            (guint64) device.total_bytes, (guint64) device.bytes_used);
+    }
+    close (fd);
+    return g_variant_ref_sink (g_variant_new ("(tt@a(stt)@a(tttt))",
+        (guint64) vfs.f_blocks * vfs.f_frsize, (guint64) fs.num_devices,
+        g_variant_builder_end (&allocations), g_variant_builder_end (&members)));
 }

@@ -4,6 +4,10 @@
     <property name="extra-child">
       <object class="AdwPreferencesGroup">
         <child><object class="AdwEntryRow" id="name_entry"><property name="title">Logical volume name</property></object></child>
+        <child><object class="AdwComboRow" id="lv_kind"><property name="title">Volume type</property>
+          <property name="model"><object class="GtkStringList"><items><item>Plain volume</item><item>Thin pool</item><item>Thin volume</item></items></object></property>
+        </object></child>
+        <child><object class="AdwComboRow" id="thin_pool"><property name="title">Thin pool</property><property name="visible">false</property></object></child>
         <child><object class="AdwEntryRow" id="capacity"><property name="title">Capacity</property><property name="input-purpose">number</property></object></child>
         <child><object class="AdwComboRow" id="unit"><property name="title">Capacity unit</property>
           <property name="model"><object class="GtkStringList"><items><item>MiB</item><item>GiB</item><item>TiB</item></items></object></property>

@@ -77,7 +77,7 @@ namespace MajorisDisks {
             drive_view.lvm_rename_requested.connect (rename_logical_volume);
             drive_view.lvm_manage_requested.connect (manage_logical_volumes);
             drive_view.lvm_add_member_requested.connect (add_lvm_physical_volume);
-            drive_view.lvm_create_requested.connect (create_logical_volume);
+            drive_view.lvm_create_requested.connect ((block) => create_logical_volume (block));
             drive_view.raid_check_requested.connect (start_raid_check);
             drive_view.raid_member_requested.connect ((block, add) => manage_raid_member (block, add));
             drive_view.raid_replace_requested.connect ((block) => manage_raid_member (block, true, true));
@@ -85,7 +85,9 @@ namespace MajorisDisks {
             drive_view.raid_power_requested.connect (confirm_raid_power);
             drive_view.raid_recovery_requested.connect (confirm_degraded_raid);
             drive_view.btrfs_subvolumes_requested.connect (list_btrfs_subvolumes);
-            drive_view.btrfs_add_requested.connect (add_btrfs_member);
+            drive_view.btrfs_add_requested.connect ((block) => change_btrfs_member (block, false));
+            drive_view.btrfs_remove_requested.connect ((block) => change_btrfs_member (block, true));
+            drive_view.btrfs_allocation_requested.connect (show_btrfs_allocation);
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
@@ -328,22 +330,71 @@ namespace MajorisDisks {
             });
         }
 
-        private void add_btrfs_member (StorageBlock filesystem) {
+        private void show_btrfs_allocation (StorageBlock block) {
+            backend.query_btrfs_allocation.begin (block, (object, result) => {
+                try {
+                    var report = backend.query_btrfs_allocation.end (result);
+                    var allocations = report.get_child_value (2);
+                    var members = report.get_child_value (3);
+                    uint64 total = 0, unallocated = 0;
+                    bool complete = members.n_children () == report.get_child_value (1).get_uint64 ();
+                    var detail = new StringBuilder ();
+                    detail.append_printf ("Filesystem UUID %s\nLogical capacity reported by the kernel: %s\n\n",
+                        block.uuid, format_size (report.get_child_value (0).get_uint64 ()));
+                    for (size_t i = 0; i < allocations.n_children (); i++) {
+                        var row = allocations.get_child_value (i);
+                        detail.append_printf ("%s · %s used of %s allocated\n",
+                            row.get_child_value (0).get_string (), format_size (row.get_child_value (2).get_uint64 ()),
+                            format_size (row.get_child_value (1).get_uint64 ()));
+                    }
+                    detail.append ("\nPhysical members\n");
+                    for (size_t i = 0; i < members.n_children (); i++) {
+                        var row = members.get_child_value (i);
+                        uint64 number = row.get_child_value (1).get_uint64 ();
+                        uint64 size = row.get_child_value (2).get_uint64 ();
+                        uint64 allocated = row.get_child_value (3).get_uint64 ();
+                        string name = KernelStorageSafety.device_number (number);
+                        foreach (var member in backend.snapshot.blocks.get_values ())
+                            if (member.number == number) { name = member.preferred; break; }
+                        detail.append_printf ("%s · device ID %s · %s capacity · %s allocated\n", name,
+                            row.get_child_value (0).get_uint64 ().to_string (), format_size (size), format_size (allocated));
+                        if (size > uint64.MAX - total) complete = false;
+                        else { total += size; unallocated += size - allocated; }
+                    }
+                    if (complete)
+                        detail.append_printf ("\nPhysical capacity %s · %s not allocated to chunks",
+                            format_size (total), format_size (unallocated));
+                    else
+                        detail.append ("\nSome member information is unavailable. Physical totals could not be verified.");
+                    show_check_message ("Btrfs Allocation", detail.str);
+                } catch (Error error) {
+                    show_check_message ("Could not read Btrfs allocation", operation_error (error));
+                }
+            });
+        }
+
+        private void change_btrfs_member (StorageBlock filesystem, bool remove) {
             string identity = backend.modification_identity (filesystem);
-            var picker = new CreateStorageGroupDialog (backend, false, true, "Add Btrfs Device");
+            StorageBlock[] choices = {};
+            if (remove)
+                foreach (var candidate in backend.snapshot.blocks.get_values ())
+                    if (backend.can_select_btrfs_removal_member (filesystem, candidate)) choices += candidate;
+            var picker = new CreateStorageGroupDialog (backend, false, true,
+                remove ? "Remove Empty Btrfs Device" : "Add Btrfs Device", remove ? choices : null);
+            if (remove) picker.body = "Removal is available for an unallocated member on a filesystem using only single or DUP profiles. The selected device will leave the filesystem.";
             picker.response.connect ((choice) => {
                 if (choice != "create" || pending.contains (filesystem.path)) return;
                 string[] identities;
                 var members = picker.selected_members (out identities);
                 if (members.length != 1) return;
                 pending.insert (filesystem.path, filesystem);
-                backend.add_btrfs_member.begin (filesystem, members[0], identity, identities[0], (object, result) => {
+                backend.change_btrfs_member.begin (filesystem, members[0], identity, identities[0], remove, (object, result) => {
                     pending.remove (filesystem.path);
                     try {
-                        backend.add_btrfs_member.end (result);
-                        notifications.add_toast (new Adw.Toast ("Btrfs member added"));
+                        backend.change_btrfs_member.end (result);
+                        notifications.add_toast (new Adw.Toast (remove ? "Btrfs member removed" : "Btrfs member added"));
                     } catch (Error error) {
-                        show_check_message ("Could not confirm the Btrfs member addition", operation_error (error));
+                        show_check_message ("Could not confirm the Btrfs member change", operation_error (error));
                     }
                 });
             });
@@ -444,15 +495,20 @@ namespace MajorisDisks {
             dialog.present (this);
         }
 
-        private void create_logical_volume (StorageBlock block) {
+        private void create_logical_volume (StorageBlock block, StorageLogicalVolume? origin = null) {
             var group = block.volume_group;
             if (group == null) return;
-            var dialog = new CreateLogicalVolumeDialog (group, backend.snapshot);
+            string origin_path = origin?.path ?? "/";
+            string origin_uuid = origin?.uuid ?? "";
+            var dialog = new CreateLogicalVolumeDialog (group, backend.snapshot, 0, false, origin?.name ?? "");
             string identity = backend.modification_identity (block);
             dialog.response.connect ((response) => {
                 if (response != "create" || pending.contains (block.path)) return;
                 pending.insert (block.path, block);
-                backend.create_logical_volume.begin (block, dialog.volume_name, dialog.bytes, identity, (object, result) => {
+                var selected_pool = dialog.selected_pool;
+                backend.create_logical_volume.begin (block, dialog.volume_name, dialog.bytes, identity,
+                    dialog.create_thin_pool, selected_pool?.path ?? "/", selected_pool?.uuid ?? "",
+                    origin_path, origin_uuid, (object, result) => {
                     pending.remove (block.path);
                     try {
                         string created = backend.create_logical_volume.end (result);
@@ -460,7 +516,8 @@ namespace MajorisDisks {
                             selected = created;
                             update_devices ();
                         }
-                        notifications.add_toast (new Adw.Toast ("Logical volume created"));
+                        notifications.add_toast (new Adw.Toast (origin_path == "/" ?
+                            "Logical volume created" : "Logical-volume snapshot created"));
                     } catch (Error error) {
                         show_check_message ("Could not confirm logical-volume creation", operation_error (error));
                     }
@@ -501,6 +558,10 @@ namespace MajorisDisks {
                 }
                 var volume = dialog.selection;
                 if (volume == null || response == "close") return;
+                if (response == "snapshot") {
+                    create_logical_volume (context, volume);
+                    return;
+                }
                 string path = volume.path;
                 string uuid = volume.uuid;
                 if (response == "delete") {
@@ -1821,7 +1882,8 @@ namespace MajorisDisks {
             return raid && level != "raid1" ? sizes[uint.min (chunk_size.selected, 4)] : 0;
         } }
 
-        public CreateStorageGroupDialog (UDisksService backend, bool raid, bool single_member = false, string member_heading = "Add RAID Member") {
+        public CreateStorageGroupDialog (UDisksService backend, bool raid, bool single_member = false, string member_heading = "Add RAID Member",
+            StorageBlock[]? member_choices = null) {
             this.raid = raid;
             this.single_member = single_member;
             heading = raid ? "Create RAID Array" : "Create LVM Volume Group";
@@ -1832,10 +1894,11 @@ namespace MajorisDisks {
                 body = "Select one unused device. Adding it can overwrite its contents.";
                 name_entry.visible = false;
                 estimate.visible = false;
-                set_response_label ("create", "Add");
+                set_response_label ("create", member_choices == null ? "Add" : "Remove");
+                if (member_choices != null) erase.title = "Confirm removal of the selected device";
             }
             foreach (var block in backend.snapshot.blocks.get_values ()) {
-                if (!backend.can_use_group_member (block)) continue;
+                if (member_choices == null ? !backend.can_use_group_member (block) : !(block in member_choices)) continue;
                 candidates += block;
                 candidate_identities += backend.modification_identity (block);
                 var check = new Gtk.CheckButton.with_label ("%s · %s".printf (block.preferred, format_size (block.size)));
@@ -1898,6 +1961,15 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.EntryRow capacity;
         [GtkChild] private unowned Adw.ComboRow unit;
         [GtkChild] private unowned Adw.ActionRow allocation;
+        [GtkChild] private unowned Adw.ComboRow lv_kind;
+        [GtkChild] private unowned Adw.ComboRow thin_pool;
+        private StorageSnapshot? snapshot;
+        private StorageLogicalVolume[] pools = {};
+        public bool create_thin_pool { get { return resize_from == 0 && lv_kind.selected == 1; } }
+        public unowned StorageLogicalVolume? selected_pool {
+            get { return resize_from == 0 && lv_kind.selected == 2 && thin_pool.selected < pools.length ?
+                pools[thin_pool.selected] : null; }
+        }
         private string[] used_names = {};
         private StorageVolumeGroup group;
         private uint64 resize_from;
@@ -1907,41 +1979,68 @@ namespace MajorisDisks {
         public uint64 bytes { get; private set; }
 
         public CreateLogicalVolumeDialog (StorageVolumeGroup group, StorageSnapshot? snapshot = null,
-            uint64 resize_from = 0, bool allow_shrink = false) {
+            uint64 resize_from = 0, bool allow_shrink = false, string snapshot_origin = "") {
             this.group = group;
+            this.snapshot = snapshot;
             this.resize_from = resize_from;
             this.allow_shrink = allow_shrink;
+            var pool_labels = new Gtk.StringList (null);
             if (snapshot != null) {
                 foreach (var item in snapshot.advanced.get_values ()) {
                     var lv = item as StorageLogicalVolume;
-                    if (lv != null && lv.group_path == group.path) used_names += lv.name;
+                    if (lv == null || lv.group_path != group.path) continue;
+                    used_names += lv.name;
+                    if (lv.lvm_type == "pool" && lv.uuid != "") {
+                        pools += lv;
+                        pool_labels.append (lv.name);
+                    }
                 }
             }
+            thin_pool.model = pool_labels;
             uint64 usable = group.extent_size == 0 ? 0 : group.free_size - group.free_size % group.extent_size;
             maximum = resize_from + uint64.min (uint64.MAX - resize_from, usable);
             body = "%s · %s allocatable · %s per extent".printf (group.name,
                 format_size (usable), format_size (group.extent_size));
+            if (snapshot_origin != "") {
+                heading = "Create LVM Snapshot";
+                body = "Snapshot origin %s · %s free for copy-on-write data · %s per extent".printf (
+                    snapshot_origin, format_size (usable), format_size (group.extent_size));
+                lv_kind.visible = false;
+            }
             if (resize_from != 0) {
                 heading = "Resize Logical Volume";
                 body = "%s · %s current capacity · %s maximum · %s per extent".printf (group.name,
                     format_size (resize_from), format_size (maximum), format_size (group.extent_size));
                 name_entry.visible = false;
+                lv_kind.visible = false;
                 set_response_label ("create", "Resize");
             }
             name_entry.changed.connect (validate);
             capacity.changed.connect (validate);
             unit.notify["selected"].connect (validate);
+            lv_kind.notify["selected"].connect (validate);
+            thin_pool.notify["selected"].connect (validate);
             validate ();
         }
 
         private void validate () {
             uint64[] units = { 1048576, 1073741824, 1099511627776 };
+            bool thin = resize_from == 0 && lv_kind.selected == 2;
+            var pool = selected_pool;
+            thin_pool.visible = thin;
+            uint64 limit = thin ? (pool == null || snapshot == null ? 0 :
+                UDisksService.thin_pool_available (snapshot, pool)) : maximum;
+            if (thin)
+                thin_pool.subtitle = pool == null ? "No thin pools are available." :
+                    "%s uncommitted · %.1f%% data · %.1f%% metadata".printf (format_size (limit),
+                        double.max (0.0, pool.data_allocated_ratio) * 100.0, double.max (0.0, pool.metadata_allocated_ratio) * 100.0);
             uint64 size;
             bool aligned = LvmCapacity.parse (capacity.text, units[uint.min (unit.selected, 2)],
-                group.extent_size, maximum, out size);
+                group.extent_size, limit, out size);
             bytes = aligned ? size : 0;
             allocation.subtitle = aligned
-                ? (resize_from == 0 ? "%s allocated · %s free afterward".printf (format_size (size), format_size (group.free_size - size)) :
+                ? (thin ? "%s virtual capacity · %s pool capacity uncommitted afterward".printf (format_size (size), format_size (limit - size)) :
+                    resize_from == 0 ? "%s allocated · %s free afterward".printf (format_size (size), format_size (group.free_size - size)) :
                     "%s resulting capacity".printf (format_size (size)))
                 : "Enter an exact multiple of the extent size within the available capacity.";
             bool valid_name = UDisksService.valid_lvm_name (volume_name) && !(volume_name in used_names);
@@ -1963,12 +2062,14 @@ namespace MajorisDisks {
     internal class LvmLifecycleDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.ComboRow volumes;
         private StorageLogicalVolume[] entries;
+        private bool physical_context;
         public unowned StorageLogicalVolume? selection {
             get { return volumes.selected < entries.length ? entries[volumes.selected] : null; }
         }
 
         public LvmLifecycleDialog (StorageLogicalVolume[] entries, string preferred, bool physical_context = false) {
             this.entries = entries;
+            this.physical_context = physical_context;
             set_response_enabled ("migrate", physical_context);
             set_response_enabled ("remove-pv", physical_context);
             set_response_enabled ("delete-vg", physical_context && entries.length == 0);
@@ -1977,7 +2078,8 @@ namespace MajorisDisks {
             foreach (var volume in entries) {
                 if (volume.path == preferred) index = labels.get_n_items ();
                 labels.append ("%s · %s · %s".printf (volume.name, format_size (volume.size),
-                    volume.active ? "Active" : "Inactive"));
+                    volume.origin_path != "/" ? (volume.active ? "Active snapshot" : "Inactive snapshot") :
+                        volume.active ? "Active" : "Inactive"));
             }
             volumes.model = labels;
             if (entries.length > 0) volumes.selected = index;
@@ -1990,7 +2092,10 @@ namespace MajorisDisks {
             var volume = selection;
             set_response_enabled ("activate", volume != null && !volume.active);
             set_response_enabled ("deactivate", volume?.active == true);
-            set_response_enabled ("delete", volume != null && !volume.active);
+            set_response_enabled ("snapshot", physical_context && volume != null && volume.active &&
+                volume.lvm_type == "block" && volume.origin_path == "/" && volume.thin_pool_path == "/");
+            set_response_enabled ("delete", volume != null && (!volume.active ||
+                (volume.origin_path != "/" && volume.thin_pool_path == "/")));
         }
     }
 

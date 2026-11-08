@@ -29,7 +29,7 @@ btrfs_default_test = executable('btrfs-default-test', 'tests/btrfs-default-test.
   include_directories: xz_include, dependencies: dependency('glib-2.0'))
 test('btrfs-default-helper', btrfs_default_test)
 test('disposable-btrfs-mount-integration', sh,
-  args: [meson.current_source_dir() / 'tests/disposable-btrfs-mount-integration.sh', btrfs_default_test],
+  args: [meson.current_source_dir() / 'tests/disposable-btrfs-mount-integration.sh', btrfs_default_test], depends: btrfs_default_helper,
   timeout: 120)
 test('storage-model', layout_test)
 test('filesystem-capacity-integration', sh,

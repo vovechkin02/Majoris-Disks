@@ -117,6 +117,19 @@ public static int main (string[] args) {
     }
     assert (instances.length == resources.length);
     assert (UDisksService.valid_lvm_name ("valid-lv_1.2+data"));
+    var pool_snapshot = new StorageSnapshot ();
+    var pool = new StorageLogicalVolume ("/test/pool") {
+        active = true, size = 1024, lvm_type = "pool",
+        data_allocated_ratio = 0.25, metadata_allocated_ratio = 0.5
+    };
+    var provisioned = new StorageLogicalVolume ("/test/thin") { size = 256, thin_pool_path = pool.path };
+    pool_snapshot.advanced.insert (provisioned.path, provisioned);
+    assert (UDisksService.thin_pool_available (pool_snapshot, pool) == 768);
+    pool.metadata_allocated_ratio = 1.0;
+    assert (UDisksService.thin_pool_available (pool_snapshot, pool) == 0);
+    pool.metadata_allocated_ratio = 0.5;
+    provisioned.size = 2048;
+    assert (UDisksService.thin_pool_available (pool_snapshot, pool) == 0);
     foreach (string invalid in new string[] { "", "-option", "..", "bad/name", "with space", "é" })
         assert (!UDisksService.valid_lvm_name (invalid));
     return 0;
