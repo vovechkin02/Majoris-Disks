@@ -498,6 +498,36 @@ private void test_mount_restoration_status () {
     entry.restoration_allowed = false;
     entry.record_mount_restoration ({});
     assert (!entry.restored && entry.mount_restoration == MountRestorationStatus.UNSAFE_TO_RESTORE);
+    var stacked = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/test",
+        { "uuid", "ext4", "/first", "/first" });
+    assert (!stacked.mount_set_matches ({ "/first", "/second" }));
+    assert (stacked.mount_set_matches ({ "/first", "/first" }));
+}
+
+private void test_preparation_device_identity () {
+    var block = new StorageBlock ("/swap");
+    block.uuid = "swap-uuid";
+    block.type_id = "swap";
+    block.device = "/dev/loop1";
+    block.number = 1793;
+    var entry = new StoragePreparationEntry (StoragePreparationKind.SWAP, block.path,
+        { block.uuid, block.type_id });
+    entry.device_identity = StoragePreparationJournal.device_identity (block);
+    assert (entry.matches_prepared_device (block));
+    block.number = 1794;
+    assert (!entry.matches_prepared_device (block));
+    block.number = 1793;
+    block.available = false;
+    assert (!entry.matches_prepared_device (block));
+}
+
+private void test_crypttab_keyfile_scope () {
+    assert (MountOptionService.manages_crypttab_keyfile ("/etc/luks-keys/volume"));
+    assert (!MountOptionService.manages_crypttab_keyfile ("/root/recovery.key"));
+    assert (!MountOptionService.manages_crypttab_keyfile ("/dev/disk/by-uuid/key"));
+    assert (!MountOptionService.manages_crypttab_keyfile ("/etc/luks-keys/subdirectory/key"));
+    assert (!MountOptionService.manages_crypttab_keyfile ("/etc/luks-keys/.."));
+    assert (!MountOptionService.manages_crypttab_keyfile ("/etc/luks-keys/volume/"));
 }
 
 private void test_offline_capacity_identity () {
@@ -1324,6 +1354,8 @@ public static int main (string[] args) {
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
     Test.add_func ("/operations/mount-configuration-snapshot", test_mount_configuration_snapshot);
     Test.add_func ("/operations/mount-restoration-status", test_mount_restoration_status);
+    Test.add_func ("/operations/preparation-device-identity", test_preparation_device_identity);
+    Test.add_func ("/operations/crypttab-keyfile-scope", test_crypttab_keyfile_scope);
     Test.add_func ("/operations/preparation-journal", test_preparation_journal);
     Test.add_func ("/operations/create-partition-safety", test_create_partition_safety);
     Test.add_func ("/operations/create-active-dependency", test_create_partition_active_dependency);

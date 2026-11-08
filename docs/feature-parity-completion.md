@@ -6,6 +6,18 @@ The baseline already provides filtered Btrfs balance, read-only scrub, restricte
 
 **Verification status:** Pending entries have no execution evidence for the corresponding acceptance case. Existing source paths are starting points for investigation.
 
+## Persistent configuration and preparation recovery follow-up
+
+| Register ID | Implementation | Verification | Final result |
+|---|---|---|---|
+| FS-08, FS-09 | `configure_mount` refreshes the snapshot under the storage operation lock before checking that the selected fstab entry still exists and the mount point is available. It retains the source reference, dump frequency and fsck pass number on edits. Verification accepts any matching entry with the requested fields. | Debian 13 build and default test suite. | Partial. Live fstab mutation, reconnection, and concurrent configuration changes from outside Disks remain unverified. |
+| FS-10, SEC-06 | The journal records partially changed mount sets after an interrupted unmount, compares repeated paths by multiplicity, and revalidates stable device identity before restarting swap or restoring mounts. When UDisks remounts at a different location, the operation reports it and preserves the observed state. | `storage-model` mount restoration status and preparation device identity cases. | Passed model tests. Exact mount flags, bind mounts, multi-mount replay, and encryption mapping restoration remain open. |
+| SEC-01 | The dialog and service restrict edits and removal of regular keyfiles to direct children of `/etc/luks-keys`. The service rejects keyfiles shared by multiple published crypttab entries and refreshes identity, configuration and protection checks immediately before dispatch. | `storage-model` crypttab keyfile scope case and `ui-templates`. | Passed model and template tests. Shared references absent from the UDisks snapshot, binary keyfile round-tripping, and live mapping reconciliation remain open. |
+
+The supplied GNOME `gduutils.c` and mount options code were inspected for dependency preparation and fstab update patterns. This pass extends Majoris' existing journal and ConfigurationItem workflow. It adds no copied GNOME functions. The keyfile restriction follows the unlink behavior in [UDisks' crypttab update implementation](https://github.com/storaged-project/udisks/blob/master/src/udiskslinuxblock.c).
+
+On Debian 13.5, `meson setup build/config-recovery`, `meson compile -C build/config-recovery`, and `meson install -C build/config-recovery --no-rebuild --destdir stage` passed. The staged install skipped the system schema post-install hook. `G_DEBUG=fatal-warnings meson test -C build/config-recovery --print-errorlogs` reported six passes, nine skips and zero failures. Passes were `storage-model`, `ui-templates` (including the existing mock UDisks LVM Poll fixture), `native-xz`, `nbd-helper`, `btrfs-default-helper`, and the file-backed `filesystem-capacity-integration`. Eight opt-in device tests and `virtual-image-growth` skipped. Live fstab and crypttab mutation, disposable-device writes, and physical hardware tests were not executed in this pass.
+
 ## 2. Feature-by-feature matrix: hardware discovery and information
 
 | ID | Feature | Existing implementation | Required behaviour | Reference | Applicability | Implementation status | Verification | Final result |

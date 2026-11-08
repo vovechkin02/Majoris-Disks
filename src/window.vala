@@ -1898,7 +1898,10 @@ namespace MajorisDisks {
             var configuration = entry.selected < configurations.length ? configurations[entry.selected] : null;
             string key_path = configuration?.passphrase_path ?? "";
             bool device_key = key_path.has_prefix ("/dev/");
-            body = fields && device_key ? "UDisks cannot safely edit an entry that uses a device as its key." :
+            bool external_key = key_path != "" && !device_key &&
+                !MountOptionService.manages_crypttab_keyfile (key_path);
+            body = external_key ? "Editing or removing this entry through UDisks could delete an externally managed key file." :
+                fields && device_key ? "UDisks cannot safely edit an entry that uses a device as its key." :
                 !fields && key_path != "" && !device_key ?
                     "Removing this entry also deletes its key file. Make sure you have another way to unlock the volume." : "";
             set_response_appearance ("apply", !fields && key_path != "" && !device_key ?
@@ -1911,7 +1914,7 @@ namespace MajorisDisks {
                 try { MountOptionService.normalize_encryption (options.text, startup.active); }
                 catch (Error error) { valid = false; }
             }
-            set_response_enabled ("apply", valid && !(fields && device_key));
+            set_response_enabled ("apply", valid && !external_key && !(fields && device_key));
         }
         public void clear_secret () { secret.text = ""; }
     }

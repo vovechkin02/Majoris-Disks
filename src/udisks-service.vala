@@ -4026,15 +4026,18 @@ namespace MajorisDisks {
                         }
                         catch (Error error) {
                             synchronize ();
-                            entry.prepared = block.filesystem != null && !block.filesystem.mounted;
-                            entry.expected_state_observed = entry.prepared;
-                            entry.actual_state = entry.prepared ? "unmounted" : "mounted or unavailable";
+                            string[]? mounts = block.filesystem?.mounts;
+                            entry.prepared = !entry.matches_prepared_device (block) ||
+                                mounts == null || !entry.mount_set_matches (mounts);
+                            entry.expected_state_observed = entry.matches_prepared_device (block) &&
+                                mounts != null && mounts.length == 0;
                             throw error;
                         }
                     }
                     if (block.swap_active) {
                         var entry = new StoragePreparationEntry (StoragePreparationKind.SWAP, block.path,
                             { block.uuid, block.type_id }, "deactivate swap");
+                        entry.device_identity = StoragePreparationJournal.device_identity (block);
                         journal.add (entry);
                         entry.action_dispatched = true;
                         var swap = require_volume (block, "Swapspace");
@@ -4084,16 +4087,16 @@ namespace MajorisDisks {
                     if (entry.kind == StoragePreparationKind.MOUNT) entry.record_mount_restoration (null);
                     continue;
                 }
+                if (!entry.matches_prepared_device (block) ||
+                    (entry.kind == StoragePreparationKind.MOUNT && block.filesystem == null)) {
+                    entry.restoration_allowed = false;
+                    entry.restored = false;
+                    entry.actual_state = "device or filesystem identity changed";
+                    if (entry.kind == StoragePreparationKind.MOUNT) entry.record_mount_restoration (null);
+                    continue;
+                }
                 if (entry.kind == StoragePreparationKind.MOUNT) {
-                    if (entry.state_length () < 2 || block.uuid != entry.state_at (0) ||
-                        block.type_id != entry.state_at (1) ||
-                        entry.device_identity != StoragePreparationJournal.device_identity (block)) {
-                        entry.restoration_allowed = false;
-                        entry.actual_state = "filesystem identity changed";
-                        entry.record_mount_restoration (null);
-                        continue;
-                    }
-                    string[] actual_mounts = block.filesystem?.mounts ?? new string[0];
+                    string[] actual_mounts = block.filesystem.mounts;
                     entry.actual_state = actual_mounts.length == 0 ? "unmounted" :
                         "mounted at " + string.joinv (", ", actual_mounts);
                     entry.record_mount_restoration (actual_mounts);
@@ -4119,9 +4122,12 @@ namespace MajorisDisks {
             reconcile_preparation (journal);
             foreach (var entry in journal.restoration_order ()) {
                 if (entry.restored) continue;
+                // Earlier restoration calls can yield while UDisks changes the graph.
+                synchronize ();
+                reconcile_preparation (journal);
+                if (entry.restored || !entry.restoration_allowed) continue;
                 var block = snapshot.blocks.lookup (entry.object_path);
-                if (block == null || !block.available || entry.state_length () < 2 ||
-                    block.uuid != entry.state_at (0) || block.type_id != entry.state_at (1)) {
+                if (block == null || !entry.matches_prepared_device (block)) {
                     entry.error = "The prepared device or filesystem identity changed."; failures += entry.error; continue;
                 }
                 try {
@@ -4136,21 +4142,8 @@ namespace MajorisDisks {
                         bool exact = entry.mount_point_count () == 0;
                         for (uint i = 0; i < entry.mount_point_count (); i++)
                             exact |= entry.mount_point_at (i) == actual;
-                        if (!exact) {
-                            var cleanup_options = new VariantBuilder (new VariantType ("a{sv}"));
-                            try {
-                                yield require_volume (block, "Filesystem").call ("Unmount",
-                                    new Variant.tuple ({ cleanup_options.end () }),
-                                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
-                                synchronize ();
-                            } catch (Error cleanup_error) {
-                                throw new IOError.FAILED ("UDisks mounted the filesystem at %s instead of its previous location, and cleanup failed: %s".printf (
-                                    actual, cleanup_error.message));
-                            }
-                            throw new IOError.FAILED (entry.persistent_mount ?
-                                "The persistent mount was restored at %s instead of its configured location.".printf (actual) :
-                                "The temporary mount could not be restored at its exact previous location; the unrelated mount was removed.");
-                        }
+                        if (!exact)
+                            throw new IOError.FAILED ("UDisks mounted the filesystem at %s instead of its previous location.".printf (actual));
                     } else if (entry.kind == StoragePreparationKind.SWAP) {
                         var options = new VariantBuilder (new VariantType ("a{sv}"));
                         yield require_volume (block, "Swapspace").call ("Start", new Variant.tuple ({ options.end () }),
@@ -4798,25 +4791,7 @@ namespace MajorisDisks {
             if (!eligibility.allowed || eligibility.unknown || StorageSafetyService.assess (block, snapshot.dependencies).system_critical)
                 throw new IOError.PERMISSION_DENIED (eligibility.reason == "" ? "This system-critical mount cannot be changed here." : eligibility.reason);
             string options_text = MountOptionService.normalize (mount_options, startup);
-            if (original_item != null) {
-                bool current_entry = false;
-                foreach (var saved in block.mount_configurations)
-                    if (saved.backend_item != null && saved.backend_item.equal (original_item))
-                        current_entry = true;
-                if (!current_entry)
-                    throw new IOError.NOT_FOUND ("The selected fstab entry changed while the dialog was open.");
-            }
-            if (enabled) {
-                MountOptionService.validate_configuration (directory, filesystem, options_text);
-                foreach (var candidate in snapshot.blocks.get_values ()) {
-                    foreach (var saved in candidate.mount_configurations) {
-                        bool selected_entry = original_item != null && saved.backend_item != null &&
-                            saved.backend_item.equal (original_item);
-                        if (!selected_entry && saved.directory == directory)
-                            throw new IOError.EXISTS ("Another persistent configuration already uses this mount point.");
-                    }
-                }
-            }
+            if (enabled) MountOptionService.validate_configuration (directory, filesystem, options_text);
             int32 frequency = 0; int32 pass_number = 0;
             string device = "UUID=" + block.uuid;
             if (original_item != null) {
@@ -4841,9 +4816,24 @@ namespace MajorisDisks {
             try {
                 jobs.phase (job, StorageJobState.RUNNING, "Updating persistent mount configuration");
                 var existing = original_item;
+                synchronize ();
                 if (snapshot.blocks.lookup (block.path) != block ||
                     modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
                     throw new IOError.NOT_FOUND ("The volume changed immediately before the configuration write.");
+                if (StorageSafetyService.assess (block, snapshot.dependencies).system_critical)
+                    throw new IOError.PERMISSION_DENIED ("This system-critical mount cannot be changed here.");
+                bool current_entry = existing == null;
+                foreach (var candidate in snapshot.blocks.get_values ()) {
+                    foreach (var saved in candidate.mount_configurations) {
+                        bool selected_entry = candidate == block && existing != null &&
+                            saved.backend_item != null && saved.backend_item.equal (existing);
+                        current_entry |= selected_entry;
+                        if (enabled && !selected_entry && saved.directory == directory)
+                            throw new IOError.EXISTS ("Another persistent configuration already uses this mount point.");
+                    }
+                }
+                if (!current_entry)
+                    throw new IOError.NOT_FOUND ("The selected fstab entry changed while the dialog was open.");
                 if (!enabled && existing != null)
                     yield proxy.call ("RemoveConfigurationItem", new Variant.tuple ({ existing, options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);
@@ -4862,7 +4852,7 @@ namespace MajorisDisks {
                             saved.filesystem == (filesystem.strip () == "" ? "auto" : filesystem.strip ()) &&
                             saved.device == device && saved.backend_item != null) {
                             var saved_details = saved.backend_item.get_child_value (1);
-                            verified = saved_details.lookup_value ("freq", VariantType.INT32)?.get_int32 () == frequency &&
+                            verified |= saved_details.lookup_value ("freq", VariantType.INT32)?.get_int32 () == frequency &&
                                 saved_details.lookup_value ("passno", VariantType.INT32)?.get_int32 () == pass_number;
                         }
                     }
@@ -5128,10 +5118,15 @@ namespace MajorisDisks {
                 old_path = old_details.lookup_value ("passphrase-path", VariantType.BYTESTRING)?.get_bytestring () ?? "";
             }
             details.add ("{sv}", "device", new Variant.bytestring (device));
-            // UDisks rewrites regular keyfiles during UpdateConfigurationItem. A device-backed
-            // key reference cannot be safely round-tripped through that operation.
-            if (enabled && old_path.has_prefix ("/dev/"))
-                throw new IOError.NOT_SUPPORTED ("UDisks cannot safely edit this device-backed key reference.");
+            // UDisks unlinks the old keyfile when removing or replacing a crypttab entry.
+            // Only let this editor manage regular keyfiles in UDisks' dedicated directory.
+            if (old_path != "") {
+                if (old_path.has_prefix ("/dev/")) {
+                    if (enabled)
+                        throw new IOError.NOT_SUPPORTED ("UDisks cannot safely edit this device-backed key reference.");
+                } else if (!MountOptionService.manages_crypttab_keyfile (old_path))
+                    throw new IOError.NOT_SUPPORTED ("Editing or removing this entry through UDisks could delete an externally managed keyfile.");
+            }
             if (enabled && new_passphrase == "" && old_path != "") {
                 var secret_config = yield secret_encryption_configuration (block, old_name);
                 if (secret_config != null && secret_config.name == old_name && secret_config.device == device &&
@@ -5155,24 +5150,31 @@ namespace MajorisDisks {
             var result = new StorageOperationResult ();
             try {
                 jobs.phase (job, StorageJobState.RUNNING, "Updating protected encryption configuration");
+                synchronize ();
                 if (snapshot.blocks.lookup (block.path) != block ||
                     modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
                     throw new IOError.NOT_FOUND ("The encrypted volume changed immediately before the configuration write.");
+                if (StorageSafetyService.assess (block, snapshot.dependencies).system_critical)
+                    throw new IOError.PERMISSION_DENIED ("This system-critical encryption configuration cannot be changed here.");
                 if (original_item != null) {
                     var current = find_encryption_configuration (block, old_name);
                     if (current == null || current.backend_item == null || !current.backend_item.equal (original_item))
                         throw new IOError.NOT_FOUND ("The selected crypttab entry changed while the dialog was open.");
                 }
-                if (enabled) {
-                    foreach (var candidate in snapshot.blocks.get_values ()) {
-                        foreach (var saved in candidate.encryption_configurations) {
-                            bool selected = candidate == block && original_item != null &&
-                                saved.backend_item != null && saved.backend_item.equal (original_item);
-                            if (!selected && saved.name == name)
-                                throw new IOError.EXISTS ("Another crypttab entry already uses this mapping name.");
-                        }
+                int key_references = 0;
+                foreach (var candidate in snapshot.blocks.get_values ()) {
+                    foreach (var saved in candidate.encryption_configurations) {
+                        bool selected = candidate == block && original_item != null &&
+                            saved.backend_item != null && saved.backend_item.equal (original_item);
+                        if (enabled && !selected && saved.name == name)
+                            throw new IOError.EXISTS ("Another crypttab entry already uses this mapping name.");
+                        if (old_path != "" && !old_path.has_prefix ("/dev/") && saved.passphrase_path != "" &&
+                            Filename.canonicalize (saved.passphrase_path) == old_path)
+                            key_references++;
                     }
                 }
+                if (key_references > 1)
+                    throw new IOError.BUSY ("UDisks reports that multiple crypttab entries share this keyfile. Changing the entry could delete the shared keyfile.");
                 if (!enabled && original_item != null)
                     yield proxy.call ("RemoveConfigurationItem", new Variant.tuple ({ original_item, call_options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, backend_lifetime);

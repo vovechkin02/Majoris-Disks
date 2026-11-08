@@ -9,6 +9,12 @@ namespace MajorisDisks {
     public enum MountVisibility { DEFAULT, SHOW, HIDE }
 
     public class MountOptionService {
+        internal static bool manages_crypttab_keyfile (string path) {
+            string name = Path.get_basename (path);
+            return Path.get_dirname (path) == "/etc/luks-keys" && name != "." && name != ".." &&
+                Filename.canonicalize (path) == path;
+        }
+
         private static bool contains (string[] values, string value) {
             foreach (var candidate in values) if (candidate == value) return true;
             return false;
@@ -194,6 +200,12 @@ namespace MajorisDisks {
         public uint state_length () { return state_values.length; }
         public string state_at (uint index) { return state_values[index]; }
 
+        internal bool matches_prepared_device (StorageBlock block) {
+            return block.available && block.path == object_path && state_length () >= 2 &&
+                block.uuid == state_at (0) && block.type_id == state_at (1) &&
+                device_identity == StoragePreparationJournal.device_identity (block);
+        }
+
         public uint mount_point_count () {
             return kind == StoragePreparationKind.MOUNT && state_values.length > 2 ? state_values.length - 2 : 0;
         }
@@ -214,10 +226,16 @@ namespace MajorisDisks {
 
         public bool mount_set_matches (string[] actual_mounts) {
             if (kind != StoragePreparationKind.MOUNT || mount_point_count () != actual_mounts.length) return false;
+            var matched = new bool[actual_mounts.length];
             for (uint i = 0; i < mount_point_count (); i++) {
                 bool found = false;
-                foreach (var actual in actual_mounts)
-                    if (actual == mount_point_at (i)) { found = true; break; }
+                for (int j = 0; j < actual_mounts.length; j++) {
+                    if (!matched[j] && actual_mounts[j] == mount_point_at (i)) {
+                        matched[j] = true;
+                        found = true;
+                        break;
+                    }
+                }
                 if (!found) return false;
             }
             return actual_mounts.length != 0;
