@@ -89,7 +89,7 @@ public static int main (string[] args) {
         new PartitionMap (), new PartitionSegment (), new DriveView (), new DisksWindow (app),
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
         new DriveInformationDialog (drive), new InformationRow ("Test", "Value", false),
-        new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
+        new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new BtrfsBalanceDialog (true), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
         new OperationResultDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
         new FormatDiskDialog (), new FormatVolumeDialog (backend, block),
         new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block),
@@ -103,7 +103,7 @@ public static int main (string[] args) {
     string[] resources = {
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
         "device-row.ui", "volume-row.ui", "information-row.ui", "sidebar-group-heading.ui",
-        "drive-information-dialog.ui", "edit-filesystem-dialog.ui", "lvm-rename-dialog.ui", "lvm-lifecycle-dialog.ui", "storage-removal-dialog.ui", "lvm-create-dialog.ui", "create-storage-group-dialog.ui", "btrfs-subvolumes-dialog.ui", "edit-partition-dialog.ui",
+        "drive-information-dialog.ui", "edit-filesystem-dialog.ui", "lvm-rename-dialog.ui", "lvm-lifecycle-dialog.ui", "storage-removal-dialog.ui", "lvm-create-dialog.ui", "create-storage-group-dialog.ui", "btrfs-subvolumes-dialog.ui", "btrfs-balance-dialog.ui", "edit-partition-dialog.ui",
         "ownership-dialog.ui", "operation-result-dialog.ui", "repair-confirmation-dialog.ui",
         "delete-confirmation-dialog.ui", "format-disk-dialog.ui", "format-volume-dialog.ui",
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "job-row.ui", "jobs-popover.ui",
@@ -125,26 +125,30 @@ public static int main (string[] args) {
     var provisioned = new StorageLogicalVolume ("/test/thin") { size = 256, thin_pool_path = pool.path };
     pool_snapshot.advanced.insert (provisioned.path, provisioned);
     var usage = new ThinPoolUsage (pool_snapshot, pool);
-    assert (usage.virtual_size == 256 && usage.physical_data_remaining () == 768);
+    assert (usage.virtual_size == 256 && usage.estimated_data_remaining () == 768);
     assert (!usage.overcommits (768) && usage.overcommits (769));
     pool.metadata_allocated_ratio = 1.0;
     assert (!new ThinPoolUsage (pool_snapshot, pool).can_provision ());
     pool.metadata_allocated_ratio = 0.5;
     provisioned.size = 2048;
     usage = new ThinPoolUsage (pool_snapshot, pool);
-    assert (usage.can_provision () && usage.overcommit_ratio () == 2.0 && usage.physical_data_remaining () == 768);
+    assert (usage.can_provision () && usage.overcommit_ratio () == 2.0 && usage.estimated_data_remaining () == 768);
     var snapshot_volume = new StorageLogicalVolume ("/test/thin-snapshot") {
         size = 2048, thin_pool_path = pool.path, origin_path = provisioned.path
     };
     pool_snapshot.advanced.insert (snapshot_volume.path, snapshot_volume);
     usage = new ThinPoolUsage (pool_snapshot, pool);
-    assert (usage.virtual_size == 4096 && usage.physical_data_remaining () == 768);
+    assert (usage.virtual_size == 4096 && usage.estimated_data_remaining () == 768);
     snapshot_volume.size = uint64.MAX;
     assert (!new ThinPoolUsage (pool_snapshot, pool).virtual_known);
     pool_snapshot.advanced.remove (snapshot_volume.path);
     pool.data_allocated_ratio = 0.99;
     assert (new ThinPoolUsage (pool_snapshot, pool).can_provision ());
     pool.data_allocated_ratio = 1.0;
+    assert (new ThinPoolUsage (pool_snapshot, pool).can_shrink ());
+    pool.metadata_allocated_ratio = 1.0;
+    assert (!new ThinPoolUsage (pool_snapshot, pool).can_shrink ());
+    pool.metadata_allocated_ratio = 0.5;
     assert (!new ThinPoolUsage (pool_snapshot, pool).can_provision ());
     pool.data_allocated_ratio = 0.25;
     pool.metadata_allocated_ratio = -1;

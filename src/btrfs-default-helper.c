@@ -196,6 +196,183 @@ check_removable_member (int mount, const char *filesystem, dev_t target, guint64
     return 0;
 }
 
+static gboolean
+verify_maintenance_topology (int fd, const char *uuid, guint64 expected, gboolean reject_scrub)
+{
+    struct btrfs_ioctl_fs_info_args fs = { 0 };
+    if (expected == 0 || ioctl (fd, BTRFS_IOC_FS_INFO, &fs) != 0 || fs.num_devices != expected)
+        return FALSE;
+    g_autofree char *canonical = g_ascii_strdown (uuid, -1);
+    g_autofree char *directory = g_strdup_printf ("/sys/fs/btrfs/%s/devinfo", canonical);
+    g_autoptr(GDir) devices = g_dir_open (directory, 0, NULL);
+    if (devices == NULL) return FALSE;
+    guint64 count = 0;
+    const char *entry;
+    while ((entry = g_dir_read_name (devices)) != NULL) {
+        guint64 id;
+        if (!g_ascii_string_to_unsigned (entry, 10, 1, G_MAXUINT64, &id, NULL)) return FALSE;
+        struct btrfs_ioctl_dev_info_args device = { .devid = id };
+        struct stat info;
+        if (ioctl (fd, BTRFS_IOC_DEV_INFO, &device) != 0 ||
+            memchr (device.path, 0, sizeof device.path) == NULL ||
+            stat ((const char *) device.path, &info) != 0 || !S_ISBLK (info.st_mode) ||
+            !filesystem_member (canonical, info.st_rdev))
+            return FALSE;
+        if (reject_scrub) {
+            struct btrfs_ioctl_scrub_args scrub = { .devid = id };
+            if (ioctl (fd, BTRFS_IOC_SCRUB_PROGRESS, &scrub) == 0 || errno != ENOTCONN)
+                return FALSE;
+        }
+        count++;
+    }
+    return count == expected;
+}
+
+static int
+balance_status (int fd)
+{
+    struct btrfs_ioctl_balance_args balance = { 0 };
+    if (ioctl (fd, BTRFS_IOC_BALANCE_PROGRESS, &balance) != 0) {
+        if (errno != ENOTCONN) return fail ("Could not query Btrfs balance status.");
+        g_print ("idle 0 0 0\n");
+        return 0;
+    }
+    const char *state = balance.state & BTRFS_BALANCE_STATE_RUNNING ? "running" : "paused";
+    g_print ("%s %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT "\n", state,
+        (guint64) balance.stat.completed, (guint64) balance.stat.considered, (guint64) balance.stat.expected);
+    return 0;
+}
+
+static int
+run_balance (int fd, const char *uuid, const char *operation, guint64 usage)
+{
+    if (g_str_equal (operation, "balance-status")) return balance_status (fd);
+    struct statvfs state;
+    if (system_filesystem (uuid) || fstatvfs (fd, &state) != 0 || (state.f_flag & ST_RDONLY))
+        return fail ("The filesystem is protected or read-only.");
+    if (g_str_equal (operation, "balance-pause") || g_str_equal (operation, "balance-cancel")) {
+        int command = g_str_equal (operation, "balance-pause") ? BTRFS_BALANCE_CTL_PAUSE : BTRFS_BALANCE_CTL_CANCEL;
+        if (ioctl (fd, BTRFS_IOC_BALANCE_CTL, (unsigned long) command) != 0)
+            return fail ("The kernel did not accept the balance control request.");
+        return balance_status (fd);
+    }
+
+    struct btrfs_ioctl_balance_args balance = { 0 };
+    if (g_str_equal (operation, "balance-resume")) {
+        balance.flags = BTRFS_BALANCE_RESUME;
+    } else if (g_str_equal (operation, "balance-data")) {
+        balance.flags = BTRFS_BALANCE_DATA;
+        balance.data.flags = BTRFS_BALANCE_ARGS_USAGE;
+        balance.data.usage = usage;
+    } else if (g_str_equal (operation, "balance-metadata")) {
+        balance.flags = BTRFS_BALANCE_METADATA;
+        balance.meta.flags = BTRFS_BALANCE_ARGS_USAGE;
+        balance.meta.usage = usage;
+    } else {
+        return fail ("Unsupported balance operation.");
+    }
+    if (ioctl (fd, BTRFS_IOC_BALANCE_V2, &balance) != 0) {
+        if (errno == ECANCELED) {
+            struct btrfs_ioctl_balance_args paused = { 0 };
+            if (ioctl (fd, BTRFS_IOC_BALANCE_PROGRESS, &paused) == 0) return balance_status (fd);
+            if (errno == ENOTCONN) {
+                g_print ("interrupted 0 0 0\n");
+                return 0;
+            }
+        }
+        return fail ("The kernel did not complete the Btrfs balance.");
+    }
+    g_print ("completed %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT "\n",
+        (guint64) balance.stat.completed, (guint64) balance.stat.considered, (guint64) balance.stat.expected);
+    return 0;
+}
+
+typedef struct {
+    int fd;
+    int error;
+    struct btrfs_ioctl_scrub_args args;
+} ScrubWork;
+
+static gpointer
+read_only_scrub (gpointer data)
+{
+    ScrubWork *work = data;
+    if (ioctl (work->fd, BTRFS_IOC_SCRUB, &work->args) != 0)
+        work->error = errno;
+    return NULL;
+}
+
+static int
+run_scrub (int fd, const char *uuid, const char *operation, guint64 expected)
+{
+    if (g_str_equal (operation, "scrub-cancel")) {
+        if (system_filesystem (uuid) || ioctl (fd, BTRFS_IOC_SCRUB_CANCEL) != 0)
+            return fail ("The kernel did not accept the scrub cancellation.");
+        g_print ("interrupted 0 0 0\n");
+        return 0;
+    }
+    gboolean query = g_str_equal (operation, "scrub-status");
+    if (!query && (!g_str_equal (operation, "scrub-readonly") || system_filesystem (uuid)))
+        return fail ("Scrub is unavailable for this request or protected filesystem.");
+    g_autofree char *canonical = g_ascii_strdown (uuid, -1);
+    if (!query) {
+        g_autofree char *exclusive_path = g_strdup_printf ("/sys/fs/btrfs/%s/exclusive_operation", canonical);
+        g_autofree char *exclusive = NULL;
+        if (!g_file_get_contents (exclusive_path, &exclusive, NULL, NULL) ||
+            !g_str_equal (g_strstrip (exclusive), "none"))
+            return fail ("A conflicting exclusive Btrfs operation is active or unknown.");
+    }
+    g_autofree char *path = g_strdup_printf ("/sys/fs/btrfs/%s/devinfo", canonical);
+    g_autoptr(GDir) devices = g_dir_open (path, 0, NULL);
+    if (devices == NULL || expected > 64)
+        return fail ("Could not verify the scrub device set.");
+    ScrubWork work[64] = { 0 };
+    GThread *workers[64] = { 0 };
+    guint count = 0;
+    const char *entry;
+    while ((entry = g_dir_read_name (devices)) != NULL) {
+        guint64 id;
+        if (count == expected || !g_ascii_string_to_unsigned (entry, 10, 1, G_MAXUINT64, &id, NULL))
+            return fail ("The scrub device set changed.");
+        work[count].fd = fd;
+        work[count].args.devid = id;
+        work[count].args.end = G_MAXUINT64;
+        work[count].args.flags = BTRFS_SCRUB_READONLY;
+        count++;
+    }
+    if (count != expected)
+        return fail ("The scrub device count changed.");
+    gboolean running = FALSE;
+    for (guint i = 0; i < count; i++) {
+        if (ioctl (fd, BTRFS_IOC_SCRUB_PROGRESS, &work[i].args) == 0)
+            running = TRUE;
+        else if (errno != ENOTCONN)
+            return fail ("Could not verify the current scrub state.");
+    }
+    if (running && !query)
+        return fail ("A Btrfs scrub is already running.");
+    if (!query)
+        for (guint i = 0; i < count; i++)
+            workers[i] = g_thread_new ("btrfs-scrub", read_only_scrub, &work[i]);
+
+    guint64 read_errors = 0, checksums = 0, uncorrectable = 0;
+    gboolean interrupted = FALSE, failed = FALSE;
+    for (guint i = 0; i < count; i++) {
+        if (!query) g_thread_join (workers[i]);
+        struct btrfs_scrub_progress *p = &work[i].args.progress;
+        read_errors += MIN (G_MAXUINT64 - read_errors, p->read_errors);
+        checksums += MIN (G_MAXUINT64 - checksums, p->csum_errors);
+        uncorrectable += MIN (G_MAXUINT64 - uncorrectable, p->uncorrectable_errors);
+        interrupted |= work[i].error == ECANCELED;
+        failed |= work[i].error != 0 && work[i].error != ECANCELED;
+    }
+    if (failed) return fail ("At least one Btrfs member scrub could not complete.");
+    g_print ("%s %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT "\n",
+        query ? (running ? "running" : "idle") : interrupted ? "interrupted" : "completed",
+        read_errors, checksums, uncorrectable);
+    return 0;
+}
+
 int
 main (int argc, char **argv)
 {
@@ -203,8 +380,10 @@ main (int argc, char **argv)
     gboolean check = argc == 7 && g_str_equal (argv[1], "check-unmounted");
     gboolean allow_allocated = argc == 7 && g_str_equal (argv[1], "check-removable-member");
     gboolean check_member = allow_allocated || (argc == 7 && g_str_equal (argv[1], "check-empty-member"));
+    gboolean balance = (argc == 6 || argc == 7) && g_str_has_prefix (argv[1], "balance-");
+    gboolean scrub = argc == 6 && g_str_has_prefix (argv[1], "scrub-");
     guint64 device, expected = 0, target = 0, current;
-    if (geteuid () != 0 || (!set && !check && !check_member && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
+    if (geteuid () != 0 || (!set && !check && !check_member && !balance && !scrub && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
         !g_path_is_absolute (argv[2]) || !g_uuid_string_is_valid (argv[3]) ||
         !g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &device, NULL) ||
         (set && (!g_ascii_string_to_unsigned (argv[5], 10, 5, G_MAXUINT64, &expected, NULL) ||
@@ -215,6 +394,23 @@ main (int argc, char **argv)
     dev_t mount_source = 0;
     if (mount < 0 || !matches_mount (mount, argv[2], device, argv[3], &mount_source) || !matches_uuid (mount, argv[3]))
         return fail ("The Btrfs mount or its source identity changed.");
+
+    if (scrub) {
+        guint64 count;
+        if (!g_ascii_string_to_unsigned (argv[5], 10, 1, 64, &count, NULL) ||
+            !verify_maintenance_topology (mount, argv[3], count, FALSE))
+            return fail ("Could not verify the Btrfs scrub member topology.");
+        return run_scrub (mount, argv[3], argv[1], count);
+    }
+    if (balance) {
+        guint64 count, usage = 0;
+        gboolean filtered = g_str_equal (argv[1], "balance-data") || g_str_equal (argv[1], "balance-metadata");
+        if (!g_ascii_string_to_unsigned (argv[5], 10, 1, G_MAXUINT64, &count, NULL) ||
+            (filtered ? argc != 7 || !g_ascii_string_to_unsigned (argv[6], 10, 0, 100, &usage, NULL) : argc != 6) ||
+            !verify_maintenance_topology (mount, argv[3], count, filtered || g_str_equal (argv[1], "balance-resume")))
+            return fail ("Could not verify the Btrfs maintenance request, member topology or scrub state.");
+        return run_balance (mount, argv[3], argv[1], usage);
+    }
 
     if (check_member) {
         guint64 member, count;

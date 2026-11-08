@@ -9,6 +9,7 @@
       <response id="activate" appearance="suggested">Activate</response>
       <response id="deactivate">Deactivate</response>
       <response id="snapshot">Create Snapshot…</response>
+      <response id="expand-pool">Expand Thin Pool…</response>
       <response id="delete" appearance="destructive">Delete LV…</response>
       <response id="migrate">Migrate Selected PV…</response>
       <response id="remove-pv">Remove Selected PV…</response>

@@ -326,6 +326,10 @@ namespace MajorisDisks {
             return active && usage_known && virtual_known && data_ratio < 1 && metadata_ratio < 1;
         }
 
+        public bool can_shrink () {
+            return active && usage_known && metadata_ratio < 1;
+        }
+
         public uint64 virtual_limit () {
             return can_provision () ? uint64.MAX - virtual_size : 0;
         }
@@ -335,7 +339,7 @@ namespace MajorisDisks {
                 virtual_size + additional > physical_size;
         }
 
-        public uint64 physical_data_remaining () {
+        public uint64 estimated_data_remaining () {
             if (!usage_known || data_ratio >= 1) return 0;
             if (data_ratio == 0) return physical_size;
             double remaining = (double) physical_size * (1.0 - data_ratio);

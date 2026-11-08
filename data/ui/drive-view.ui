@@ -42,6 +42,7 @@
 <child><object class="GtkButton" id="raid_add"><property name="label">Add RAID Member…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="raid_remove_spare"><property name="label">Remove Inactive RAID Member…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="raid_check"><property name="label">Check RAID Consistency</property><property name="visible">false</property></object></child>
+<child><object class="GtkButton" id="btrfs_balance"><property name="label">Btrfs Maintenance…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="btrfs_allocation"><property name="label">Btrfs Allocation…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="btrfs_remove"><property name="label">Remove Btrfs Device…</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="btrfs_add"><property name="label">Add Btrfs Device…</property><property name="visible">false</property></object></child>

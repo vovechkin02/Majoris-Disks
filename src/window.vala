@@ -88,6 +88,7 @@ namespace MajorisDisks {
             drive_view.btrfs_add_requested.connect ((block) => change_btrfs_member (block, false));
             drive_view.btrfs_remove_requested.connect ((block) => change_btrfs_member (block, true));
             drive_view.btrfs_allocation_requested.connect (show_btrfs_allocation);
+            drive_view.btrfs_balance_requested.connect (manage_btrfs_balance);
             drive_view.mount_options_requested.connect (edit_mount_options);
             drive_view.encryption_requested.connect (manage_encryption);
             drive_view.passphrase_requested.connect (change_passphrase);
@@ -330,6 +331,19 @@ namespace MajorisDisks {
             });
         }
 
+        private void manage_btrfs_balance (StorageBlock block) {
+            string identity = backend.modification_identity (block);
+            var dialog = new BtrfsBalanceDialog (!block.read_only && !block.system_hint, !block.system_hint);
+            dialog.response.connect ((response) => {
+                if (response == "close") return;
+                backend.btrfs_maintenance.begin (block, identity, response, dialog.usage_limit, (object, result) => {
+                    try { show_check_message ("Btrfs Maintenance", backend.btrfs_maintenance.end (result)); }
+                    catch (Error error) { show_check_message ("Could not confirm Btrfs maintenance", operation_error (error)); }
+                });
+            });
+            dialog.present (this);
+        }
+
         private void show_btrfs_allocation (StorageBlock block) {
             backend.query_btrfs_allocation.begin (block, (object, result) => {
                 try {
@@ -558,6 +572,11 @@ namespace MajorisDisks {
                 }
                 var volume = dialog.selection;
                 if (volume == null || response == "close") return;
+                if (response == "expand-pool" || (volume.lvm_type == "pool" &&
+                    (response == "delete" || response == "deactivate"))) {
+                    confirm_thin_pool_change (context, identity, volume, response == "delete", response == "deactivate");
+                    return;
+                }
                 if (response == "snapshot") {
                     create_logical_volume (context, volume);
                     return;
@@ -579,6 +598,59 @@ namespace MajorisDisks {
                 }
             });
             dialog.present (this);
+        }
+
+        private void confirm_thin_pool_change (StorageBlock context, string identity, StorageLogicalVolume pool,
+            bool deleting, bool deactivate) {
+            var group = context.volume_group;
+            if (group == null) return;
+            string path = pool.path;
+            string uuid = pool.uuid;
+            if (!deleting && !deactivate) {
+                var dialog = new CreateLogicalVolumeDialog (group, null, pool.size, false);
+                dialog.heading = "Expand Thin Pool";
+                dialog.response.connect ((response) => {
+                    if (response == "create") change_thin_pool (context, path, uuid, identity, dialog.bytes);
+                });
+                dialog.present (this);
+                return;
+            }
+            string[] dependents = {};
+            foreach (var item in backend.snapshot.advanced.get_values ()) {
+                var child = item as StorageLogicalVolume;
+                if (child != null && (child.thin_pool_path == path || child.origin_path == path))
+                    dependents += child.name;
+            }
+            if (dependents.length != 0) {
+                show_check_message ("Thin pool still contains volumes", string.joinv (", ", dependents));
+                return;
+            }
+            var confirm = new StorageRemovalDialog (false) {
+                heading = deactivate ? "Deactivate Empty Thin Pool?" : "Delete Empty Thin Pool?",
+                body = deactivate ? "Deactivate the empty pool %s.".printf (pool.name) :
+                    "Delete the inactive pool %s and release its data and metadata extents to the volume group.".printf (pool.name)
+            };
+            if (deactivate) confirm.set_response_label ("remove", "Deactivate");
+            confirm.response.connect ((response) => {
+                if (response == "remove") change_thin_pool (context, path, uuid, identity, 0, deactivate);
+            });
+            confirm.present (this);
+        }
+
+        private void change_thin_pool (StorageBlock context, string path, string uuid, string identity, uint64 size,
+            bool deactivate = false) {
+            if (pending.contains (context.path)) return;
+            pending.insert (context.path, context);
+            backend.change_thin_pool.begin (context, path, uuid, identity, size, deactivate, (object, result) => {
+                pending.remove (context.path);
+                try {
+                    backend.change_thin_pool.end (result);
+                    notifications.add_toast (new Adw.Toast (deactivate ? "Empty thin pool deactivated" :
+                        size == 0 ? "Empty thin pool deleted" : "Thin-pool data capacity expanded"));
+                } catch (Error error) {
+                    show_check_message ("Could not confirm the thin-pool operation", operation_error (error));
+                }
+            });
         }
 
         private void confirm_lvm_membership (StorageBlock member, string choice) {
@@ -1801,6 +1873,20 @@ namespace MajorisDisks {
             return summary;
         }
     }
+    [GtkTemplate (ui = "/com/majoris/disks/ui/btrfs-balance-dialog.ui")]
+    internal class BtrfsBalanceDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Gtk.SpinButton usage;
+        public uint usage_limit { get { return (uint) usage.get_value_as_int (); } }
+
+        public BtrfsBalanceDialog (bool writable, bool scrubbable = true) {
+            set_response_enabled ("scrub-readonly", scrubbable);
+            set_response_enabled ("scrub-cancel", scrubbable);
+            foreach (string action in new string[] { "balance-data", "balance-metadata", "balance-pause",
+                "balance-resume", "balance-cancel" })
+                set_response_enabled (action, writable);
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/btrfs-subvolumes-dialog.ui")]
     internal class BtrfsSubvolumesDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.ComboRow subvolumes;
@@ -2068,15 +2154,16 @@ namespace MajorisDisks {
             uint64 limit = thin ? usage?.virtual_limit () ?? 0 : maximum;
             if (thin_resize)
                 limit = usage != null && usage.can_provision () ? resize_from +
-                    uint64.min (uint64.MAX - resize_from, usage.virtual_limit ()) : 0;
+                    uint64.min (uint64.MAX - resize_from, usage.virtual_limit ()) :
+                    usage?.can_shrink () == true ? resize_from : 0;
             if (thin) {
                 if (usage == null) thin_pool.subtitle = "No thin pools are available.";
                 else if (!usage.usage_known || !usage.virtual_known || !usage.active)
                     thin_pool.subtitle = "Pool is inactive or its allocation is unknown.";
                 else {
-                    thin_pool.subtitle = "%s physical · %s virtual (%.2f×) · %.1f%% data · %.1f%% metadata · %s physical data remaining".printf (
+                    thin_pool.subtitle = "%s total pool size · %s virtual (%.2f×) · %.1f%% data · %.1f%% metadata · estimated data space remaining %s".printf (
                         format_size (usage.physical_size), format_size (usage.virtual_size), usage.overcommit_ratio (),
-                        usage.data_ratio * 100.0, usage.metadata_ratio * 100.0, format_size (usage.physical_data_remaining ()));
+                        usage.data_ratio * 100.0, usage.metadata_ratio * 100.0, format_size (usage.estimated_data_remaining ()));
                     if (usage.data_ratio >= ThinPoolUsage.WARNING_RATIO || usage.metadata_ratio >= ThinPoolUsage.WARNING_RATIO)
                         thin_pool.subtitle += " · Pool usage is at or above 90%";
                 }
@@ -2087,12 +2174,17 @@ namespace MajorisDisks {
             bytes = aligned ? size : 0;
             uint64 additional = size > resize_from ? size - resize_from : 0;
             overcommit.visible = aligned && usage != null && additional > 0 && usage.overcommits (additional);
+            string invalid_capacity = thin_resize && usage?.can_shrink () != true ?
+                "An active pool with known allocation and free metadata is required." :
+                thin_resize && usage?.can_provision () != true ?
+                    "Growth is unavailable. Enter a smaller extent-aligned size to shrink." :
+                    "Enter an exact multiple of the extent size within the available capacity.";
             allocation.subtitle = aligned
                 ? (thin ? "%s virtual capacity · %s total virtual afterward".printf (format_size (size),
                     format_size (usage.virtual_size + size)) :
                     resize_from == 0 ? "%s allocated · %s free afterward".printf (format_size (size), format_size (group.free_size - size)) :
                     "%s resulting capacity".printf (format_size (size)))
-                : "Enter an exact multiple of the extent size within the available capacity.";
+                : invalid_capacity;
             bool valid_name = UDisksService.valid_lvm_name (volume_name) && !(volume_name in used_names);
             set_response_enabled ("create", aligned && (!overcommit.visible || overcommit.active) &&
                 (resize_from == 0 ? valid_name :
@@ -2141,11 +2233,14 @@ namespace MajorisDisks {
 
         private void update_buttons () {
             var volume = selection;
-            set_response_enabled ("activate", volume != null && !volume.active);
-            set_response_enabled ("deactivate", volume?.active == true);
+            set_response_enabled ("activate", volume != null && volume.lvm_type == "block" && !volume.active);
+            set_response_enabled ("deactivate", volume?.active == true &&
+                (volume.lvm_type == "block" || (physical_context && volume.lvm_type == "pool")));
+            set_response_enabled ("expand-pool", physical_context && volume?.lvm_type == "pool" && volume.active);
             set_response_enabled ("snapshot", physical_context && volume != null && volume.active &&
                 volume.lvm_type == "block" && (volume.origin_path == "/" || volume.thin_pool_path != "/"));
-            set_response_enabled ("delete", volume != null && (!volume.active ||
+            set_response_enabled ("delete", volume != null && (volume.lvm_type == "pool" ?
+                physical_context && !volume.active : !volume.active ||
                 (volume.origin_path != "/" && volume.thin_pool_path == "/")));
         }
     }

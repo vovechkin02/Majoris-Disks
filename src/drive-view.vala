@@ -44,6 +44,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button btrfs_add;
         [GtkChild] private unowned Gtk.Button btrfs_remove;
         [GtkChild] private unowned Gtk.Button btrfs_allocation;
+        [GtkChild] private unowned Gtk.Button btrfs_balance;
         [GtkChild] private unowned Gtk.Button mount_options;
         [GtkChild] private unowned Gtk.Button unlock_volume;
         [GtkChild] private unowned Gtk.Button lock_volume;
@@ -70,6 +71,7 @@ namespace MajorisDisks {
         public signal void btrfs_add_requested (StorageBlock block);
         public signal void btrfs_remove_requested (StorageBlock block);
         public signal void btrfs_allocation_requested (StorageBlock block);
+        public signal void btrfs_balance_requested (StorageBlock block);
         public signal void mount_options_requested (StorageBlock block);
         public signal void encryption_requested (StorageBlock block, bool unlock);
         public signal void passphrase_requested (StorageBlock block);
@@ -180,6 +182,9 @@ namespace MajorisDisks {
             });
             raid_check.clicked.connect (() => {
                 if (selected_block != null) raid_check_requested (selected_block);
+            });
+            btrfs_balance.clicked.connect (() => {
+                if (selected_block != null) btrfs_balance_requested (selected_block);
             });
             btrfs_allocation.clicked.connect (() => {
                 if (selected_block != null) btrfs_allocation_requested (selected_block);
@@ -352,6 +357,7 @@ namespace MajorisDisks {
             btrfs_add.visible = false;
             btrfs_remove.visible = false;
             btrfs_allocation.visible = false;
+            btrfs_balance.visible = false;
             mount_options.visible = false;
             take_ownership.visible = false;
             edit_partition.visible = false;
@@ -396,6 +402,7 @@ namespace MajorisDisks {
             btrfs_subvolumes.visible = backend?.has_btrfs_subvolumes (block) == true;
             btrfs_add.visible = btrfs_subvolumes.visible && !block.read_only && !block.system_hint;
             btrfs_allocation.visible = btrfs_subvolumes.visible;
+            btrfs_balance.visible = btrfs_subvolumes.visible;
             if (btrfs_add.visible && backend != null)
                 foreach (var candidate in backend.snapshot.blocks.get_values ())
                     btrfs_remove.visible |= backend.can_select_btrfs_removal_member (block, candidate);

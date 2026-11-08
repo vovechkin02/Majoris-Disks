@@ -1466,6 +1466,88 @@ namespace MajorisDisks {
             return report;
         }
 
+        internal async string btrfs_maintenance (StorageBlock block, string identity, string action, uint usage) throws Error {
+            bool start = action == "balance-data" || action == "balance-metadata";
+            bool scrub = action.has_prefix ("scrub-");
+            bool long_running = start || action == "balance-resume" || action == "scrub-readonly";
+            bool status = action == "balance-status" || action == "scrub-status";
+            if ((!long_running && !status && action != "balance-pause" && action != "balance-cancel" &&
+                action != "scrub-cancel") || usage > 100)
+                throw new IOError.INVALID_ARGUMENT ("Invalid Btrfs maintenance operation.");
+            synchronize ();
+            var proxy = require_volume (block, "Filesystem.BTRFS");
+            string uuid = proxy.get_cached_property ("uuid")?.get_string () ?? "";
+            uint64 count = proxy.get_cached_property ("num_devices")?.get_uint64 () ?? 0;
+            string[] mounts = block.filesystem?.mounts ?? new string[0];
+            if (creation_identity_changed (block, identity) || mounts.length != 1 ||
+                !Uuid.string_is_valid (uuid) || count == 0 || block.number == 0)
+                throw new IOError.NOT_FOUND ("A stable Btrfs mount and device identity are required.");
+            if (!FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE) ||
+                !FileUtils.test (BTRFS_DEFAULT_HELPER, FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("Install the authorized Btrfs helper to manage Btrfs maintenance.");
+            StorageBlock[] members = {};
+            foreach (var member in snapshot.blocks.get_values ()) {
+                if (member.type_id != "btrfs" || member.uuid != uuid || !member.available) continue;
+                if (!status) {
+                    var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                    if ((!scrub && member.read_only) || safety.system_critical || safety.unknown_dependencies || safety.active_dependents)
+                        throw new IOError.BUSY ("A Btrfs member is protected or has unresolved dependencies.");
+                }
+                members += member;
+            }
+            if (members.length != count)
+                throw new IOError.NOT_SUPPORTED ("The complete Btrfs member set is required.");
+
+            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", BTRFS_DEFAULT_HELPER,
+                action, mounts[0], uuid, block.number.to_string (), count.to_string () };
+            if (start) argv += usage.to_string ();
+            var lifetime = backend_lifetime;
+            StorageJob? job = null;
+            if (long_running) {
+                locks.acquire_members (block, members, snapshot.dependencies);
+                job = jobs.begin (scrub ? "Read-only Btrfs scrub" : "Btrfs balance", block, snapshot.dependencies);
+                jobs.phase (job, StorageJobState.RUNNING, "Waiting for the Btrfs kernel operation");
+            }
+            var outcome = new StorageOperationResult ();
+            bool dispatched = false;
+            try {
+                lifetime.set_error_if_cancelled ();
+                var helper = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+                dispatched = true;
+                string? output, diagnostic;
+                yield helper.communicate_utf8_async (null, status ? lifetime : null, out output, out diagnostic);
+                if (!helper.get_successful ())
+                    throw new IOError.FAILED (diagnostic?.strip () ?? "Btrfs maintenance did not complete.");
+                var fields = (output ?? "").strip ().split (" ");
+                uint64 completed = 0, considered = 0, expected = 0;
+                if (fields.length != 4 || !(fields[0] in new string[] { "idle", "running", "paused", "completed", "interrupted" }) ||
+                    !uint64.try_parse (fields[1], out completed) || !uint64.try_parse (fields[2], out considered) ||
+                    !uint64.try_parse (fields[3], out expected))
+                    throw new IOError.INVALID_DATA ("The Btrfs helper returned invalid maintenance status.");
+                synchronize ();
+                lifetime.set_error_if_cancelled ();
+                if (creation_identity_changed (block, identity) || require_volume (block, "Filesystem.BTRFS") != proxy ||
+                    proxy.get_cached_property ("uuid")?.get_string () != uuid ||
+                    proxy.get_cached_property ("num_devices")?.get_uint64 () != count)
+                    throw new IOError.NOT_FOUND ("The Btrfs filesystem changed during maintenance.");
+                outcome.summary = (scrub ? "Scrub %s · %s read errors · %s checksum errors · %s uncorrectable errors" :
+                    "Balance %s · %s completed · %s examined · %s expected chunks").printf (
+                    fields[0], completed.to_string (), considered.to_string (), expected.to_string ());
+                outcome.successful = fields[0] == "completed" && (!scrub || (completed == 0 && considered == 0 && expected == 0));
+                if (long_running && !outcome.successful) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                return outcome.summary;
+            } catch (Error error) {
+                outcome.fail ("Could not confirm the Btrfs maintenance outcome", error);
+                if (dispatched && long_running) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                if (job != null) {
+                    jobs.finish (job, outcome);
+                    locks.release (block);
+                }
+            }
+        }
+
         internal bool can_select_btrfs_removal_member (StorageBlock filesystem, StorageBlock member) {
             return filesystem != member && filesystem.uuid != "" && filesystem.uuid == member.uuid &&
                 filesystem.number != member.number && member.number != 0 && member.type_id == "btrfs" &&
@@ -2671,6 +2753,125 @@ namespace MajorisDisks {
             return pool;
         }
 
+        internal async void change_thin_pool (StorageBlock context, string path, string uuid,
+            string identity, uint64 new_size, bool deactivate = false) throws Error {
+            synchronize ();
+            require_volume (context, "Block");
+            var group = context.volume_group;
+            var pool = snapshot.advanced.lookup (path) as StorageLogicalVolume;
+            var proxy = manager?.get_interface (path, PREFIX + "LogicalVolume") as DBusProxy;
+            var vg = group != null ? manager?.get_interface (group.path, PREFIX + "VolumeGroup") as DBusProxy : null;
+            string vg_uuid = vg?.get_cached_property ("UUID")?.get_string () ?? "";
+            if (group == null || pool == null || pool.lvm_type != "pool" || pool.group_path != group.path ||
+                uuid == "" || pool.uuid != uuid || proxy == null || vg == null || vg_uuid == "" ||
+                creation_identity_changed (context, identity))
+                throw new IOError.NOT_FOUND ("The selected thin pool or volume group changed.");
+            bool deleting = new_size == 0 && !deactivate;
+            uint64 previous_size = pool.size;
+            StorageBlock[] members = {};
+            string[] identities = {};
+            foreach (var block in snapshot.blocks.get_values ()) {
+                if (block.volume_group != group) continue;
+                members += block;
+                identities += modification_identity (block);
+            }
+            locks.acquire_members (context, members, snapshot.dependencies);
+            var job = jobs.begin (deactivate ? "Deactivate empty thin pool" :
+                deleting ? "Delete thin pool" : "Expand thin pool", context, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Verifying pool dependencies and physical extents");
+                foreach (var member in members) {
+                    var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                    if (safety.system_critical || safety.unknown_dependencies || member.read_only)
+                        throw new IOError.BUSY ("The volume group contains protected or unresolved storage.");
+                    if (deleting) yield KernelStorageSafety.require_idle (member, lifetime);
+                }
+                synchronize ();
+                if (manager?.get_interface (path, PREFIX + "LogicalVolume") != proxy ||
+                    manager?.get_interface (group.path, PREFIX + "VolumeGroup") != vg ||
+                    snapshot.advanced.lookup (path) != pool || pool.uuid != uuid ||
+                    vg.get_cached_property ("UUID")?.get_string () != vg_uuid ||
+                    pool.size != previous_size || creation_identity_changed (context, identity) ||
+                    (vg.get_cached_property ("MissingPhysicalVolumes")?.n_children () ?? 1) != 0 ||
+                    volume_group_has_backend_job (group, members))
+                    throw new IOError.BUSY ("The pool or volume group changed, is incomplete, or is busy.");
+                int live_members = 0;
+                foreach (var member in snapshot.blocks.get_values ())
+                    if (member.volume_group == group) live_members++;
+                if (live_members != members.length)
+                    throw new IOError.NOT_FOUND ("The physical member set changed.");
+                for (int i = 0; i < members.length; i++)
+                    if (creation_identity_changed (members[i], identities[i]) || members[i].volume_group != group)
+                        throw new IOError.NOT_FOUND ("A physical member changed.");
+                var children = new HashTable<string, string> (str_hash, str_equal);
+                foreach (var item in snapshot.advanced.get_values ()) {
+                    var lv = item as StorageLogicalVolume;
+                    if (lv == null || (lv.thin_pool_path != path && lv.origin_path != path)) continue;
+                    if (lv.uuid == "")
+                        throw new IOError.NOT_FOUND ("A dependent volume cannot be identified.");
+                    children.insert (lv.path, lv.uuid);
+                }
+                var usage = new ThinPoolUsage (snapshot, pool);
+                uint64 free_before = vg.get_cached_property ("FreeSize")?.get_uint64 () ?? uint64.MAX;
+                uint64 extent = vg.get_cached_property ("ExtentSize")?.get_uint64 () ?? 0;
+                if (free_before == uint64.MAX || extent == 0 || previous_size == 0)
+                    throw new IOError.INVALID_DATA ("The volume group did not report valid extent geometry.");
+                if (deleting || deactivate) {
+                    if (children.size () != 0 || pool.active != deactivate ||
+                        (proxy.get_cached_property ("ChildConfiguration")?.n_children () ?? 1) != 0 ||
+                        proxy.get_cached_property ("BlockDevice")?.get_string () != "/")
+                        throw new IOError.BUSY ("The pool must be empty, in the expected active state, and have no persistent configuration.");
+                } else if (new_size <= previous_size || new_size % extent != 0 ||
+                    new_size - previous_size > free_before || !usage.active || !usage.usage_known) {
+                    throw new IOError.NOT_SUPPORTED ("Choose an extent-aligned growth size that fits the VG. The pool must be active with known usage.");
+                }
+                jobs.phase (job, StorageJobState.RUNNING, deactivate ? "Deactivating the empty thin pool" :
+                    deleting ? "Deleting the empty thin pool" : "Expanding thin-pool data capacity");
+                dispatched = true;
+                var options = new Variant ("a{sv}", null);
+                yield call_tracked_method (job, proxy, deactivate ? "Deactivate" : deleting ? "Delete" : "Resize",
+                    deleting || deactivate ? new Variant ("(@a{sv})", options) :
+                        new Variant ("(t@a{sv})", new_size, options), lifetime);
+                yield poll_volume_group (vg, lifetime);
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    lifetime.set_error_if_cancelled ();
+                    if (manager?.get_interface (group.path, PREFIX + "VolumeGroup") != vg ||
+                        vg.get_cached_property ("UUID")?.get_string () != vg_uuid)
+                        break;
+                    var current = snapshot.advanced.lookup (path) as StorageLogicalVolume;
+                    uint64 free = vg.get_cached_property ("FreeSize")?.get_uint64 () ?? uint64.MAX;
+                    bool verified = deleting ? current == null && free != uint64.MAX && free > free_before :
+                        deactivate ? current?.uuid == uuid && !current.active && current.size == previous_size &&
+                            proxy.get_cached_property ("BlockDevice")?.get_string () == "/" :
+                        current?.uuid == uuid && current.size == new_size &&
+                        new ThinPoolUsage (snapshot, current).usage_known && free != uint64.MAX && free < free_before;
+                    foreach (var child_path in children.get_keys ()) {
+                        var child = snapshot.advanced.lookup (child_path) as StorageLogicalVolume;
+                        verified &= child?.uuid == children.lookup (child_path) && child.thin_pool_path == path;
+                    }
+                    if (verified) {
+                        result.successful = true;
+                        result.summary = deactivate ? "Empty thin pool deactivated" :
+                            deleting ? "Empty thin pool deleted" : "Thin-pool data capacity expanded";
+                        return;
+                    }
+                    yield settle_delay (lifetime);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the thin-pool result.");
+            } catch (Error error) {
+                result.fail ("Could not confirm the thin-pool operation", error);
+                if (dispatched) result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                jobs.finish (job, result);
+                locks.release (context);
+            }
+        }
+
         internal async string change_logical_volume_state (StorageBlock context, string path, string uuid,
             string context_identity, string method) throws Error {
             if (method != "Activate" && method != "Deactivate" && method != "Delete")
@@ -2813,8 +3014,13 @@ namespace MajorisDisks {
                 throw new IOError.NOT_FOUND ("The thin pool changed.");
             var usage = new ThinPoolUsage (snapshot, pool);
             uint64 growth = new_size > old_size ? new_size - old_size : 0;
+            if (new_size < old_size) {
+                if (!usage.can_shrink ())
+                    throw new IOError.NO_SPACE ("Shrinking requires an active thin pool with known usage and available metadata space.");
+                return;
+            }
             if (!usage.can_provision () || growth > usage.virtual_limit ())
-                throw new IOError.NO_SPACE ("Thin-pool allocation is unavailable or exhausted.");
+                throw new IOError.NO_SPACE ("Thin-pool provisioning is unavailable or exhausted.");
             if (growth > 0 && usage.overcommits (growth) && !confirm_overcommit)
                 throw new IOError.PERMISSION_DENIED ("Confirm virtual capacity above the physical pool capacity.");
         }
