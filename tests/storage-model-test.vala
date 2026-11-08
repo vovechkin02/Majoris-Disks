@@ -976,6 +976,14 @@ private async void exercise_image_workflows () throws Error {
         assert (BenchmarkResult.average (measured.throughput) > 0);
         assert (DiskBenchmark.position (2097152, 4096, 512, 0, 4) == 0);
         assert (DiskBenchmark.position (2097152, 4096, 512, 3, 4) == 2097152 - 4096);
+        assert (measured.throughput_positions.length == measured.throughput.length);
+        assert (measured.latency_positions.length == measured.latency.length);
+        assert (measured.throughput_positions[0] == 0);
+        assert (measured.throughput_positions[3] == (2097152 - 4096) / 2097152.0);
+        foreach (double position in measured.latency_positions) {
+            double sector = position * (2097152 / 512);
+            assert (position >= 0 && position < 1 && sector == (uint64) sector);
+        }
         job.cancellable.cancel ();
         try {
             yield DiskImageCopy.copy (input, output, 1, jobs, job);

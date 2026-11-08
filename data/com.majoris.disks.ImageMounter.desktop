@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Disk Image Mounter
+Comment=Attach a disk image with Disks
+Exec=majoris-disks %f
+Icon=drive-removable-media
+Type=Application
+NoDisplay=true
+Terminal=false
+StartupNotify=true
+MimeType=application/x-cd-image;application/x-raw-disk-image;

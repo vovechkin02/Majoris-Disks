@@ -125,6 +125,17 @@ The follow-up build on Debian 13.5 passed, as did the staged install. The defaul
 
 The identity fix passes scalar offset and partition number values into the GVariant tuple. With the prior nullable expressions, generated C passed boxed pointers for those fields. The rebuilt default suite passed. A successful partition restore in a suitable live UDisks environment remains outstanding. The failed privileged runs retained two read-only source fixtures under `/tmp/majoris-image-devices-ZD2MY3` and `/tmp/majoris-image-devices-ZGIZY3`.
 
+## Benchmark and image-launcher follow-up
+
+| Register ID | Implementation | Verification | Final result |
+|---|---|---|---|
+| DIAG-02 | `DiskBenchmark.measure_sync` records the normalized device offset of each throughput and latency sample. `BenchmarkDialog` plots those positions, persists them with the results, and shows sample counts, units and summary statistics. Older saved measurements retain their statistics. | `storage-model` exercises real reads from a temporary file and checks sample counts, read endpoints and sector alignment. `ui-templates` instantiates the updated dialog. | Passed those tests. Physical-device measurements, interactive chart inspection and cancellation remain open. DIAG-01 still covers scratch-file writes and the separate raw device-write request. |
+| IMG-11 | The installed Disk Image Mounter desktop entry registers optical and raw image types and opens a single local file in the existing Disks process. The same confirmation is used from the picker and external launch. ISO files only offer read-only attachment, which the UDisks service wrapper also enforces. | Staged Meson install, `desktop-file-validate` and an isolated Xvfb and D-Bus CLI smoke test. | The staged desktop entry validated. A single path containing spaces launched the application. Two paths returned status 2. Live attachment through a file manager and UDisks remains open. |
+
+The benchmark adapts repeatable seeded access sampling and position-based plotting from GNOME Disks' `gdu-benchmark-dialog.c`. The sampling adaptation retains upstream attribution. The launcher follows the file-open pattern in GNOME's `src/disk-image-mounter/application.rs` and uses Majoris' existing confirmation, UDisks authorization and verified loop setup.
+
+This follow-up built on Debian 13.5 with `meson setup build/audit-current`, `meson compile -C build/audit-current` and `meson test -C build/audit-current --print-errorlogs`. The six default tests listed above passed again, including the existing mock UDisks and native helper checks. The same eight opt-in cases skipped. The staged install passed. The isolated graphical smoke emitted an Adwaita warning that the navigation split view requested 665 pixels at a width of 640. No physical-device or destructive disposable-device operation was run in this follow-up. Full parity and release acceptance remain open.
+
 ## Platform scope
 
 Use mount paths and fstab for persistent volume assignment, LVM/mdraid for Linux storage sets, Btrfs/LVM snapshots for Linux snapshot workflows, and LUKS for Linux encryption. Native drive letters, LDM, BitLocker management, APFS/FileVault and proprietary DMG/sparsebundle formats are excluded.

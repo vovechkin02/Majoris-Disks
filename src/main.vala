@@ -1,7 +1,8 @@
 namespace MajorisDisks {
     public class Application : Adw.Application {
         public Application () {
-            Object (application_id: "com.majoris.disks", flags: ApplicationFlags.HANDLES_COMMAND_LINE);
+            Object (application_id: "com.majoris.disks",
+                flags: ApplicationFlags.HANDLES_COMMAND_LINE | ApplicationFlags.HANDLES_OPEN);
             add_main_option ("drive", 0, OptionFlags.NONE, OptionArg.STRING, "Select a drive by identity", "ID");
             var preferences = new SimpleAction ("preferences", null);
             preferences.activate.connect (() => new HealthPreferences ().present (active_window));
@@ -32,10 +33,28 @@ namespace MajorisDisks {
         }
 
         protected override int command_line (ApplicationCommandLine command) {
+            var args = command.get_arguments ();
+            if (args.length > 2) {
+                command.printerr ("Open one disk image at a time.\n");
+                return 2;
+            }
+            if (args.length == 2) {
+                open ({ command.create_file_for_arg (args[1]) }, "");
+                return 0;
+            }
             activate ();
             string? identity = command.get_options_dict ().lookup_value ("drive", VariantType.STRING)?.get_string ();
             if (identity != null) (active_window as DisksWindow)?.select_drive (identity);
             return 0;
+        }
+
+        protected override void open (File[] files, string hint) {
+            activate ();
+            if (files.length != 1) {
+                (active_window as DisksWindow)?.show_image_open_error ("Open one disk image at a time.");
+                return;
+            }
+            (active_window as DisksWindow)?.confirm_attach_image (files[0]);
         }
 
         protected override void activate () {

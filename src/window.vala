@@ -1082,23 +1082,42 @@ namespace MajorisDisks {
             chooser.open.begin (this, null, (object, result) => {
                 File file;
                 try { file = chooser.open.end (result); } catch (Error error) { return; }
-                string name = (file.get_basename () ?? "").down ();
-                if (name.has_suffix (".vhd") || name.has_suffix (".vhdx") || name.has_suffix (".qcow2")) {
-                    inspect_virtual_image (file);
-                    return;
-                }
-                var confirmation = new DiskImageConfirmation () {
-                    heading = "Attach Disk Image?",
-                    body = file.get_parse_name () + "\n\nRead/write access allows changes to the image file."
-                };
-                confirmation.set_response_label ("proceed", "Attach Read-Only");
-                confirmation.set_response_appearance ("proceed", Adw.ResponseAppearance.SUGGESTED);
-                confirmation.add_response ("writable", "Attach Read/Write");
-                confirmation.response.connect ((response) => {
-                    if (response == "proceed" || response == "writable") attach_image (file, response == "proceed");
-                });
-                confirmation.present (this);
+                confirm_attach_image (file);
             });
+        }
+
+        internal void show_image_open_error (string detail) {
+            show_check_message ("Could not open disk image", detail);
+        }
+
+        internal void confirm_attach_image (File file) {
+            string name = (file.get_basename () ?? "").down ();
+            if (file.get_path () == null) {
+                show_image_open_error ("Choose a local disk image.");
+                return;
+            }
+            if (name.has_suffix (".vhd") || name.has_suffix (".vhdx") || name.has_suffix (".qcow2")) {
+                inspect_virtual_image (file);
+                return;
+            }
+            bool optical = name.has_suffix (".iso");
+            if (!optical && !name.has_suffix (".img") && !name.has_suffix (".raw")) {
+                show_image_open_error ("Choose a RAW, ISO, VHD, VHDX or QCOW2 image.");
+                return;
+            }
+            var confirmation = new DiskImageConfirmation () {
+                heading = "Attach Disk Image?",
+                body = optical ? file.get_parse_name () :
+                    file.get_parse_name () + "\n\nRead/write access allows changes to the image file."
+            };
+            confirmation.set_response_label ("proceed", "Attach Read-Only");
+            confirmation.set_response_appearance ("proceed", Adw.ResponseAppearance.SUGGESTED);
+            if (!optical) confirmation.add_response ("writable", "Attach Read/Write");
+            confirmation.response.connect ((response) => {
+                if (response == "proceed" || (!optical && response == "writable"))
+                    attach_image (file, response == "proceed");
+            });
+            confirmation.present (this);
         }
 
         private void attach_image (File file, bool read_only, string? completed = null) {

@@ -983,8 +983,11 @@ namespace MajorisDisks {
 
         internal async string attach_disk_image (File source, bool read_only) throws Error {
             string? path = source.get_path ();
-            if (path == null || !(path.has_suffix (".img") || path.has_suffix (".iso") || path.has_suffix (".raw")))
+            string name = (source.get_basename () ?? "").down ();
+            if (path == null || !(name.has_suffix (".img") || name.has_suffix (".iso") || name.has_suffix (".raw")))
                 throw new IOError.INVALID_ARGUMENT ("Choose a local raw .img, .iso or .raw image.");
+            if (!read_only && name.has_suffix (".iso"))
+                throw new IOError.INVALID_ARGUMENT ("Optical images can only be attached read-only.");
             var lifetime = backend_lifetime;
             if (owner == null) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
             var job = jobs.begin_named ("Attach disk image", source.get_parse_name (), {});

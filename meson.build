@@ -57,6 +57,8 @@ test('disposable-loop-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],
   timeout: 120)
 install_data('data/com.majoris.disks.desktop', install_dir: get_option('datadir') / 'applications')
+install_data('data/com.majoris.disks.ImageMounter.desktop',
+  install_dir: get_option('datadir') / 'applications')
 install_data('data/com.majoris.disks.metainfo.xml', install_dir: get_option('datadir') / 'metainfo')
 install_data('data/icons/hicolor/scalable/apps/com.majoris.disks.svg',
   install_dir: get_option('datadir') / 'icons/hicolor/scalable/apps')

@@ -15,8 +15,14 @@ namespace MajorisDisks {
         public BenchmarkDialog (UDisksService backend, StorageDrive drive) {
             var block = drive.medium;
             title = "Benchmark " + drive.name;
-            throughput.set_draw_func ((area, cr, width, height) => draw (area, cr, width, height, measurements?.throughput ?? new double[0]));
-            latency.set_draw_func ((area, cr, width, height) => draw (area, cr, width, height, measurements?.latency ?? new double[0]));
+            throughput.set_draw_func ((area, cr, width, height) => {
+                if (measurements != null)
+                    draw (area, cr, width, height, measurements.throughput, measurements.throughput_positions);
+            });
+            latency.set_draw_func ((area, cr, width, height) => {
+                if (measurements != null)
+                    draw (area, cr, width, height, measurements.latency, measurements.latency_positions);
+            });
             start.sensitive = block != null;
             string identity = DriveHealth.identity (drive);
             string? saved = null;
@@ -29,6 +35,10 @@ namespace MajorisDisks {
                     var previous = new BenchmarkResult ();
                     previous.throughput = keyfile.get_double_list ("result", "throughput");
                     previous.latency = keyfile.get_double_list ("result", "latency");
+                    if (keyfile.has_key ("result", "throughput-positions"))
+                        previous.throughput_positions = keyfile.get_double_list ("result", "throughput-positions");
+                    if (keyfile.has_key ("result", "latency-positions"))
+                        previous.latency_positions = keyfile.get_double_list ("result", "latency-positions");
                     string mode = keyfile.has_key ("result", "mode") ? keyfile.get_string ("result", "mode") : "Direct I/O";
                     show_result (previous, "Saved " + keyfile.get_string ("result", "date") + " · " + mode);
                 } catch (Error error) {}
@@ -65,6 +75,8 @@ namespace MajorisDisks {
                                 var keyfile = new KeyFile ();
                                 keyfile.set_double_list ("result", "throughput", current.throughput);
                                 keyfile.set_double_list ("result", "latency", current.latency);
+                                keyfile.set_double_list ("result", "throughput-positions", current.throughput_positions);
+                                keyfile.set_double_list ("result", "latency-positions", current.latency_positions);
                                 keyfile.set_string ("result", "mode", mode);
                                 keyfile.set_string ("result", "date", new DateTime.now_local ().format ("%F %R"));
                                 try { keyfile.save_to_file (saved); } catch (Error error) {
@@ -85,29 +97,32 @@ namespace MajorisDisks {
             double low_read, high_read, low_latency, high_latency;
             BenchmarkResult.range (result.throughput, out low_read, out high_read);
             BenchmarkResult.range (result.latency, out low_latency, out high_latency);
-            summary.label = "%s\nRead: %s/s mean · %s/s minimum · %s/s maximum\nAccess: %.2f ms mean · %.2f ms minimum · %.2f ms maximum".printf (
-                label, format_size ((uint64) BenchmarkResult.average (result.throughput)),
+            summary.label = "%s\nRead (%d samples): %s/s mean · %s/s minimum · %s/s maximum\nAccess (%d samples): %.2f ms mean · %.2f ms minimum · %.2f ms maximum".printf (
+                label, result.throughput.length, format_size ((uint64) BenchmarkResult.average (result.throughput)),
                 format_size ((uint64) low_read), format_size ((uint64) high_read),
-                BenchmarkResult.average (result.latency), low_latency, high_latency);
+                result.latency.length, BenchmarkResult.average (result.latency), low_latency, high_latency);
+            if (result.throughput_positions.length != result.throughput.length ||
+                result.latency_positions.length != result.latency.length)
+                summary.label += "\nThis saved measurement predates position charts. Run the benchmark to plot it.";
             throughput.queue_draw ();
             latency.queue_draw ();
         }
 
-        private static void draw (Gtk.DrawingArea area, Cairo.Context cr, int width, int height, double[] values) {
-            if (values.length < 2 || width < 10 || height < 10) return;
+        private static void draw (Gtk.DrawingArea area, Cairo.Context cr, int width, int height,
+            double[] values, double[] positions) {
+            if (values.length < 2 || values.length != positions.length || width < 10 || height < 10) return;
             double max = 0;
             foreach (var value in values) max = double.max (max, value);
             if (max <= 0) return;
             var colour = area.get_style_context ().get_color ();
             cr.set_source_rgba (colour.red, colour.green, colour.blue, colour.alpha);
-            cr.set_line_width (2);
             for (int i = 0; i < values.length; i++) {
-                double x = 4 + (width - 8) * i / (double) (values.length - 1);
+                double x = 4 + (width - 8) * positions[i];
                 double y = height - 4 - (height - 8) * values[i] / max;
-                if (i == 0) cr.move_to (x, y);
-                else cr.line_to (x, y);
+                cr.new_sub_path ();
+                cr.arc (x, y, 2, 0, 2 * Math.PI);
             }
-            cr.stroke ();
+            cr.fill ();
         }
     }
 }

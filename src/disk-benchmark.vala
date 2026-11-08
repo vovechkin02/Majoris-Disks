@@ -2,6 +2,8 @@ namespace MajorisDisks {
     internal class BenchmarkResult : Object {
         public double[] throughput = {};
         public double[] latency = {};
+        public double[] throughput_positions = {};
+        public double[] latency_positions = {};
         public uint64 sample_bytes;
         public static double average (double[] values) {
             double total = 0;
@@ -128,22 +130,30 @@ namespace MajorisDisks {
                 throw new IOError.NO_SPACE ("Could not allocate the benchmark buffer.");
             var result = new BenchmarkResult ();
             result.sample_bytes = bytes;
-            var random = new Rand ();
+            // Repeatable access sampling adapted from GNOME Disks, gdu-benchmark-dialog.c.
+            // Copyright (C) 2008-2013 Red Hat, Inc. GPL-2.0-or-later.
+            var random = new Rand.with_seed (42);
             try {
                 for (int stage = 0; stage < 2; stage++) {
                     for (int i = 0; i < count; i++) {
                         token.set_error_if_cancelled ();
                         uint64 length = stage == 0 ? bytes : sector;
                         uint64 offset = stage == 0 ? position (capacity, bytes, sector, i, count) :
-                            (uint64) (random.next_double () * ((capacity - sector) / sector)) * sector;
+                            (uint64) (random.next_double () * (capacity / sector)) * sector;
                         int64 start = get_monotonic_time ();
                         ssize_t got = -1;
                         do { got = read_at (fd, buffer, (size_t) length, (Posix.off_t) offset); }
                         while (got < 0 && Posix.errno == Posix.EINTR);
                         int64 elapsed = int64.max (1, get_monotonic_time () - start);
                         if (got != length) throw new IOError.FAILED ("The device returned an incomplete benchmark read.");
-                        if (stage == 0) result.throughput += bytes * 1000000.0 / elapsed;
-                        else result.latency += elapsed / 1000.0;
+                        double position_fraction = offset / (double) capacity;
+                        if (stage == 0) {
+                            result.throughput += bytes * 1000000.0 / elapsed;
+                            result.throughput_positions += position_fraction;
+                        } else {
+                            result.latency += elapsed / 1000.0;
+                            result.latency_positions += position_fraction;
+                        }
                         string phase = "%s · %d of %d samples".printf (stage == 0 ? "Read throughput" : "Access time", i + 1, count);
                         double fraction = (stage * count + i + 1) / (2.0 * count);
                         var progress = new IdleSource ();
