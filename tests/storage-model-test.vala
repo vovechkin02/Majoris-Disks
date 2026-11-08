@@ -636,6 +636,15 @@ private void test_mount_option_normalization () {
         assert (MountOptionService.normalize ("defaults,noauto,rw", true) == "defaults,rw");
         assert (MountOptionService.normalize ("rw,noauto", false) == "rw,noauto");
         assert (MountOptionService.normalize ("", false) == "defaults,noauto");
+        assert (MountOptionService.normalize_encryption ("", true) == "");
+        assert (MountOptionService.normalize_encryption ("", false) == "noauto");
+        assert (MountOptionService.normalize_encryption ("luks,noauto,nofail", true) == "luks,nofail");
+        foreach (var destructive in new string[] { "swap", "tmp", "tmp=ext4" }) {
+            bool unsafe_option = false;
+            try { MountOptionService.normalize_encryption (destructive, true); }
+            catch (IOError error) { unsafe_option = true; }
+            assert (unsafe_option);
+        }
         assert (MountOptionService.compose ("defaults", "Archive, 2026", MountVisibility.DEFAULT) ==
             "defaults,x-gvfs-name=Archive\\054\\0402026");
         string saved = "defaults,x-gvfs-name=Archive\\054\\0402026";

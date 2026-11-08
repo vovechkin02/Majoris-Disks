@@ -56,6 +56,22 @@ namespace MajorisDisks {
             return string.joinv (",", result);
         }
 
+        public static string normalize_encryption (string input, bool startup) throws Error {
+            string[] result = {};
+            if (input.strip () != "") {
+                foreach (var option in parse (input)) {
+                    string name = option.split ("=")[0];
+                    if (name.has_prefix ("x-gvfs-") || name == "subvol" || name == "subvolid" ||
+                        name == "compress" || name == "compress-force" || name == "swap" || name == "tmp" ||
+                        option.contains (" ") || option.contains ("\t"))
+                        throw new IOError.INVALID_ARGUMENT ("The option ‘%s’ is not valid here.".printf (name));
+                    if (option != "auto" && option != "noauto") result += option;
+                }
+            }
+            if (!startup) result += "noauto";
+            return string.joinv (",", result);
+        }
+
         public static string display_name (string input) {
             try {
                 foreach (var option in parse (input))

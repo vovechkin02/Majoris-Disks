@@ -1379,12 +1379,13 @@ namespace MajorisDisks {
         public string mount_point { owned get { return directory.text; } }
         public string filesystem_type { owned get { return filesystem.text; } }
         private StorageBlock block;
+        private StorageMountConfiguration[] configurations;
         public string confirmed_identity { get; private set; }
         public string confirmed_uuid { get; private set; }
         private Gtk.StringList entries = new Gtk.StringList (null);
         private Gtk.StringList visibility_choices = new Gtk.StringList ({ "Use system default", "Show", "Hide" });
         public Variant? original_item { owned get {
-            return entry.selected < block.mount_configurations.length ? block.mount_configurations[entry.selected].backend_item : null;
+            return entry.selected < configurations.length ? configurations[entry.selected].backend_item : null;
         } }
         public string mount_options { owned get {
             try { return MountOptionService.compose (options.text, display_name.text,
@@ -1394,7 +1395,8 @@ namespace MajorisDisks {
         public MountOptionsDialog (StorageBlock block, string identity) {
             this.block = block; confirmed_identity = identity; files_visibility.model = visibility_choices;
             confirmed_uuid = block.uuid; entry.model = entries;
-            foreach (var item in block.mount_configurations) entries.append (item.directory + " · " + item.device);
+            configurations = block.mount_configurations;
+            foreach (var item in configurations) entries.append (item.directory + " · " + item.device);
             entries.append ("New configuration");
             entry.selected = 0;
             entry.notify["selected"].connect (load_selected);
@@ -1404,13 +1406,13 @@ namespace MajorisDisks {
             display_name.changed.connect (validate); files_visibility.notify["selected"].connect (validate); validate ();
         }
         private void load_selected () {
-            var config = entry.selected < block.mount_configurations.length ? block.mount_configurations[entry.selected] : null;
+            var config = entry.selected < configurations.length ? configurations[entry.selected] : null;
             custom.active = config != null; startup.active = config == null || !("," + config.options + ",").contains (",noauto,");
             directory.text = config?.directory ?? "/mnt/" + (block.label == "" ? block.uuid : block.label);
             filesystem.text = config?.filesystem ?? block.type_id; options.text = config?.options ?? "defaults";
             display_name.text = MountOptionService.display_name (options.text);
             files_visibility.selected = (uint) MountOptionService.visibility (options.text);
-            identifier.subtitle = "UUID=" + block.uuid;
+            identifier.subtitle = config?.device ?? "UUID=" + block.uuid;
             validate ();
         }
         private void validate () {
@@ -1578,47 +1580,55 @@ namespace MajorisDisks {
         public string new_passphrase { owned get { return secret.text; } }
         public string confirmed_identity { get; private set; }
         public string confirmed_uuid { get; private set; }
-        private StorageBlock block;
+        private StorageEncryptionConfiguration[] configurations;
+        private string default_options;
         private Gtk.StringList entries = new Gtk.StringList (null);
         public Variant? original_item { owned get {
-            return entry.selected < block.encryption_configurations.length ?
-                block.encryption_configurations[entry.selected].backend_item : null;
+            return entry.selected < configurations.length ? configurations[entry.selected].backend_item : null;
         } }
         public EncryptionOptionsDialog (StorageBlock block, string identity) {
-            this.block = block;
+            configurations = block.encryption_configurations;
+            default_options = block.physical_drive?.removable == true ? "nofail,noauto" : "nofail";
             confirmed_identity = identity; confirmed_uuid = block.uuid;
             entry.model = entries;
-            foreach (var configuration in block.encryption_configurations)
+            foreach (var configuration in configurations)
                 entries.append (configuration.name + " · " + configuration.device);
             entries.append ("New configuration"); entry.selected = 0;
-            identifier.subtitle = "UUID=" + block.uuid;
             entry.notify["selected"].connect (load_selected);
             custom.notify["active"].connect (validate); startup.notify["active"].connect (validate);
             mapping_name.changed.connect (validate); options.changed.connect (validate); secret.changed.connect (validate);
             load_selected ();
         }
         private void load_selected () {
-            var configuration = entry.selected < block.encryption_configurations.length ?
-                block.encryption_configurations[entry.selected] : null;
+            var configuration = entry.selected < configurations.length ? configurations[entry.selected] : null;
             custom.active = configuration != null;
-            mapping_name.text = configuration?.name ?? "luks-" + block.uuid;
-            options.text = configuration?.options ?? (block.physical_drive?.removable == true ? "nofail,noauto" : "nofail");
+            mapping_name.text = configuration?.name ?? "luks-" + confirmed_uuid;
+            options.text = configuration?.options ?? default_options;
             startup.active = !("," + options.text + ",").contains (",noauto,");
             keyfile.subtitle = configuration == null || configuration.passphrase_path == "" ? "None" :
                 configuration.passphrase_path;
+            identifier.subtitle = configuration?.device ?? "UUID=" + confirmed_uuid;
             secret.text = ""; validate ();
         }
         private void validate () {
             bool fields = custom.active;
+            var configuration = entry.selected < configurations.length ? configurations[entry.selected] : null;
+            string key_path = configuration?.passphrase_path ?? "";
+            bool device_key = key_path.has_prefix ("/dev/");
+            body = fields && device_key ? "UDisks cannot safely edit an entry that uses a device as its key." :
+                !fields && key_path != "" && !device_key ?
+                    "Removing this entry also deletes its key file. Make sure you have another way to unlock the volume." : "";
+            set_response_appearance ("apply", !fields && key_path != "" && !device_key ?
+                Adw.ResponseAppearance.DESTRUCTIVE : Adw.ResponseAppearance.SUGGESTED);
             startup.sensitive = fields; mapping_name.sensitive = fields; options.sensitive = fields;
             secret.sensitive = fields;
             bool valid = !fields || (mapping_name.text.strip () != "" && !mapping_name.text.contains ("/") &&
                 !mapping_name.text.contains (",") && !mapping_name.text.contains (" "));
-            if (valid && fields) {
-                try { MountOptionService.normalize (options.text, startup.active); }
+            if (valid && fields && !device_key) {
+                try { MountOptionService.normalize_encryption (options.text, startup.active); }
                 catch (Error error) { valid = false; }
             }
-            set_response_enabled ("apply", valid);
+            set_response_enabled ("apply", valid && !(fields && device_key));
         }
         public void clear_secret () { secret.text = ""; }
     }

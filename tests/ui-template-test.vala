@@ -61,6 +61,28 @@ private void test_lvm_poll () throws Error {
     if (failure != null) throw failure;
 }
 
+private void test_restore_rejects_parent_image (UDisksService backend, StorageBlock disk, StorageBlock partition)
+    throws Error {
+    string path;
+    int fd = FileUtils.open_tmp ("majoris-restore-parent-XXXXXX", out path);
+    try {
+        Posix.Stat source;
+        assert (Posix.fstat (fd, out source) == 0);
+        backend.snapshot.dependencies.add (disk, partition);
+        disk.loop = new StorageLoopDevice () { backing_file = path };
+        try {
+            backend.check_image_filesystem (partition, source);
+            assert_not_reached ();
+        } catch (IOError error) {
+            assert (error is IOError.INVALID_ARGUMENT);
+        }
+    } finally {
+        disk.loop = null;
+        Posix.close (fd);
+        FileUtils.unlink (path);
+    }
+}
+
 public static int main (string[] args) {
     string? display = Environment.get_variable ("DISPLAY");
     try { test_lvm_poll (); }
@@ -80,6 +102,8 @@ public static int main (string[] args) {
     block.partition.uuid = "test-partition-uuid";
     block.partition.offset = 1024 * 1024; block.parent = disk; block.filesystem = new StorageFilesystem ();
     disk.table.partitions = { block }; backend.snapshot.blocks.insert (block.path, block);
+    try { test_restore_rejects_parent_image (backend, disk, block); }
+    catch (Error error) { stderr.printf ("%s\n", error.message); return 1; }
     string disk_identity = backend.modification_identity (disk);
     assert (disk_identity == backend.modification_identity (disk));
     string partition_identity = backend.modification_identity (block);
@@ -126,6 +150,20 @@ public static int main (string[] args) {
         catch (Error error) { critical ("Missing resource %s: %s", name, error.message); return 1; }
     }
     assert (instances.length == resources.length);
+    var mount_item = new Variant.string ("original fstab entry");
+    var crypt_item = new Variant.string ("original crypttab entry");
+    block.mount_configurations = {
+        new StorageMountConfiguration () { directory = "/mnt/original", backend_item = mount_item }
+    };
+    block.encryption_configurations = {
+        new StorageEncryptionConfiguration () { name = "original-mapping", backend_item = crypt_item }
+    };
+    var mount_dialog = new MountOptionsDialog (block, partition_identity);
+    var encryption_dialog = new EncryptionOptionsDialog (block, partition_identity);
+    block.mount_configurations = {};
+    block.encryption_configurations = {};
+    assert (mount_dialog.original_item.equal (mount_item));
+    assert (encryption_dialog.original_item.equal (crypt_item));
     assert (UDisksService.valid_lvm_name ("valid-lv_1.2+data"));
     var pool_snapshot = new StorageSnapshot ();
     var pool = new StorageLogicalVolume ("/test/pool") {

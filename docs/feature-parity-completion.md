@@ -95,6 +95,18 @@ The baseline already provides filtered Btrfs balance, read-only scrub, restricte
 
 The partition action in `DriveView` adapts the target routing in `src/disks/gdu-block-row.c:restore_partition_image_cb` from the supplied GNOME archive. The local adaptation retains the upstream copyright and GPL-2.0-or-later attribution. The GNOME Rust restore dialog was inspected for the prepare, open, write and rescan sequence. Majoris continues to use its existing restore backend and storage jobs.
 
+The configuration fixes also reference GNOME's `gdu-mount-options-dialog.c` and `gdu-encryption-options-dialog.c`, including its use of UDisks to fetch existing protected key material. This pass adds no copied GNOME functions.
+
+## Follow-up implementation evidence
+
+| Register ID | Changes in this pass | Remaining acceptance |
+|---|---|---|
+| FS-08, FS-09 | The mount dialog retains the entries it displayed even if UDisks refreshes the device. The backend rejects a stale entry, preserves its existing device reference, dump frequency and fsck pass number, and checks those fields after UDisks updates the entry. New entries use UUIDs. | Verify add, edit, remove, multiple mount points and reconnection using a disposable UDisks fixture. |
+| SEC-01 | The encryption dialog retains the selected entry across refresh. A rename looks up protected key material using the original mapping name. Removal skips the secret read and warns when UDisks also deletes the keyfile. Existing device references are retained. The dialog and service share crypttab-specific validation for startup options and reject `swap` and `tmp`, which could overwrite mapped data. | Verify with disposable LUKS mappings. UDisks updates rewrite a regular keyfile and cannot safely round-trip device-backed key references through this editor. The UI disables edits of those references. Binary/shared keyfiles and live mapping reconciliation still require separate coverage. |
+| IMG-01 | Restore checks the target and its upstream devices for the source backing-file inode, including when the selected target is a partition. The service repeats the check after preflight and checks cancellation before preparing the device. | Successful RAW and XZ writes and readback on a disposable partition, and mid-write cancellation, remain open. Both opt-in tests on Debian WSL returned `NotAuthorizedCanObtain` during source loop setup. |
+
+The follow-up build on Debian 13.5 passed, as did the staged install. The default Meson run passed six cases and skipped eight. `storage-model` includes the new crypttab option checks. `ui-templates` includes regressions for the fstab and crypttab dialog selections after a model refresh, and for rejecting a partition's parent backing file as the image source. These tests use model objects and a temporary file. They do not exercise live configuration writes or a partition restore. The two opt-in failures retained fixtures under `/tmp/majoris-image-devices-4JSNY3` and `/tmp/majoris-image-devices-F5ZNY3`.
+
 ## Release gates
 
 - **REL-01 — Passed.** Debian 13.5 in WSL, Meson 1.7.0, Vala 0.56.18, GTK 4.18.6 and libadwaita 1.7.6. Ran `meson setup build/parity-validation`, `meson compile -C build/parity-validation`, `meson test -C build/parity-validation --print-errorlogs` and a staged `meson install`. The build emits warnings. Staging does not execute the installed schema post-install hook.
