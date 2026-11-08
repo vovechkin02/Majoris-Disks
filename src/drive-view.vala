@@ -362,7 +362,7 @@ namespace MajorisDisks {
                 (block.volume_group?.free_size ?? 0) > 0;
             raid_check.visible = backend?.can_check_raid (block) == true;
             raid_add.visible = block.available && !block.system_hint && block.raid?.state == "idle";
-            raid_remove_spare.visible = backend?.can_remove_raid_spare (block) == true;
+            raid_remove_spare.visible = backend?.can_remove_inactive_raid_member (block) == true;
             raid_delete.visible = backend?.can_delete_stopped_raid (block) == true;
             raid_power.visible = backend?.can_set_raid_running (block, block.raid == null) == true;
             raid_power.label = block.raid == null ? "Start RAID Array" : "Stop RAID Array";
@@ -385,7 +385,8 @@ namespace MajorisDisks {
             var scheme = current?.medium?.table?.scheme;
             edit_partition.visible = delete_partition.visible && block.filesystem?.mounted != true &&
                 (scheme == "gpt" || (scheme == "dos" && block.partition?.logical != true));
-            resize_volume.visible = block.partition != null && block.available &&
+            resize_volume.visible = backend?.can_resize_logical_volume (block) == true ||
+                block.partition != null && block.available &&
                 !block.read_only && !block.system_hint && block.backing_path == "/" && block.raid_path == "/" &&
                 block.logical_volume_path == "/";
             add_volume_field ("Device", block.preferred, true);

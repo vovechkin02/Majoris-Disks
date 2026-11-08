@@ -1,6 +1,71 @@
 using MajorisDisks;
 
+[DBus (name = "org.freedesktop.UDisks2.VolumeGroup")]
+private interface PollFixture : Object {
+    public abstract void poll () throws DBusError, IOError;
+}
+
+private class DelayedPollFixture : Object, PollFixture {
+    public bool requested;
+    public bool published;
+
+    public void poll () throws DBusError, IOError {
+        requested = true;
+
+    }
+}
+
+private async void exercise_lvm_poll (DBusProxy proxy, DelayedPollFixture fixture) throws Error {
+    for (int state = 0; state < 3; state++) {
+        fixture.requested = false;
+        fixture.published = false;
+        proxy.set_cached_property ("NeedsPolling", state == 2 ? null : new Variant.boolean (state == 1));
+        yield UDisksService.poll_volume_group (proxy, new Cancellable ());
+        assert (fixture.requested);
+        assert (!fixture.published);
+        Idle.add (() => {
+            fixture.published = true;
+            exercise_lvm_poll.callback ();
+            return Source.REMOVE;
+        });
+        yield;
+        assert (fixture.published);
+    }
+}
+
+private void test_lvm_poll () throws Error {
+    var bus = new TestDBus (TestDBusFlags.NONE);
+    bus.up ();
+    var flags = DBusConnectionFlags.AUTHENTICATION_CLIENT | DBusConnectionFlags.MESSAGE_BUS_CONNECTION;
+    var server = new DBusConnection.for_address_sync (bus.get_bus_address (), flags);
+    var client = new DBusConnection.for_address_sync (bus.get_bus_address (), flags);
+    var fixture = new DelayedPollFixture ();
+    uint registration = server.register_object<PollFixture> ("/test/vg", fixture);
+    var proxy = new DBusProxy.sync (client, DBusProxyFlags.DO_NOT_LOAD_PROPERTIES | DBusProxyFlags.DO_NOT_CONNECT_SIGNALS,
+        null, server.get_unique_name (), "/test/vg", "org.freedesktop.UDisks2.VolumeGroup");
+    var loop = new MainLoop ();
+    Error? failure = null;
+    exercise_lvm_poll.begin (proxy, fixture, (object, result) => {
+        try { exercise_lvm_poll.end (result); }
+        catch (Error error) { failure = error; }
+        loop.quit ();
+    });
+    loop.run ();
+    server.unregister_object (registration);
+    client.close_sync ();
+    server.close_sync ();
+    proxy = null;
+    client = null;
+    server = null;
+    bus.down ();
+    if (failure != null) throw failure;
+}
+
 public static int main (string[] args) {
+    string? display = Environment.get_variable ("DISPLAY");
+    try { test_lvm_poll (); }
+    catch (Error error) { stderr.printf ("%s\n", error.message); return 1; }
+    if (display != null) Environment.set_variable ("DISPLAY", display, true);
     Gtk.init ();
     Adw.init ();
     var backend = new UDisksService ();

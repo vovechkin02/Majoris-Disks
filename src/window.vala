@@ -262,7 +262,7 @@ namespace MajorisDisks {
                 var anchor = array;
                 string array_identity = backend.modification_identity (anchor);
                 var confirm = new HardwareActionConfirmationDialog () {
-                    heading = "Remove RAID Spare?",
+                    heading = "Remove Inactive RAID Member?",
                     body = "Remove %s from the array. Its RAID metadata will be retained.".printf (block.preferred)
                 };
                 confirm.response.connect ((choice) => {
@@ -280,7 +280,7 @@ namespace MajorisDisks {
                 pending.remove (anchor.path);
                 try {
                     backend.change_raid_member.end (result);
-                    notifications.add_toast (new Adw.Toast (add ? "RAID member added" : "RAID spare removed"));
+                    notifications.add_toast (new Adw.Toast (add ? "RAID member added" : "Inactive RAID member removed"));
                 } catch (Error error) {
                     show_check_message ("Could not confirm the RAID member change", operation_error (error));
                 }
@@ -330,15 +330,21 @@ namespace MajorisDisks {
                     var dialog = new BtrfsSubvolumesDialog (entries, !block.read_only && !block.system_hint);
                     dialog.response.connect ((response) => {
                         if (pending.contains (block.path)) return;
+                        if (response == "delete") {
+                            var selected_subvolume = dialog.snapshot_source;
+                            if (selected_subvolume != null)
+                                confirm_btrfs_subvolume_delete (block, identity, selected_subvolume);
+                            return;
+                        }
                         if (response == "create" || response == "snapshot") {
                             var source = response == "snapshot" ? dialog.snapshot_source : null;
                             if (response == "snapshot" && source == null) return;
                             pending.insert (block.path, block);
-                            backend.create_btrfs_subvolume.begin (block, dialog.new_name, identity,
-                                source, dialog.read_only_snapshot, (object, created) => {
+                            backend.change_btrfs_subvolume.begin (block, dialog.new_name, identity,
+                                source, dialog.read_only_snapshot, false, (object, created) => {
                                 pending.remove (block.path);
                                 try {
-                                    backend.create_btrfs_subvolume.end (created);
+                                    backend.change_btrfs_subvolume.end (created);
                                     notifications.add_toast (new Adw.Toast (source == null ? "Btrfs subvolume created" : "Btrfs snapshot created"));
                                 } catch (Error error) {
                                     show_check_message ("Could not confirm Btrfs creation", operation_error (error));
@@ -363,6 +369,30 @@ namespace MajorisDisks {
                     show_check_message ("Could not list Btrfs subvolumes", operation_error (error));
                 }
             });
+        }
+
+        private void confirm_btrfs_subvolume_delete (StorageBlock block, string identity, BtrfsSubvolume subvolume) {
+            var confirm = new StorageRemovalDialog (false) {
+                heading = subvolume.snapshot ? "Delete Btrfs Snapshot?" : "Delete Btrfs Subvolume?",
+                body = "%s on %s will be permanently deleted. Mounted and nested subvolumes are protected.".printf (
+                    subvolume.path, block.preferred)
+            };
+            confirm.response.connect ((response) => {
+                if (response != "remove" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.change_btrfs_subvolume.begin (block, subvolume.path, identity, subvolume, false, true,
+                    (object, result) => {
+                        pending.remove (block.path);
+                        try {
+                            backend.change_btrfs_subvolume.end (result);
+                            notifications.add_toast (new Adw.Toast (subvolume.snapshot ? "Btrfs snapshot deleted" : "Btrfs subvolume deleted"));
+                            list_btrfs_subvolumes (block);
+                        } catch (Error error) {
+                            show_check_message ("Could not confirm Btrfs deletion", operation_error (error));
+                        }
+                    });
+            });
+            confirm.present (this);
         }
 
         private void create_storage_group (bool raid) {
@@ -785,6 +815,10 @@ namespace MajorisDisks {
         }
 
         private void resize_volume (StorageBlock block) {
+            if (block.logical_volume != null) {
+                resize_lvm_volume (block);
+                return;
+            }
             string identity = backend.modification_identity (block);
             ResizeVolumeDialog dialog;
             try { dialog = new ResizeVolumeDialog (backend, block); }
@@ -811,6 +845,30 @@ namespace MajorisDisks {
             });
             dialog.present (this);
         }
+        private void resize_lvm_volume (StorageBlock block) {
+            var group = backend.snapshot.advanced.lookup (block.logical_volume.group_path) as StorageVolumeGroup;
+            if (group == null) return;
+            string identity = backend.modification_identity (block);
+            var dialog = new CreateLogicalVolumeDialog (group, null, block.size, block.filesystem != null);
+            dialog.response.connect ((response) => {
+                if (response != "create" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.resize_logical_volume.begin (block, dialog.bytes, identity, (object, async_result) => {
+                    pending.remove (block.path);
+                    try {
+                        var result = backend.resize_logical_volume.end (async_result);
+                        drive_view.invalidate_usage (block);
+                        if (result.successful) notifications.add_toast (new Adw.Toast (result.summary));
+                        else show_check_message (result.partial ? "Logical volume partially resized" : result.summary,
+                            operation_result_details (result));
+                    } catch (Error error) {
+                        show_check_message ("Could not resize logical volume", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
         private void run_maintenance (StorageBlock block, bool repair) {
             if (pending.contains (block.path)) return;
             pending.insert (block.path, block);
@@ -1689,9 +1747,14 @@ namespace MajorisDisks {
             snapshot_read_only.visible = can_change;
             set_response_enabled ("create", false);
             set_response_enabled ("snapshot", false);
+            set_response_enabled ("delete", false);
             new_subvolume.changed.connect (() => update_create_responses (can_change));
             subvolumes.notify["selected"].connect (() => {
                 update_create_responses (can_change);
+                var chosen = snapshot_source;
+                set_response_enabled ("delete", can_change && info.default_known && chosen != null &&
+                    chosen.id != info.default_id && chosen.parent_id == 5 &&
+                    UDisksService.valid_btrfs_leaf (chosen.path));
                 uint index = subvolumes.selected;
                 set_response_enabled ("apply", can_change && info.default_known && index < ids.length &&
                     ids[index] <= uint.MAX && ids[index] != info.default_id);
@@ -1809,11 +1872,17 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow allocation;
         private string[] used_names = {};
         private StorageVolumeGroup group;
+        private uint64 resize_from;
+        private bool allow_shrink;
+        private uint64 maximum;
         public string volume_name { owned get { return name_entry.text; } }
         public uint64 bytes { get; private set; }
 
-        public CreateLogicalVolumeDialog (StorageVolumeGroup group, StorageSnapshot? snapshot = null) {
+        public CreateLogicalVolumeDialog (StorageVolumeGroup group, StorageSnapshot? snapshot = null,
+            uint64 resize_from = 0, bool allow_shrink = false) {
             this.group = group;
+            this.resize_from = resize_from;
+            this.allow_shrink = allow_shrink;
             if (snapshot != null) {
                 foreach (var item in snapshot.advanced.get_values ()) {
                     var lv = item as StorageLogicalVolume;
@@ -1821,8 +1890,16 @@ namespace MajorisDisks {
                 }
             }
             uint64 usable = group.extent_size == 0 ? 0 : group.free_size - group.free_size % group.extent_size;
+            maximum = resize_from + uint64.min (uint64.MAX - resize_from, usable);
             body = "%s · %s allocatable · %s per extent".printf (group.name,
                 format_size (usable), format_size (group.extent_size));
+            if (resize_from != 0) {
+                heading = "Resize Logical Volume";
+                body = "%s · %s current capacity · %s maximum · %s per extent".printf (group.name,
+                    format_size (resize_from), format_size (maximum), format_size (group.extent_size));
+                name_entry.visible = false;
+                set_response_label ("create", "Resize");
+            }
             name_entry.changed.connect (validate);
             capacity.changed.connect (validate);
             unit.notify["selected"].connect (validate);
@@ -1833,13 +1910,15 @@ namespace MajorisDisks {
             uint64[] units = { 1048576, 1073741824, 1099511627776 };
             uint64 size;
             bool aligned = LvmCapacity.parse (capacity.text, units[uint.min (unit.selected, 2)],
-                group.extent_size, group.free_size, out size);
+                group.extent_size, maximum, out size);
             bytes = aligned ? size : 0;
             allocation.subtitle = aligned
-                ? "%s allocated · %s free afterward".printf (format_size (size), format_size (group.free_size - size))
+                ? (resize_from == 0 ? "%s allocated · %s free afterward".printf (format_size (size), format_size (group.free_size - size)) :
+                    "%s resulting capacity".printf (format_size (size)))
                 : "Enter an exact multiple of the extent size within the available capacity.";
-            set_response_enabled ("create", aligned && UDisksService.valid_lvm_name (volume_name) &&
-                !(volume_name in used_names));
+            bool valid_name = UDisksService.valid_lvm_name (volume_name) && !(volume_name in used_names);
+            set_response_enabled ("create", aligned && (resize_from == 0 ? valid_name :
+                size != resize_from && (allow_shrink || size > resize_from)));
         }
     }
     [GtkTemplate (ui = "/com/majoris/disks/ui/storage-removal-dialog.ui")]

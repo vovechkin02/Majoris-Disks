@@ -13,6 +13,7 @@
       <response id="apply" appearance="suggested">Set Default</response>
       <response id="create">Create Subvolume</response>
       <response id="snapshot">Snapshot Selected</response>
+      <response id="delete" appearance="destructive">Delete Selected…</response>
     </responses>
     <property name="default-response">close</property>
     <property name="close-response">close</property>
