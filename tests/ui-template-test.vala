@@ -124,12 +124,31 @@ public static int main (string[] args) {
     };
     var provisioned = new StorageLogicalVolume ("/test/thin") { size = 256, thin_pool_path = pool.path };
     pool_snapshot.advanced.insert (provisioned.path, provisioned);
-    assert (UDisksService.thin_pool_available (pool_snapshot, pool) == 768);
+    var usage = new ThinPoolUsage (pool_snapshot, pool);
+    assert (usage.virtual_size == 256 && usage.physical_data_remaining () == 768);
+    assert (!usage.overcommits (768) && usage.overcommits (769));
     pool.metadata_allocated_ratio = 1.0;
-    assert (UDisksService.thin_pool_available (pool_snapshot, pool) == 0);
+    assert (!new ThinPoolUsage (pool_snapshot, pool).can_provision ());
     pool.metadata_allocated_ratio = 0.5;
     provisioned.size = 2048;
-    assert (UDisksService.thin_pool_available (pool_snapshot, pool) == 0);
+    usage = new ThinPoolUsage (pool_snapshot, pool);
+    assert (usage.can_provision () && usage.overcommit_ratio () == 2.0 && usage.physical_data_remaining () == 768);
+    var snapshot_volume = new StorageLogicalVolume ("/test/thin-snapshot") {
+        size = 2048, thin_pool_path = pool.path, origin_path = provisioned.path
+    };
+    pool_snapshot.advanced.insert (snapshot_volume.path, snapshot_volume);
+    usage = new ThinPoolUsage (pool_snapshot, pool);
+    assert (usage.virtual_size == 4096 && usage.physical_data_remaining () == 768);
+    snapshot_volume.size = uint64.MAX;
+    assert (!new ThinPoolUsage (pool_snapshot, pool).virtual_known);
+    pool_snapshot.advanced.remove (snapshot_volume.path);
+    pool.data_allocated_ratio = 0.99;
+    assert (new ThinPoolUsage (pool_snapshot, pool).can_provision ());
+    pool.data_allocated_ratio = 1.0;
+    assert (!new ThinPoolUsage (pool_snapshot, pool).can_provision ());
+    pool.data_allocated_ratio = 0.25;
+    pool.metadata_allocated_ratio = -1;
+    assert (!new ThinPoolUsage (pool_snapshot, pool).can_provision ());
     foreach (string invalid in new string[] { "", "-option", "..", "bad/name", "with space", "é" })
         assert (!UDisksService.valid_lvm_name (invalid));
     return 0;

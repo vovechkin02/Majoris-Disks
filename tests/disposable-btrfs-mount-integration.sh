@@ -6,7 +6,7 @@ if [ "${MAJORIS_DISKS_RUN_BTRFS_MOUNT_TESTS:-0}" != 1 ]; then
     echo 'SKIP: opt in on a disposable Linux test system with MAJORIS_DISKS_RUN_BTRFS_MOUNT_TESTS=1'
     exit 77
 fi
-for command in mkfs.btrfs btrfs blkid findmnt losetup mount mountpoint umount unshare; do
+for command in mkfs.btrfs btrfs blkid fallocate findmnt losetup mount mountpoint umount unshare; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "SKIP: $command is unavailable"
         exit 77
@@ -93,7 +93,7 @@ helper=$(dirname "$1")/src/majoris-disks-btrfs-default
 source=$(findmnt -n -o SOURCE --mountpoint "$fixture/target" | sed 's/\[.*$//')
 test -b "$source"
 source_number=$(stat -c '%r' "$source")
-truncate -s 256M "$fixture/extra.img"
+truncate -s 1G "$fixture/extra.img"
 extra_loop=$(losetup --find --show --nooverlap "$fixture/extra.img")
 losetup -j "$fixture/extra.img" | grep -q -F "$extra_loop:"
 test "$extra_loop" != "$source"
@@ -101,10 +101,26 @@ extra_number=$(stat -c '%r' "$extra_loop")
 btrfs device add --nodiscard "$extra_loop" "$fixture/target"
 "$1" --allocation "$fixture/target" "$uuid" 2
 "$helper" check-empty-member "$fixture/target" "$uuid" "$source_number" "$extra_number" 2
+"$helper" check-removable-member "$fixture/target" "$uuid" "$source_number" "$extra_number" 2
+if "$helper" check-removable-member "$fixture/target" "$uuid" "$extra_number" "$source_number" 2; then
+    echo "Expected the helper to reject the active mount source" >&2
+    exit 1
+fi
 if "$helper" check-empty-member "$fixture/target" "$uuid" "$source_number" "$extra_number" 3; then
     echo 'Expected the helper to reject a stale member count' >&2
     exit 1
 fi
+fallocate -l 128M "$fixture/target/relocation-probe"
+sync -f "$fixture/target/relocation-probe"
+if "$helper" check-empty-member "$fixture/target" "$uuid" "$source_number" "$extra_number" 2; then
+    echo "Expected the fixture to allocate chunks on the larger member" >&2
+    exit 1
+fi
+if "$helper" check-removable-member "$fixture/target" "$uuid" "$source_number" "$extra_number" 2; then
+    echo "Expected the helper to reject insufficient relocation headroom" >&2
+    exit 1
+fi
+rm "$fixture/target/relocation-probe"
 btrfs device remove "$extra_loop" "$fixture/target"
 "$1" --allocation "$fixture/target" "$uuid" 1
 if "$helper" check-empty-member "$fixture/target" "$uuid" "$source_number" "$extra_number" 2; then

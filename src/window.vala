@@ -380,8 +380,8 @@ namespace MajorisDisks {
                 foreach (var candidate in backend.snapshot.blocks.get_values ())
                     if (backend.can_select_btrfs_removal_member (filesystem, candidate)) choices += candidate;
             var picker = new CreateStorageGroupDialog (backend, false, true,
-                remove ? "Remove Empty Btrfs Device" : "Add Btrfs Device", remove ? choices : null);
-            if (remove) picker.body = "Removal is available for an unallocated member on a filesystem using only single or DUP profiles. The selected device will leave the filesystem.";
+                remove ? "Remove Btrfs Device" : "Add Btrfs Device", remove ? choices : null);
+            if (remove) picker.body = "Removal is available with single or DUP profiles. Allocated chunks must fit on a surviving device with headroom. The kernel verifies actual placement before completing removal.";
             picker.response.connect ((choice) => {
                 if (choice != "create" || pending.contains (filesystem.path)) return;
                 string[] identities;
@@ -500,7 +500,7 @@ namespace MajorisDisks {
             if (group == null) return;
             string origin_path = origin?.path ?? "/";
             string origin_uuid = origin?.uuid ?? "";
-            var dialog = new CreateLogicalVolumeDialog (group, backend.snapshot, 0, false, origin?.name ?? "");
+            var dialog = new CreateLogicalVolumeDialog (group, backend.snapshot, 0, false, origin);
             string identity = backend.modification_identity (block);
             dialog.response.connect ((response) => {
                 if (response != "create" || pending.contains (block.path)) return;
@@ -508,7 +508,7 @@ namespace MajorisDisks {
                 var selected_pool = dialog.selected_pool;
                 backend.create_logical_volume.begin (block, dialog.volume_name, dialog.bytes, identity,
                     dialog.create_thin_pool, selected_pool?.path ?? "/", selected_pool?.uuid ?? "",
-                    origin_path, origin_uuid, (object, result) => {
+                    origin_path, origin_uuid, dialog.allow_overcommit, (object, result) => {
                     pending.remove (block.path);
                     try {
                         string created = backend.create_logical_volume.end (result);
@@ -938,11 +938,12 @@ namespace MajorisDisks {
             var group = backend.snapshot.advanced.lookup (block.logical_volume.group_path) as StorageVolumeGroup;
             if (group == null) return;
             string identity = backend.modification_identity (block);
-            var dialog = new CreateLogicalVolumeDialog (group, null, block.size, block.filesystem != null);
+            var pool = backend.snapshot.advanced.lookup (block.logical_volume.thin_pool_path) as StorageLogicalVolume;
+            var dialog = new CreateLogicalVolumeDialog (group, backend.snapshot, block.size, block.filesystem != null, null, pool);
             dialog.response.connect ((response) => {
                 if (response != "create" || pending.contains (block.path)) return;
                 pending.insert (block.path, block);
-                backend.resize_logical_volume.begin (block, dialog.bytes, identity, (object, async_result) => {
+                backend.resize_logical_volume.begin (block, dialog.bytes, identity, dialog.allow_overcommit, (object, async_result) => {
                     pending.remove (block.path);
                     try {
                         var result = backend.resize_logical_volume.end (async_result);
@@ -1963,7 +1964,11 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow allocation;
         [GtkChild] private unowned Adw.ComboRow lv_kind;
         [GtkChild] private unowned Adw.ComboRow thin_pool;
+        [GtkChild] private unowned Adw.SwitchRow overcommit;
+        public bool allow_overcommit { get { return overcommit.visible && overcommit.active; } }
         private StorageSnapshot? snapshot;
+        private StorageLogicalVolume? snapshot_origin;
+        private StorageLogicalVolume? resize_pool;
         private StorageLogicalVolume[] pools = {};
         public bool create_thin_pool { get { return resize_from == 0 && lv_kind.selected == 1; } }
         public unowned StorageLogicalVolume? selected_pool {
@@ -1979,9 +1984,12 @@ namespace MajorisDisks {
         public uint64 bytes { get; private set; }
 
         public CreateLogicalVolumeDialog (StorageVolumeGroup group, StorageSnapshot? snapshot = null,
-            uint64 resize_from = 0, bool allow_shrink = false, string snapshot_origin = "") {
+            uint64 resize_from = 0, bool allow_shrink = false, StorageLogicalVolume? snapshot_origin = null,
+            StorageLogicalVolume? resize_pool = null) {
             this.group = group;
             this.snapshot = snapshot;
+            this.snapshot_origin = snapshot_origin;
+            this.resize_pool = resize_pool;
             this.resize_from = resize_from;
             this.allow_shrink = allow_shrink;
             var pool_labels = new Gtk.StringList (null);
@@ -2001,50 +2009,93 @@ namespace MajorisDisks {
             maximum = resize_from + uint64.min (uint64.MAX - resize_from, usable);
             body = "%s · %s allocatable · %s per extent".printf (group.name,
                 format_size (usable), format_size (group.extent_size));
-            if (snapshot_origin != "") {
+            if (snapshot_origin != null) {
                 heading = "Create LVM Snapshot";
                 body = "Snapshot origin %s · %s free for copy-on-write data · %s per extent".printf (
-                    snapshot_origin, format_size (usable), format_size (group.extent_size));
+                    snapshot_origin.name, format_size (usable), format_size (group.extent_size));
+                if (snapshot_origin.thin_pool_path != "/") {
+                    body = "Thin snapshot of %s. It shares existing blocks with the origin and uses pool space as writes diverge.".printf (snapshot_origin.name);
+                    capacity.visible = false;
+                    unit.visible = false;
+                }
                 lv_kind.visible = false;
             }
             if (resize_from != 0) {
                 heading = "Resize Logical Volume";
                 body = "%s · %s current capacity · %s maximum · %s per extent".printf (group.name,
                     format_size (resize_from), format_size (maximum), format_size (group.extent_size));
+                if (resize_pool != null)
+                    body = "%s thin pool · %s current virtual capacity · %s per extent".printf (
+                        resize_pool.name, format_size (resize_from), format_size (group.extent_size));
                 name_entry.visible = false;
                 lv_kind.visible = false;
                 set_response_label ("create", "Resize");
             }
             name_entry.changed.connect (validate);
-            capacity.changed.connect (validate);
-            unit.notify["selected"].connect (validate);
-            lv_kind.notify["selected"].connect (validate);
-            thin_pool.notify["selected"].connect (validate);
+            capacity.changed.connect (reset_overcommit);
+            unit.notify["selected"].connect (reset_overcommit);
+            lv_kind.notify["selected"].connect (reset_overcommit);
+            thin_pool.notify["selected"].connect (reset_overcommit);
+            overcommit.notify["active"].connect (validate);
+            validate ();
+        }
+
+        private void reset_overcommit () {
+            overcommit.active = false;
             validate ();
         }
 
         private void validate () {
             uint64[] units = { 1048576, 1073741824, 1099511627776 };
+            bool thin_snapshot = snapshot_origin != null && snapshot_origin.thin_pool_path != "/";
+            bool thin_resize = resize_from != 0 && resize_pool != null;
             bool thin = resize_from == 0 && lv_kind.selected == 2;
-            var pool = selected_pool;
+            var pool = thin_snapshot ? snapshot?.advanced.lookup (snapshot_origin.thin_pool_path) as StorageLogicalVolume : thin_resize ? resize_pool : selected_pool;
             thin_pool.visible = thin;
-            uint64 limit = thin ? (pool == null || snapshot == null ? 0 :
-                UDisksService.thin_pool_available (snapshot, pool)) : maximum;
-            if (thin)
-                thin_pool.subtitle = pool == null ? "No thin pools are available." :
-                    "%s uncommitted · %.1f%% data · %.1f%% metadata".printf (format_size (limit),
-                        double.max (0.0, pool.data_allocated_ratio) * 100.0, double.max (0.0, pool.metadata_allocated_ratio) * 100.0);
+            if (thin_snapshot) {
+                var snapshot_usage = pool != null && snapshot != null ? new ThinPoolUsage (snapshot, pool) : null;
+                bool safe = snapshot_usage != null && snapshot_origin.size > 0 &&
+                    snapshot_origin.size <= snapshot_usage.virtual_limit ();
+                overcommit.visible = safe && snapshot_usage.overcommits (snapshot_origin.size);
+                allocation.subtitle = safe ? "%s virtual snapshot capacity".printf (format_size (snapshot_origin.size)) :
+                    "Pool capacity is unknown or exhausted.";
+                set_response_enabled ("create", safe && (!overcommit.visible || overcommit.active) &&
+                    UDisksService.valid_lvm_name (volume_name) && !(volume_name in used_names));
+                bytes = 0;
+                return;
+            }
+            var usage = (thin || thin_resize) && pool != null && snapshot != null ? new ThinPoolUsage (snapshot, pool) : null;
+            uint64 limit = thin ? usage?.virtual_limit () ?? 0 : maximum;
+            if (thin_resize)
+                limit = usage != null && usage.can_provision () ? resize_from +
+                    uint64.min (uint64.MAX - resize_from, usage.virtual_limit ()) : 0;
+            if (thin) {
+                if (usage == null) thin_pool.subtitle = "No thin pools are available.";
+                else if (!usage.usage_known || !usage.virtual_known || !usage.active)
+                    thin_pool.subtitle = "Pool is inactive or its allocation is unknown.";
+                else {
+                    thin_pool.subtitle = "%s physical · %s virtual (%.2f×) · %.1f%% data · %.1f%% metadata · %s physical data remaining".printf (
+                        format_size (usage.physical_size), format_size (usage.virtual_size), usage.overcommit_ratio (),
+                        usage.data_ratio * 100.0, usage.metadata_ratio * 100.0, format_size (usage.physical_data_remaining ()));
+                    if (usage.data_ratio >= ThinPoolUsage.WARNING_RATIO || usage.metadata_ratio >= ThinPoolUsage.WARNING_RATIO)
+                        thin_pool.subtitle += " · Pool usage is at or above 90%";
+                }
+            }
             uint64 size;
             bool aligned = LvmCapacity.parse (capacity.text, units[uint.min (unit.selected, 2)],
                 group.extent_size, limit, out size);
             bytes = aligned ? size : 0;
+            uint64 additional = size > resize_from ? size - resize_from : 0;
+            overcommit.visible = aligned && usage != null && additional > 0 && usage.overcommits (additional);
             allocation.subtitle = aligned
-                ? (thin ? "%s virtual capacity · %s pool capacity uncommitted afterward".printf (format_size (size), format_size (limit - size)) :
+                ? (thin ? "%s virtual capacity · %s total virtual afterward".printf (format_size (size),
+                    format_size (usage.virtual_size + size)) :
                     resize_from == 0 ? "%s allocated · %s free afterward".printf (format_size (size), format_size (group.free_size - size)) :
                     "%s resulting capacity".printf (format_size (size)))
                 : "Enter an exact multiple of the extent size within the available capacity.";
             bool valid_name = UDisksService.valid_lvm_name (volume_name) && !(volume_name in used_names);
-            set_response_enabled ("create", aligned && (resize_from == 0 ? valid_name :
+            set_response_enabled ("create", aligned && (!overcommit.visible || overcommit.active) &&
+                (resize_from == 0 ? valid_name :
                 size != resize_from && (allow_shrink || size > resize_from)));
         }
     }
@@ -2093,7 +2144,7 @@ namespace MajorisDisks {
             set_response_enabled ("activate", volume != null && !volume.active);
             set_response_enabled ("deactivate", volume?.active == true);
             set_response_enabled ("snapshot", physical_context && volume != null && volume.active &&
-                volume.lvm_type == "block" && volume.origin_path == "/" && volume.thin_pool_path == "/");
+                volume.lvm_type == "block" && (volume.origin_path == "/" || volume.thin_pool_path != "/"));
             set_response_enabled ("delete", volume != null && (!volume.active ||
                 (volume.origin_path != "/" && volume.thin_pool_path == "/")));
         }

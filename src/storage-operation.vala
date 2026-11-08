@@ -294,6 +294,59 @@ namespace MajorisDisks {
         }
     }
 
+    internal class ThinPoolUsage : Object {
+        public const double WARNING_RATIO = 0.90;
+        public uint64 physical_size;
+        public uint64 virtual_size;
+        public bool virtual_known = true;
+        public double data_ratio;
+        public double metadata_ratio;
+        public bool usage_known;
+        public bool active;
+
+        public ThinPoolUsage (StorageSnapshot snapshot, StorageLogicalVolume pool) {
+            physical_size = pool.size;
+            active = pool.active && pool.lvm_type == "pool";
+            data_ratio = pool.data_allocated_ratio;
+            metadata_ratio = pool.metadata_allocated_ratio;
+            usage_known = physical_size > 0 && data_ratio >= 0 && data_ratio <= 1 &&
+                metadata_ratio >= 0 && metadata_ratio <= 1;
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var lv = item as StorageLogicalVolume;
+                if (lv == null || lv.thin_pool_path != pool.path) continue;
+                if (lv.size == 0 || lv.size > uint64.MAX - virtual_size) {
+                    virtual_known = false;
+                    break;
+                }
+                virtual_size += lv.size;
+            }
+        }
+
+        public bool can_provision () {
+            return active && usage_known && virtual_known && data_ratio < 1 && metadata_ratio < 1;
+        }
+
+        public uint64 virtual_limit () {
+            return can_provision () ? uint64.MAX - virtual_size : 0;
+        }
+
+        public bool overcommits (uint64 additional) {
+            return !virtual_known || additional > uint64.MAX - virtual_size ||
+                virtual_size + additional > physical_size;
+        }
+
+        public uint64 physical_data_remaining () {
+            if (!usage_known || data_ratio >= 1) return 0;
+            if (data_ratio == 0) return physical_size;
+            double remaining = (double) physical_size * (1.0 - data_ratio);
+            return remaining >= (double) physical_size ? physical_size : (uint64) remaining;
+        }
+
+        public double overcommit_ratio () {
+            return physical_size == 0 || !virtual_known ? -1.0 : (double) virtual_size / (double) physical_size;
+        }
+    }
+
     internal class LvmCapacity {
         public static bool parse (string input, uint64 unit, uint64 extent, uint64 free, out uint64 bytes) {
             bytes = 0;

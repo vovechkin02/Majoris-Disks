@@ -55,6 +55,7 @@ namespace MajorisDisks {
         private bool connecting;
         private StorageOperationLocks locks = new StorageOperationLocks ();
         private uint raid_reconcile_source;
+        private HashTable<string, string> thin_pool_warnings = new HashTable<string, string> (str_hash, str_equal);
         private HashTable<string, RaidMaintenanceObservation> raid_observations =
             new HashTable<string, RaidMaintenanceObservation> (str_hash, str_equal);
         private HashTable<string, StorageJob> local_raid_checks = new HashTable<string, StorageJob> (str_hash, str_equal);
@@ -390,7 +391,33 @@ namespace MajorisDisks {
             synchronize_jobs ();
             synchronize_selftests ();
             synchronize_raid_maintenance ();
+            synchronize_thin_pool_warnings ();
             changed ();
+        }
+
+        private void synchronize_thin_pool_warnings () {
+            var previous = thin_pool_warnings;
+            thin_pool_warnings = new HashTable<string, string> (str_hash, str_equal);
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var pool = item as StorageLogicalVolume;
+                if (pool == null || pool.lvm_type != "pool" || !pool.active || pool.uuid == "") continue;
+                var usage = new ThinPoolUsage (snapshot, pool);
+                string warning;
+                if (!usage.usage_known || !usage.virtual_known)
+                    warning = "Thin pool allocation is unavailable";
+                else if (usage.data_ratio >= 1 || usage.metadata_ratio >= 1)
+                    warning = "Thin pool data or metadata is exhausted";
+                else if (usage.data_ratio >= ThinPoolUsage.WARNING_RATIO || usage.metadata_ratio >= ThinPoolUsage.WARNING_RATIO)
+                    warning = "Thin pool data or metadata is at or above 90%";
+                else continue;
+                thin_pool_warnings.insert (pool.uuid, warning);
+                if (previous.lookup (pool.uuid) == warning) continue;
+                var job = jobs.begin_named ("Thin pool capacity", pool.name, { pool.path });
+                var result = new StorageOperationResult ();
+                result.fail (warning);
+                result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                jobs.finish (job, result);
+            }
         }
 
         private static string? raid_maintenance_title (string action) {
@@ -1446,14 +1473,14 @@ namespace MajorisDisks {
                 member.mount_configurations.length == 0 && member.encryption_configurations.length == 0;
         }
 
-        private async void check_empty_btrfs_member (StorageBlock filesystem, StorageBlock member,
+        private async void check_removable_btrfs_member (StorageBlock filesystem, StorageBlock member,
             string uuid, uint64 count, Cancellable token) throws Error {
             string[] mounts = filesystem.filesystem?.mounts ?? new string[0];
             if (mounts.length != 1 || !FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE) ||
                 !FileUtils.test (BTRFS_DEFAULT_HELPER, FileTest.IS_EXECUTABLE))
                 throw new IOError.NOT_SUPPORTED ("An authorized Btrfs allocation check and one verified mount are required.");
             string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", BTRFS_DEFAULT_HELPER,
-                "check-empty-member", mounts[0], uuid, filesystem.number.to_string (), member.number.to_string (), count.to_string () };
+                "check-removable-member", mounts[0], uuid, filesystem.number.to_string (), member.number.to_string (), count.to_string () };
             var helper = new Subprocess.newv (argv, SubprocessFlags.STDOUT_SILENCE | SubprocessFlags.STDERR_PIPE);
             string? diagnostic;
             yield helper.communicate_utf8_async (null, token, null, out diagnostic);
@@ -1498,7 +1525,7 @@ namespace MajorisDisks {
                         throw new IOError.BUSY ("A Btrfs member is protected or has unresolved dependencies.");
                 }
                 yield KernelStorageSafety.require_idle (member, lifetime);
-                if (remove) yield check_empty_btrfs_member (filesystem, member, uuid, count, lifetime);
+                if (remove) yield check_removable_btrfs_member (filesystem, member, uuid, count, lifetime);
                 synchronize ();
                 if (creation_identity_changed (filesystem, filesystem_identity) ||
                     creation_identity_changed (member, member_identity) ||
@@ -1510,7 +1537,7 @@ namespace MajorisDisks {
                 for (int i = 0; i < members.length; i++)
                     if (creation_identity_changed (members[i], identities[i]))
                         throw new IOError.NOT_FOUND ("A Btrfs member changed after confirmation.");
-                jobs.phase (job, StorageJobState.RUNNING, remove ? "Removing the empty Btrfs member" : "Adding the unused device to Btrfs");
+                jobs.phase (job, StorageJobState.RUNNING, remove ? "Relocating chunks and removing the Btrfs member" : "Adding the unused device to Btrfs");
                 dispatched = true;
                 yield call_tracked_method (job, proxy, remove ? "RemoveDevice" : "AddDevice",
                     new Variant ("(o@a{sv})", member.path, new Variant ("a{sv}", null)), lifetime);
@@ -2225,27 +2252,12 @@ namespace MajorisDisks {
             }
         }
 
-        internal static uint64 thin_pool_available (StorageSnapshot snapshot, StorageLogicalVolume pool) {
-            if (pool.lvm_type != "pool" || !pool.active || pool.size == 0 ||
-                !(pool.data_allocated_ratio >= 0.0 && pool.data_allocated_ratio < 1.0) ||
-                !(pool.metadata_allocated_ratio >= 0.0 && pool.metadata_allocated_ratio < 1.0))
-                return 0;
-            uint64 remaining = pool.size;
-            foreach (var item in snapshot.advanced.get_values ()) {
-                var lv = item as StorageLogicalVolume;
-                if (lv == null || lv.thin_pool_path != pool.path) continue;
-                if (lv.size == 0 || lv.size >= remaining) return 0;
-                remaining -= lv.size;
-            }
-            return remaining;
-        }
-
         internal async string create_logical_volume (StorageBlock member, string name, uint64 size,
             string confirmed_identity, bool thin_pool = false, string pool_path = "/", string pool_uuid = "",
-            string origin_path = "/", string origin_uuid = "") throws Error {
+            string origin_path = "/", string origin_uuid = "", bool confirm_overcommit = false) throws Error {
             bool thin_volume = pool_path != "/";
             bool snapshot_volume = origin_path != "/";
-            if (!valid_lvm_name (name) || size == 0 || (thin_pool && thin_volume) ||
+            if (!valid_lvm_name (name) || (!snapshot_volume && size == 0) || (thin_pool && thin_volume) ||
                 (snapshot_volume && (thin_pool || thin_volume)))
                 throw new IOError.INVALID_ARGUMENT ("Enter a valid LVM name and nonzero capacity.");
             synchronize ();
@@ -2256,14 +2268,19 @@ namespace MajorisDisks {
             if (group == null || proxy == null || uuid == "")
                 throw new IOError.NOT_SUPPORTED ("The selected device does not belong to an identifiable volume group.");
             var origin = snapshot_volume ? snapshot.advanced.lookup (origin_path) as StorageLogicalVolume : null;
+            bool thin_snapshot = snapshot_volume && origin != null && origin.thin_pool_path != "/";
+            string snapshot_pool_path = thin_snapshot ? origin.thin_pool_path : "/";
+            string snapshot_pool_uuid = thin_snapshot ? require_thin_pool (origin).uuid : "";
+            uint64 expected_size = thin_snapshot ? origin.size : size;
             var origin_proxy = origin != null ? manager?.get_interface (origin.path, PREFIX + "LogicalVolume") as DBusProxy : null;
             string origin_block_path = origin_proxy?.get_cached_property ("BlockDevice")?.get_string () ?? "/";
             var origin_block = snapshot.blocks.lookup (origin_block_path);
             if (snapshot_volume && (origin == null || origin_uuid == "" || origin.uuid != origin_uuid ||
-                origin.group_path != group.path || origin.lvm_type != "block" || origin.thin_pool_path != "/" ||
-                origin.origin_path != "/" || !origin.active || origin_proxy == null || origin_block == null ||
+                origin.group_path != group.path || origin.lvm_type != "block" ||
+                (thin_snapshot ? size != 0 || expected_size == 0 : size == 0 || origin.origin_path != "/") ||
+                !origin.active || origin_proxy == null || origin_block == null ||
                 origin_block.logical_volume != origin))
-                throw new IOError.NOT_SUPPORTED ("Choose an active plain logical volume in this group as the snapshot origin.");
+                throw new IOError.NOT_SUPPORTED ("Choose an active, supported logical volume in this group as the snapshot origin.");
             string origin_identity = origin_block != null ? modification_identity (origin_block) : "";
             StorageBlock[] affected = origin_block != null ? new StorageBlock[] { origin_block } : new StorageBlock[0];
             locks.acquire_members (member, affected, snapshot.dependencies);
@@ -2301,9 +2318,26 @@ namespace MajorisDisks {
                 uint64 free = proxy.get_cached_property ("FreeSize")?.get_uint64 () ?? 0;
                 var missing = proxy.get_cached_property ("MissingPhysicalVolumes");
                 var pool = thin_volume ? snapshot.advanced.lookup (pool_path) as StorageLogicalVolume : null;
-                if (thin_volume && (pool == null || pool_uuid == "" || pool.uuid != pool_uuid || pool.group_path != group.path ||
-                    size > thin_pool_available (snapshot, pool)))
-                    throw new IOError.NO_SPACE ("The selected thin pool changed, is exhausted, or lacks uncommitted capacity.");
+                if (thin_snapshot) {
+                    var live_pool = require_thin_pool (origin);
+                    if (origin.thin_pool_path != snapshot_pool_path || live_pool.uuid != snapshot_pool_uuid ||
+                        origin.size != expected_size)
+                        throw new IOError.NOT_FOUND ("The snapshot origin or its thin pool changed.");
+                    var usage = new ThinPoolUsage (snapshot, live_pool);
+                    if (expected_size > usage.virtual_limit ())
+                        throw new IOError.NO_SPACE ("The thin pool is exhausted or its allocation cannot be verified.");
+                    if (usage.overcommits (expected_size) && !confirm_overcommit)
+                        throw new IOError.PERMISSION_DENIED ("Confirm that this thin snapshot increases provisioned virtual capacity above physical capacity.");
+                }
+                if (thin_volume) {
+                    if (pool == null || pool_uuid == "" || pool.uuid != pool_uuid || pool.group_path != group.path)
+                        throw new IOError.NOT_FOUND ("The selected thin pool changed.");
+                    var usage = new ThinPoolUsage (snapshot, pool);
+                    if (size > usage.virtual_limit ())
+                        throw new IOError.NO_SPACE ("The thin pool is unavailable, exhausted, or its capacity cannot be verified.");
+                    if (usage.overcommits (size) && !confirm_overcommit)
+                        throw new IOError.PERMISSION_DENIED ("Explicitly confirm virtual capacity above the physical thin-pool capacity.");
+                }
                 if ((missing != null && missing.n_children () != 0) || extent == 0 ||
                     (!thin_volume && size > free) || size % extent != 0)
                     throw new IOError.INVALID_ARGUMENT ("Choose a capacity that fits the free space and is a multiple of the LVM extent size.");
@@ -2331,9 +2365,9 @@ namespace MajorisDisks {
                     synchronize ();
                     var created = snapshot.advanced.lookup (path) as StorageLogicalVolume;
                     if (created != null && created.group_path == group.path && created.name == name &&
-                        created.uuid != "" && created.size == size && created.origin_path == origin_path &&
+                        created.uuid != "" && created.size == expected_size && created.origin_path == origin_path &&
                         (thin_pool ? created.lvm_type == "pool" :
-                            created.lvm_type == "block" && created.thin_pool_path == pool_path) &&
+                            created.lvm_type == "block" && created.thin_pool_path == (thin_snapshot ? snapshot_pool_path : pool_path)) &&
                         proxy.get_cached_property ("UUID")?.get_string () == uuid) {
                         var volume_proxy = manager?.get_interface (path, PREFIX + "LogicalVolume") as DBusProxy;
                         string block_path = volume_proxy?.get_cached_property ("BlockDevice")?.get_string () ?? "/";
@@ -2610,12 +2644,16 @@ namespace MajorisDisks {
             return volumes;
         }
 
-        private void require_independent_lv (DBusProxy proxy, StorageLogicalVolume volume, bool allow_snapshot = false) throws Error {
+        private void require_independent_lv (DBusProxy proxy, StorageLogicalVolume volume,
+            bool allow_snapshot = false, bool allow_thin = false) throws Error {
             string origin = proxy.get_cached_property ("Origin")?.get_string () ?? "";
+            string pool = proxy.get_cached_property ("ThinPool")?.get_string () ?? "";
+            bool thin = allow_thin && volume.thin_pool_path != "/";
             if (proxy.get_cached_property ("Type")?.get_string () != "block" || origin != volume.origin_path ||
-                (!allow_snapshot && origin != "/") ||
-                proxy.get_cached_property ("ThinPool")?.get_string () != "/")
-                throw new IOError.NOT_SUPPORTED ("This operation requires a plain logical volume without a pool or origin.");
+                (!allow_snapshot && !thin && origin != "/") ||
+                pool != (thin ? volume.thin_pool_path : "/"))
+                throw new IOError.NOT_SUPPORTED ("The logical volume has an unsupported pool or origin relationship.");
+            if (thin) require_thin_pool (volume);
             foreach (var item in snapshot.advanced.get_values ()) {
                 var candidate = item as StorageLogicalVolume;
                 if (candidate == null || candidate.group_path != volume.group_path || candidate == volume) continue;
@@ -2624,6 +2662,13 @@ namespace MajorisDisks {
                     related.get_cached_property ("ThinPool")?.get_string () == volume.path)
                     throw new IOError.BUSY ("A snapshot or thin volume depends on this logical volume.");
             }
+        }
+
+        private StorageLogicalVolume require_thin_pool (StorageLogicalVolume volume) throws Error {
+            var pool = snapshot.advanced.lookup (volume.thin_pool_path) as StorageLogicalVolume;
+            if (pool == null || pool.uuid == "" || pool.lvm_type != "pool" || pool.group_path != volume.group_path)
+                throw new IOError.NOT_FOUND ("The thin pool identity could not be verified.");
+            return pool;
         }
 
         internal async string change_logical_volume_state (StorageBlock context, string path, string uuid,
@@ -2641,8 +2686,11 @@ namespace MajorisDisks {
             bool activate = method == "Activate";
             bool deleting = method == "Delete";
             bool was_active = volume.active;
-            bool snapshot_deletion = deleting && volume.origin_path != "/" && volume.thin_pool_path == "/";
-            if (deleting ? was_active && !snapshot_deletion : activate == was_active)
+            bool snapshot_deletion = deleting && volume.origin_path != "/";
+            bool thin = volume.thin_pool_path != "/";
+            string pool_path = volume.thin_pool_path;
+            string pool_uuid = thin ? require_thin_pool (volume).uuid : "";
+            if (deleting ? was_active && (!snapshot_deletion || thin) : activate == was_active)
                 throw new IOError.BUSY (deleting ? "Deactivate the logical volume before deleting it." :
                     "The logical volume is already in a different state.");
             string origin_path = volume.origin_path;
@@ -2650,7 +2698,7 @@ namespace MajorisDisks {
             string origin_uuid = snapshot_origin?.uuid ?? "";
             if (snapshot_deletion && origin_uuid == "")
                 throw new IOError.NOT_FOUND ("Could not verify the snapshot origin.");
-            require_independent_lv (proxy, volume, deleting);
+            require_independent_lv (proxy, volume, deleting, true);
             string previous_block = proxy.get_cached_property ("BlockDevice")?.get_string () ?? "/";
             var active_block = snapshot.blocks.lookup (previous_block);
             if (!volume.active && previous_block != "/")
@@ -2684,9 +2732,16 @@ namespace MajorisDisks {
                     volume.active != was_active || volume.origin_path != origin_path ||
                     (proxy.get_cached_property ("BlockDevice")?.get_string () ?? "/") != previous_block)
                     throw new IOError.NOT_FOUND ("The logical-volume identity or active state changed.");
-                require_independent_lv (proxy, volume, deleting);
+                require_independent_lv (proxy, volume, deleting, true);
                 if (deleting && (proxy.get_cached_property ("ChildConfiguration")?.n_children () ?? 1) != 0)
                     throw new IOError.BUSY ("The logical volume gained persistent configuration.");
+                if (thin) {
+                    var pool = require_thin_pool (volume);
+                    if (volume.thin_pool_path != pool_path || pool.uuid != pool_uuid)
+                        throw new IOError.NOT_FOUND ("The thin pool changed after confirmation.");
+                    if (activate && !new ThinPoolUsage (snapshot, pool).can_provision ())
+                        throw new IOError.BUSY ("The thin pool must be active with verified free data and metadata space.");
+                }
                 jobs.phase (job, StorageJobState.RUNNING, method + " logical volume");
                 dispatched = true;
                 var reply = yield call_tracked_method (job, proxy, method,
@@ -2710,6 +2765,10 @@ namespace MajorisDisks {
                         current != null && current.uuid == uuid && current.active == activate &&
                         (activate ? current_block != null && current_block.available && current_block.logical_volume == current :
                             current_block == null || current_block.logical_volume != current);
+                    if (thin) {
+                        var live_pool = snapshot.advanced.lookup (pool_path) as StorageLogicalVolume;
+                        verified &= live_pool?.uuid == pool_uuid && (deleting || current?.thin_pool_path == pool_path);
+                    }
                     if (verified) {
                         outcome.successful = true;
                         outcome.summary = activate ? "Logical volume activated" :
@@ -2747,8 +2806,21 @@ namespace MajorisDisks {
                 throw new IOError.FAILED ("The verified filesystem capacity does not match the requested size.");
         }
 
+        private void verify_thin_resize (StorageLogicalVolume volume, string pool_path, string pool_uuid,
+            uint64 old_size, uint64 new_size, bool confirm_overcommit) throws Error {
+            var pool = require_thin_pool (volume);
+            if (pool.path != pool_path || pool.uuid != pool_uuid)
+                throw new IOError.NOT_FOUND ("The thin pool changed.");
+            var usage = new ThinPoolUsage (snapshot, pool);
+            uint64 growth = new_size > old_size ? new_size - old_size : 0;
+            if (!usage.can_provision () || growth > usage.virtual_limit ())
+                throw new IOError.NO_SPACE ("Thin-pool allocation is unavailable or exhausted.");
+            if (growth > 0 && usage.overcommits (growth) && !confirm_overcommit)
+                throw new IOError.PERMISSION_DENIED ("Confirm virtual capacity above the physical pool capacity.");
+        }
+
         internal async StorageOperationResult resize_logical_volume (StorageBlock block, uint64 size,
-            string confirmed_identity) throws Error {
+            string confirmed_identity, bool confirm_overcommit = false) throws Error {
             synchronize ();
             var device = require_volume (block, "Block");
             var volume = block.logical_volume;
@@ -2759,7 +2831,12 @@ namespace MajorisDisks {
             var group_proxy = group != null ? manager?.get_interface (group.path, PREFIX + "VolumeGroup") as DBusProxy : null;
             if (proxy == null || group == null || group_proxy == null)
                 throw new IOError.NOT_FOUND ("The logical volume or its volume group is unavailable.");
-            require_independent_lv (proxy, volume);
+            string pool_path = volume.thin_pool_path;
+            bool thin = pool_path != "/";
+            if (volume.origin_path != "/")
+                throw new IOError.NOT_SUPPORTED ("Resize the origin rather than a snapshot.");
+            string pool_uuid = thin ? require_thin_pool (volume).uuid : "";
+            require_independent_lv (proxy, volume, false, true);
             uint64 original_size = block.size;
             uint64 number = block.number;
             string uuid = volume.uuid;
@@ -2796,13 +2873,15 @@ namespace MajorisDisks {
                     manager?.get_interface (volume.path, PREFIX + "LogicalVolume") != proxy ||
                     manager?.get_interface (group.path, PREFIX + "VolumeGroup") != group_proxy)
                     throw new IOError.NOT_FOUND ("The logical volume changed after confirmation.");
-                require_independent_lv (proxy, volume);
+                require_independent_lv (proxy, volume, false, true);
                 uint64 extent = group_proxy.get_cached_property ("ExtentSize")?.get_uint64 () ?? 0;
                 uint64 free = group_proxy.get_cached_property ("FreeSize")?.get_uint64 () ?? 0;
-                if (extent == 0 || size % extent != 0 || (!shrink && size - original_size > free) ||
+                if (extent == 0 || size % extent != 0 || (!thin && !shrink && size - original_size > free) ||
                     (group_proxy.get_cached_property ("MissingPhysicalVolumes")?.n_children () ?? 1) != 0 ||
                     volume_group_has_backend_job (group, { block }))
                     throw new IOError.BUSY ("The requested size is unaligned, exceeds free extents, or the volume group is busy.");
+
+                if (thin) verify_thin_resize (volume, pool_path, pool_uuid, original_size, size, confirm_overcommit);
 
                 if (shrink) {
                     if (!(yield maintenance_available (type, false)))
@@ -2829,7 +2908,8 @@ namespace MajorisDisks {
                     volume.uuid != uuid || volume.size != original_size ||
                     manager?.get_interface (volume.path, PREFIX + "LogicalVolume") != proxy)
                     throw new IOError.NOT_FOUND ("The logical volume changed before resizing.");
-                require_independent_lv (proxy, volume);
+                require_independent_lv (proxy, volume, false, true);
+                if (thin) verify_thin_resize (volume, pool_path, pool_uuid, original_size, size, confirm_overcommit);
                 jobs.phase (job, StorageJobState.RUNNING, shrink ? "Shrinking the logical volume" : "Growing the logical volume");
                 dispatched = true;
                 yield call_tracked_method (job, proxy, "Resize",
@@ -2843,6 +2923,8 @@ namespace MajorisDisks {
                     block.logical_volume != volume || volume.uuid != uuid || block.size != size || volume.size != size ||
                     require_volume (block, "Block") != device || block.uuid != filesystem_uuid)
                     throw new IOError.FAILED ("UDisks did not confirm the new capacity on the same logical volume.");
+                if (thin && (volume.thin_pool_path != pool_path || require_thin_pool (volume).uuid != pool_uuid))
+                    throw new IOError.NOT_FOUND ("The thin pool changed during resizing.");
                 result.completed ("Logical-volume capacity verified");
                 if (filesystem != null) {
                     if (!shrink) {

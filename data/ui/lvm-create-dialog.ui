@@ -12,6 +12,7 @@
         <child><object class="AdwComboRow" id="unit"><property name="title">Capacity unit</property>
           <property name="model"><object class="GtkStringList"><items><item>MiB</item><item>GiB</item><item>TiB</item></items></object></property>
         </object></child>
+        <child><object class="AdwSwitchRow" id="overcommit"><property name="title">Allow virtual capacity above physical capacity</property><property name="subtitle">Writes can fail if the pool runs out of data or metadata space</property><property name="visible">false</property></object></child>
         <child><object class="AdwActionRow" id="allocation"><property name="title">Allocation</property></object></child>
       </object>
     </property>
