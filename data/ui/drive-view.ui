@@ -59,6 +59,7 @@
 <child><object class="GtkButton" id="resize_volume"><property name="label">Resize Volume</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="delete_partition"><property name="label">Delete Partition</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="backup_volume"><property name="label">Create Volume Image</property></object></child>
+<child><object class="GtkButton" id="restore_partition"><property name="label">Restore Partition Image</property><property name="visible">false</property></object></child>
 <child><object class="GtkButton" id="open_files"><property name="label">Open in Files</property></object></child>
 </object></child></object></child>
 </object></property></object></child>

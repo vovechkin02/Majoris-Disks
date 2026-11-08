@@ -9,6 +9,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button detach_image_button;
         [GtkChild] private unowned Gtk.Button restore_drive;
         [GtkChild] private unowned Gtk.Button backup_volume;
+        [GtkChild] private unowned Gtk.Button restore_partition;
         [GtkChild] private unowned Gtk.Button benchmark_button;
         [GtkChild] private unowned Gtk.MenuButton drive_actions;
         [GtkChild] private unowned Gtk.Button eject_drive;
@@ -108,12 +109,20 @@ namespace MajorisDisks {
         construct {
             usage_service.updated.connect ((description) => usage.label = description);
             information.clicked.connect (() => {
-                if (current != null) new DriveInformationDialog (current).present (this);
+                if (current != null) new DriveInformationDialog (current, selected_block).present (this);
             });
             detach_image_button.clicked.connect (() => { if (current?.medium != null) detach_image_requested (current.medium); });
             backup_drive.clicked.connect (() => { if (current?.medium != null) backup_requested (current.medium); });
             restore_drive.clicked.connect (() => { if (current?.medium != null) restore_requested (current.medium); });
             backup_volume.clicked.connect (() => { if (selected_block != null) backup_requested (selected_block); });
+            // Adapted from GNOME Disks gdu-block-row.c, restore_partition_image_cb.
+            // Copyright 2023 Mohammed Sadiq <sadiq@sadiqpk.org>
+            // Copyright (C) 2008-2013 Red Hat, Inc.
+            // Upstream license: GPL-2.0-or-later.
+            restore_partition.clicked.connect (() => {
+                var block = selected_block;
+                if (block?.partition != null && !block.partition.container) restore_requested (block);
+            });
             benchmark_button.clicked.connect (() => { if (current != null) benchmark_requested (current); });
             health.clicked.connect (() => { if (current != null) health_requested (current); });
             eject_drive.clicked.connect (() => request_drive_action ("Eject"));
@@ -363,6 +372,7 @@ namespace MajorisDisks {
             edit_partition.visible = false;
             create_partition.visible = false;
             resize_volume.visible = false;
+            restore_partition.visible = false;
             selected_block = null;
             usage.label = "";
             foreach (var field in metadata) properties.remove (field);
@@ -463,6 +473,11 @@ namespace MajorisDisks {
                 !StorageSafetyService.assess (target, backend?.snapshot.dependencies).system_critical;
             if (block.encrypted != null) add_volume_field ("Encryption", target == block ? "Locked" : "Unlocked");
             backup_volume.visible = block.available && block.size > 0;
+            if (block.available && block.size > 0 && block.partition != null && !block.partition.container) {
+                var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.IMAGE_RESTORE,
+                    block, backend?.snapshot.dependencies);
+                restore_partition.visible = eligibility.allowed && !eligibility.unknown;
+            }
             unlock_volume.visible = block.encrypted != null && block.encrypted.mapping == null && block.available;
             lock_volume.visible = block.encrypted?.mapping != null && block.available && !block.system_hint;
             change_passphrase.visible = block.encrypted != null && block.available && !block.read_only && !block.system_hint;
@@ -564,14 +579,21 @@ namespace MajorisDisks {
     public class DriveInformationDialog : Adw.Dialog {
         [GtkChild] private unowned Adw.PreferencesGroup fields;
 
-        public DriveInformationDialog (StorageDrive drive) {
+        public DriveInformationDialog (StorageDrive drive, StorageBlock? selected = null) {
             var disk = drive.medium;
             add_field ("Model", drive.model, true);
             add_field ("Vendor", drive.vendor);
             add_field ("Serial", drive.serial, true);
             add_field ("WWN", drive.wwn, true);
-            add_field ("Firmware revision", drive.revision);
+            add_field ("Firmware revision", drive.revision, true);
             add_field ("Device path", disk?.preferred ?? "", true);
+            var volume = selected ?? disk;
+            if (volume != null) {
+                if (volume != disk) add_field ("Volume device path", volume.preferred, true);
+                add_field ("Partition UUID", volume.partition?.uuid ?? "", true);
+                var filesystem = volume.encrypted?.mapping ?? volume;
+                if (filesystem.filesystem != null) add_field ("Filesystem UUID", filesystem.uuid, true);
+            }
             add_field ("Connection", drive.bus);
             add_field ("Device category", drive.category);
             if (drive.optical) add_field ("Optical media", drive.media);
@@ -606,7 +628,7 @@ namespace MajorisDisks {
             this.title = title;
             subtitle = value;
             copy_button.visible = copy;
-            copy_button.label = "Copy " + title;
+            copy_button.tooltip_text = "Copy " + title;
             copy_button.clicked.connect (() => get_clipboard ().set_text (subtitle));
         }
     }

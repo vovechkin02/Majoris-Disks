@@ -75,9 +75,19 @@ public static int main (string[] args) {
     backend.snapshot.blocks.insert (disk.path, disk);
     var block = new StorageBlock ("/test/partition");
     block.preferred = "/dev/test1"; block.size = 8 * 1024 * 1024; block.type_id = "ext4";
+    block.uuid = "test-filesystem-uuid";
     block.partition = new StoragePartition (); block.partition.table_path = disk.path;
+    block.partition.uuid = "test-partition-uuid";
     block.partition.offset = 1024 * 1024; block.parent = disk; block.filesystem = new StorageFilesystem ();
     disk.table.partitions = { block }; backend.snapshot.blocks.insert (block.path, block);
+    string disk_identity = backend.modification_identity (disk);
+    assert (disk_identity == backend.modification_identity (disk));
+    string partition_identity = backend.modification_identity (block);
+    assert (partition_identity == backend.modification_identity (block));
+    block.partition.offset += 512;
+    assert (partition_identity != backend.modification_identity (block));
+    block.partition.offset -= 512;
+    assert (partition_identity == backend.modification_identity (block));
     var gap = new StorageFreeSpace (disk, Extent (16 * 1024 * 1024, 16 * 1024 * 1024));
     var drive = new StorageDrive ("/test/drive"); drive.medium = disk; drive.name = "Test drive";
     var app = new Gtk.Application ("com.majoris.disks.TemplateTest", ApplicationFlags.NON_UNIQUE);
@@ -88,7 +98,7 @@ public static int main (string[] args) {
     Object[] instances = {
         new PartitionMap (), new PartitionSegment (), new DriveView (), new DisksWindow (app),
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
-        new DriveInformationDialog (drive), new InformationRow ("Test", "Value", false),
+        new DriveInformationDialog (drive, block), new InformationRow ("Test", "Value", false),
         new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new BtrfsBalanceDialog (true), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
         new OperationResultDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
         new FormatDiskDialog (), new FormatVolumeDialog (backend, block),

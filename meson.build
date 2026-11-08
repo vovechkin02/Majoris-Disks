@@ -50,6 +50,8 @@ imaging_test = executable('image-device-test', 'tests/image-device-test.vala', s
   dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
 test('disposable-imaging-integration', imaging_test, timeout: 180)
 test('disposable-xz-integration', imaging_test, args: ['--xz'], timeout: 180)
+test('disposable-partition-image-integration', imaging_test, args: ['--partition'], timeout: 180)
+test('disposable-partition-xz-integration', imaging_test, args: ['--partition', '--xz'], timeout: 180)
 test('disposable-nbd-integration', imaging_test, args: ['--nbd'], timeout: 300)
 test('disposable-loop-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-loop-integration.sh'],

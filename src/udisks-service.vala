@@ -865,8 +865,11 @@ namespace MajorisDisks {
         internal async StorageOperationResult restore_disk_image (StorageBlock block, File source,
             string confirmed_identity) throws Error {
             string? path = source.get_path ();
-            if (path == null || !(path.has_suffix (".img") || path.has_suffix (".iso") || path.has_suffix (".img.xz")))
-                throw new IOError.INVALID_ARGUMENT ("Choose a local .img, .iso or .img.xz file.");
+            if (path == null || !(path.has_suffix (".img") || path.has_suffix (".raw") ||
+                path.has_suffix (".iso") || path.has_suffix (".img.xz")))
+                throw new IOError.INVALID_ARGUMENT ("Choose a local .img, .raw, .iso or .img.xz file.");
+            if (block.partition?.container == true)
+                throw new IOError.INVALID_ARGUMENT ("An extended partition container cannot be restored as a volume.");
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The selected device changed after confirmation.");
             var eligible = StorageSafetyService.assess_operation (StorageOperationKind.IMAGE_RESTORE, block, snapshot.dependencies);
@@ -923,6 +926,8 @@ namespace MajorisDisks {
                     var dependent = node as StorageBlock;
                     if (dependent != null) yield KernelStorageSafety.require_idle (dependent, lifetime);
                 }
+                if (modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The target device changed before opening it for restore.");
                 target = yield open_block (block, "rw", Posix.O_EXCL | Posix.O_CLOEXEC | Posix.O_SYNC, token);
                 token.set_error_if_cancelled ();
                 if (source_identity != image_identity (input))
@@ -3611,11 +3616,13 @@ namespace MajorisDisks {
                 if (child == null) continue;
                 var partition = child.partition;
                 var drive = child.physical_drive;
+                uint64 partition_offset = partition != null ? partition.offset : 0;
+                uint partition_number = partition != null ? partition.number : 0;
                 records.add (new Variant ("(ssssssssssttttu)", child.path, child.device,
                     child.parent?.path ?? "", child.drive_path, drive?.serial ?? "", drive?.wwn ?? "",
                     child.uuid, partition?.uuid ?? "", partition?.table_path ?? "",
-                    child.table?.scheme ?? "", child.number, child.size, partition?.offset ?? 0,
-                    child.logical_sector_size, partition?.number ?? 0).print (false));
+                    child.table?.scheme ?? "", child.number, child.size, partition_offset,
+                    child.logical_sector_size, partition_number).print (false));
             }
             records.sort ((left, right) => strcmp (left, right));
             var identity = new StringBuilder ();

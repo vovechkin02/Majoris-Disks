@@ -1267,7 +1267,10 @@ namespace MajorisDisks {
 
         private void choose_restore (StorageBlock block) {
             string identity = backend.modification_identity (block);
-            var chooser = new Gtk.FileDialog () { title = "Select Disk Image to Restore" };
+            bool partition = block.partition != null;
+            var chooser = new Gtk.FileDialog () {
+                title = partition ? "Select Partition Image to Restore" : "Select Disk Image to Restore"
+            };
             chooser.open.begin (this, null, (object, result) => {
                 File source;
                 try { source = chooser.open.end (result); } catch (Error error) { return; }
@@ -1279,7 +1282,7 @@ namespace MajorisDisks {
                 }
                 var drive = block.physical_drive;
                 var confirmation = new DiskImageConfirmation () {
-                    heading = "Overwrite the selected device?",
+                    heading = partition ? "Overwrite the selected partition?" : "Overwrite the selected device?",
                     body = "%s\n\nTarget: %s · %s · %s\nSerial: %s\nWWN: %s%s\n\nRestoring this image overwrites existing data.".printf (
                         source.get_parse_name (), block.preferred, drive?.model ?? "Storage device",
                         format_size (block.size), drive?.serial ?? "", drive?.wwn ?? "", details.str)

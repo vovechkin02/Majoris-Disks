@@ -1,19 +1,22 @@
 using MajorisDisks;
 
-private void verify_fixture (File target, uint8[] expected, uint8[] trailing) throws Error {
+private void verify_fixture (File target, uint8[] expected, uint8[] before, int offset) throws Error {
     uint8[] actual;
     FileUtils.get_data (target.get_path (), out actual);
-    if (actual.length != 8 * 1024 * 1024 ||
-        new Bytes (actual[0:expected.length]).compare (new Bytes (expected)) != 0 ||
-        new Bytes (actual[expected.length:actual.length]).compare (new Bytes (trailing)) != 0)
+    int end = offset + expected.length;
+    if (actual.length != before.length ||
+        new Bytes (actual[0:offset]).compare (new Bytes (before[0:offset])) != 0 ||
+        new Bytes (actual[offset:end]).compare (new Bytes (expected)) != 0 ||
+        new Bytes (actual[end:actual.length]).compare (new Bytes (before[end:before.length])) != 0)
         throw new IOError.INVALID_DATA ("The restored device contents differ from the expected image.");
 }
 
-private async void exercise_devices (bool use_xz) throws Error {
+private async void exercise_devices (bool use_xz, bool partition) throws Error {
     string directory = DirUtils.make_tmp ("majoris-image-devices-XXXXXX");
     var source = File.new_for_path (Path.build_filename (directory, "source.img"));
     var copy = File.new_for_path (Path.build_filename (directory, "copy.img"));
     var compressed = File.new_for_path (Path.build_filename (directory, "second.img.xz"));
+    var oversized = File.new_for_path (Path.build_filename (directory, "oversized.raw"));
     var target = File.new_for_path (Path.build_filename (directory, "target.img"));
     var backend = new UDisksService ();
     StorageBlock? attached = null;
@@ -30,6 +33,14 @@ private async void exercise_devices (bool use_xz) throws Error {
         destination.output_stream.write_all (trailing, out tail_written);
         assert (tail_written == trailing.length);
         destination.close ();
+        if (partition) {
+            var partitioner = new Subprocess.newv ({ "sfdisk", "--no-reread", "--no-tell-kernel", target.get_path () },
+                SubprocessFlags.STDIN_PIPE | SubprocessFlags.STDOUT_SILENCE);
+            yield partitioner.communicate_utf8_async ("label: gpt\nstart=2048, size=8192, type=L\n", null, null, null);
+            yield partitioner.wait_check_async ();
+        }
+        uint8[] before;
+        FileUtils.get_data (target.get_path (), out before);
         int writer = Posix.open (source.get_path (), Posix.O_WRONLY | Posix.O_CLOEXEC | Posix.O_NOFOLLOW);
         if (writer < 0) throw new IOError.FAILED ("Could not open the disposable source fixture.");
         try {
@@ -71,13 +82,33 @@ private async void exercise_devices (bool use_xz) throws Error {
         attached = backend.snapshot.blocks.lookup (target_object);
         if (attached == null || attached.read_only || attached.loop?.backing_file != target.get_path ())
             throw new IOError.INVALID_DATA ("Refusing to restore to an unverified disposable fixture.");
-        var result = yield backend.restore_disk_image (attached, restore_source, backend.modification_identity (attached));
+        StorageBlock restore_target = attached;
+        int offset = 0;
+        if (partition) {
+            var partitions = attached.table?.partitions ?? new StorageBlock[0];
+            offset = 1024 * 1024;
+            if (partitions.length != 1 || partitions[0].partition?.offset != offset ||
+                partitions[0].partition?.table_path != attached.path || partitions[0].size != 4 * 1024 * 1024)
+                throw new IOError.INVALID_DATA ("Could not verify the disposable target partition.");
+            restore_target = partitions[0];
+            try {
+                yield backend.restore_disk_image (restore_target, restore_source, "stale confirmation");
+                assert_not_reached ();
+            } catch (Error error) { assert (error is IOError.NOT_FOUND); }
+            yield DiskImageCopy.create_blank (oversized, restore_target.size + 512);
+            var rejected = yield backend.restore_disk_image (restore_target, oversized,
+                backend.modification_identity (restore_target));
+            assert (!rejected.successful);
+            verify_fixture (target, before[offset:offset + expected.length], before, offset);
+        }
+        var result = yield backend.restore_disk_image (restore_target, restore_source,
+            backend.modification_identity (restore_target));
         if (!result.successful)
             throw new IOError.FAILED (result.summary + " " + result.technical_error);
         yield backend.detach_disk_image (attached);
         attached = null;
         safe_to_remove = true;
-        verify_fixture (target, expected, trailing);
+        verify_fixture (target, expected, before, offset);
     } finally {
         if (attached != null && (attached.loop?.backing_file == source.get_path () ||
             attached.loop?.backing_file == target.get_path ())) {
@@ -91,6 +122,7 @@ private async void exercise_devices (bool use_xz) throws Error {
             FileUtils.unlink (copy.get_path ());
             FileUtils.unlink (target.get_path ());
             FileUtils.unlink (compressed.get_path ());
+            FileUtils.unlink (oversized.get_path ());
             DirUtils.remove (directory);
         } else warning ("A loop attachment could not be reconciled. Retained fixtures in %s", directory);
     }
@@ -255,7 +287,12 @@ private async void exercise_nbd_devices () throws Error {
 
 public static int main (string[] args) {
     bool nbd = args.length > 1 && args[1] == "--nbd";
-    bool use_xz = args.length > 1 && args[1] == "--xz";
+    bool use_xz = "--xz" in args;
+    bool partition = "--partition" in args;
+    if (partition && Environment.find_program_in_path ("sfdisk") == null) {
+        stdout.printf ("SKIP: sfdisk is required to create the partition fixture.\n");
+        return 77;
+    }
     if (use_xz && Environment.find_program_in_path ("xz") == null) {
         stdout.printf ("SKIP: xz-utils is required to generate the compressed fixture.\n");
         return 77;
@@ -279,7 +316,7 @@ public static int main (string[] args) {
         catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
         loop.quit ();
     });
-    else exercise_devices.begin (use_xz, (object, result) => {
+    else exercise_devices.begin (use_xz, partition, (object, result) => {
         try { exercise_devices.end (result); }
         catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
         loop.quit ();
