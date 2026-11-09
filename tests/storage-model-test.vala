@@ -504,18 +504,29 @@ private void test_mount_restoration_status () {
     assert (stacked.mount_set_matches ({ "/first", "/first" }));
 }
 
-private void test_kernel_mount_signatures () {
-    bool whole;
-    string record = " 22 253:1 / /mnt/data rw,nosuid - ext4 /dev/dm-1 rw,errors=remount-ro";
-    var original = KernelStorageSafety.mount_signatures ("35" + record, "253:1", out whole);
-    assert (whole && original.length == 1);
-    var remounted = KernelStorageSafety.mount_signatures ("47" + record, "253:1", out whole);
-    assert (whole && remounted.length == 1 && remounted[0] == original[0]);
-    var changed = KernelStorageSafety.mount_signatures ("47" + record.replace ("rw,nosuid", "ro"), "253:1", out whole);
-    assert (changed.length == 1 && changed[0] != original[0]);
-    var bind = KernelStorageSafety.mount_signatures ("35" + record + "\n" +
-        "48 22 253:1 /subdir /mnt/bind rw - ext4 /dev/dm-1 rw", "253:1", out whole);
-    assert (!whole && bind.length == 2);
+private void test_kernel_mount_topology () {
+    string record = " 22 253:1 / /mnt/data\\040drive rw,nosuid shared:7 - ext4 /dev/dm-1 rw,errors=remount-ro";
+    try {
+        var original = KernelStorageSafety.parse_mountinfo ("35" + record + "\n" +
+            "48 35 253:1 /subdir /mnt/bind rw - ext4 /dev/dm-1 rw", "mnt:[9]");
+        assert (original.length == 2 && original[0].target == "/mnt/data drive");
+        assert (original[0].propagation[0] == "shared:7");
+        assert (original[1].parent_id == original[0].id && original[1].root == "/subdir");
+        var remounted = KernelStorageSafety.parse_mountinfo ("47" + record, "mnt:[9]");
+        assert (original[0].same_mount (remounted[0]));
+        var changed = KernelStorageSafety.parse_mountinfo ("47" + record.replace ("rw,nosuid", "ro"), "mnt:[9]");
+        assert (!original[0].same_mount (changed[0]));
+        changed = KernelStorageSafety.parse_mountinfo ("47" + record, "mnt:[10]");
+        assert (!original[0].same_mount (changed[0]));
+    } catch (Error error) {
+        Test.fail_printf ("%s", error.message);
+    }
+    try {
+        KernelStorageSafety.parse_mountinfo ("35" + record.replace ("040", "041"), "mnt:[9]");
+        Test.fail ();
+    } catch (Error expected) {
+        assert (expected is IOError.INVALID_DATA);
+    }
 }
 
 private void test_preparation_device_identity () {
@@ -1389,7 +1400,7 @@ public static int main (string[] args) {
     Test.add_func ("/operations/minimum-size-parsers", test_minimum_size_parsers);
     Test.add_func ("/operations/mount-configuration-snapshot", test_mount_configuration_snapshot);
     Test.add_func ("/operations/mount-restoration-status", test_mount_restoration_status);
-    Test.add_func ("/operations/kernel-mount-signatures", test_kernel_mount_signatures);
+    Test.add_func ("/operations/kernel-mount-topology", test_kernel_mount_topology);
     Test.add_func ("/operations/preparation-device-identity", test_preparation_device_identity);
     Test.add_func ("/operations/crypttab-keyfile-scope", test_crypttab_keyfile_scope);
     Test.add_func ("/operations/crypttab-option-preservation", test_crypttab_option_preservation);

@@ -1,4 +1,28 @@
 namespace MajorisDisks {
+    internal class KernelMountRecord : Object {
+        public uint id;
+        public uint parent_id;
+        public string device;
+        public string root;
+        public string target;
+        public string filesystem;
+        public string source;
+        public string mount_options;
+        public string super_options;
+        public string[] propagation;
+        public string namespace_id;
+        public string block_path = "";
+        public Variant? fstab;
+
+        public bool same_mount (KernelMountRecord current) {
+            return parent_id == current.parent_id && device == current.device &&
+                root == current.root && target == current.target && filesystem == current.filesystem &&
+                source == current.source && mount_options == current.mount_options &&
+                super_options == current.super_options && namespace_id == current.namespace_id &&
+                string.joinv (" ", propagation) == string.joinv (" ", current.propagation);
+        }
+    }
+
     public class KernelStorageSafety {
         public static string device_number (uint64 number) {
             uint64 major = ((number >> 8) & 0xfff) | ((number >> 32) & 0xfffff000);
@@ -68,21 +92,64 @@ namespace MajorisDisks {
             return false;
         }
 
-        internal static string[] mount_signatures (string mountinfo, string identity, out bool whole_filesystem) {
-            string[] signatures = {};
-            whole_filesystem = true;
+        private static string decode_mount_field (string field) throws Error {
+            var decoded = new StringBuilder ();
+            for (int i = 0; i < field.length; i++) {
+                if (field[i] != '\\') {
+                    decoded.append_c (field[i]);
+                    continue;
+                }
+                if (field.length - i < 4)
+                    throw new IOError.INVALID_DATA ("Incomplete kernel mount path escape.");
+                switch (field.substring (i + 1, 3)) {
+                case "040": decoded.append_c (' '); break;
+                case "011": decoded.append_c ('\t'); break;
+                case "012": decoded.append_c ('\n'); break;
+                case "134": decoded.append_c ('\\'); break;
+                default: throw new IOError.INVALID_DATA ("Invalid kernel mount path escape.");
+                }
+                i += 3;
+            }
+            return decoded.str;
+        }
+
+        internal static KernelMountRecord[] parse_mountinfo (string mountinfo, string namespace_id) throws Error {
+            var seen = new HashTable<uint, bool> (direct_hash, direct_equal);
+            var records = new GenericArray<KernelMountRecord> ();
             foreach (var line in mountinfo.split ("\n")) {
+                if (line == "") continue;
                 var fields = line.split (" ");
-                if (fields.length < 10 || fields[2] != identity) continue;
                 int separator = 6;
                 while (separator < fields.length && fields[separator] != "-") separator++;
-                if (separator + 3 >= fields.length) continue;
-                whole_filesystem &= fields[3] == "/";
-                // Omit the mount ID, which changes on remount. Retain the parent,
-                // root, target, mount options, propagation and superblock options.
-                signatures += string.joinv (" ", fields[1:fields.length]);
+                var record = new KernelMountRecord ();
+                if (separator + 4 != fields.length ||
+                    !uint.try_parse (fields[0], out record.id) || record.id == 0 ||
+                    !uint.try_parse (fields[1], out record.parent_id) || record.parent_id == 0 ||
+                    seen.contains (record.id) || !Regex.match_simple ("^[0-9]+:[0-9]+$", fields[2]) ||
+                    fields[5] == "" || fields[separator + 1] == "" ||
+                    fields[separator + 2] == "" || fields[separator + 3] == "")
+                    throw new IOError.INVALID_DATA ("Invalid or ambiguous kernel mount record.");
+                record.device = fields[2];
+                record.root = decode_mount_field (fields[3]);
+                record.target = decode_mount_field (fields[4]);
+                if (!Path.is_absolute (record.root) || !Path.is_absolute (record.target))
+                    throw new IOError.INVALID_DATA ("Kernel mount roots and targets must be absolute.");
+                record.mount_options = fields[5];
+                record.propagation = fields[6:separator];
+                foreach (var tag in record.propagation)
+                    if (tag == "") throw new IOError.INVALID_DATA ("Empty kernel mount propagation field.");
+                record.filesystem = fields[separator + 1];
+                record.source = decode_mount_field (fields[separator + 2]);
+                record.super_options = fields[separator + 3];
+                record.namespace_id = namespace_id;
+                seen.insert (record.id, true);
+                records.add (record);
             }
-            return signatures;
+            if (records.length == 0)
+                throw new IOError.INVALID_DATA ("The kernel mount table is empty.");
+            var result = new KernelMountRecord[records.length];
+            for (uint i = 0; i < records.length; i++) result[i] = records[i];
+            return result;
         }
     }
 }

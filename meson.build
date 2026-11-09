@@ -18,6 +18,9 @@ deps = [
 subdir('src')
 layout_test = executable('storage-model-test', 'tests/storage-model-test.vala', 'tests/mock-open-device.c',
   storage_model_sources, include_directories: [include_directories('tests'), xz_include], dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+crypttab_inspector_test = executable('crypttab-inspector-test', 'tests/crypttab-inspector-test.c',
+  dependencies: dependency('glib-2.0'))
+test('crypttab-inspector', crypttab_inspector_test)
 sh = find_program('sh')
 native_xz_test = executable('native-xz-test', 'tests/xz-stream-test.c', 'src/xz-stream.c',
   include_directories: xz_include, dependencies: [dependency('gio-2.0'), xz_dep])
@@ -58,7 +61,8 @@ if cryptsetup_dep.found()
   luks_service_test = executable('luks-header-service-test', 'tests/luks-header-service-test.vala',
     storage_model_sources, 'src/udisks-service.vala',
     include_directories: xz_include,
-    c_args: ['-DLUKS_HEADER_WORKER="' + luks_header_worker.full_path() + '"'],
+    c_args: ['-DLUKS_HEADER_WORKER="' + luks_header_worker.full_path() + '"',
+      '-DMAJORIS_CRYPTTAB_INSPECTOR="' + crypttab_inspector.full_path() + '"'],
     dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
   luks_worker_faults = shared_module('luks-worker-faults', 'tests/luks-worker-faults.c',
     dependencies: meson.get_compiler('c').find_library('dl'))
@@ -73,7 +77,8 @@ if cryptsetup_dep.found()
     args: [meson.current_source_dir() / 'tests/luks-resize-integration.sh', luks_service_test, 'partition'],
     timeout: 300)
   test('luks-configuration-integration', sh,
-    args: [meson.current_source_dir() / 'tests/luks-configuration-integration.sh', luks_service_test],
+    args: [meson.current_source_dir() / 'tests/luks-configuration-integration.sh', luks_service_test, crypttab_inspector],
+    depends: crypttab_inspector,
     timeout: 300)
 endif
 test('disposable-loop-integration', sh,

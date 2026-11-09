@@ -1013,7 +1013,9 @@ namespace MajorisDisks {
                             passphrase = ""; pending.remove (block.path);
                             try {
                                 var result = backend.configure_encryption.end (completed);
-                                if (result.completed_steps.length > 2)
+                                if (result.status == StorageOperationStatus.NEEDS_ATTENTION)
+                                    show_check_message ("Automatic Unlocking Needs Attention", operation_result_details (result));
+                                else if (result.completed_steps.length > 2)
                                     show_check_message ("Automatic Unlocking Updated", operation_result_details (result));
                                 else notifications.add_toast (new Adw.Toast (result.summary));
                             } catch (Error error) {

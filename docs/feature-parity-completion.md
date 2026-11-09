@@ -1,5 +1,27 @@
 # Feature parity completion register
 
+## Protected crypttab inspection and mount topology follow-up
+
+| Area | Status | Scope |
+| --- | --- | --- |
+| Crypttab conflicts | Parser execution-tested | The inspector checks exact records, duplicate names, shared key references and octal-escaped aliases. The tests use an in-memory crypttab. |
+| Protected configuration and keyfiles | Implemented, live authorization pending | The dedicated `com.majoris.disks.crypttab-inspect` action authenticates an active desktop requester as an administrator. The helper checks metadata with descriptor-relative `openat2` and rejects unsafe directory ownership, non-regular files, symlinks and multiple hard links. It compares a file identity stamp across checks and checks the fixed systemd implicit keyfile locations. It returns a finding and file identity metadata. UDisks handles secret reads and configuration writes. |
+| Credential rotation and UI | Implemented, live verification pending | The existing keyslot verification and enrollment flow stays in place. The old slot remains active. A possible write or enrollment with an unverified outcome returns **Needs Attention** and shows details in the existing dialog. The editor explains that protected inspection may require authorization. |
+| Mount topology and preparation | Parser execution-tested, restoration partial | The journal captures structured mountinfo records with mount and parent IDs, device number, root, decoded target, source, type, mount and superblock options, propagation fields, namespace, block object and matching fstab record. The common preparation path captures the dependency plan before its first mutation and rechecks the captured mount identity before unmounting. Existing single-mount UDisks restoration checks the semantic record after remount. |
+| Multiple ordinary mounts and bind mounts | Unsupported | The parser recognizes these records. Automatic preparation still refuses multi-mount, bind, stacked and nested layouts. There is no privileged mount-restoration backend or supported cross-namespace path. |
+| Reopening LUKS mappings during restoration | Unsupported | Existing inner-filesystem operations can restore a single eligible mount while the same verified mapping remains available. Mapping recreation, credential prompting for restoration and cleartext-object rebinding remain open. |
+
+The helper inspects the system mount namespace for desktop requests. It cannot safely resolve unrelated crypttab key references that traverse symlinks and may therefore refuse an otherwise valid edit. Inspection and the subsequent UDisks write are separately authorized operations. The final inspection narrows the time in which another administrator can change configuration or keyfile identity. UDisks performs its own record match, but the two calls do not share a transaction. UDisks can unlink an old keyfile before recreating it during an update. The retained LUKS keyslot and the on-disk keyfile have separate failure modes. [UDisks configuration implementation](https://github.com/storaged-project/udisks/blob/udisks-2.10.1/src/udiskslinuxblock.c)
+
+The attached GNOME source was reviewed for crypttab variant construction, protected configuration retrieval, configuration updates, passphrase changes, dependency preparation and local-job completion. This pass retains the attributed adaptation of `gdu_encryption_options_dialog_get_new_crypttab` and copies no additional GNOME source.
+
+The opt-in private-namespace crypttab fixture now includes protected directory, shared reference, symlink, hard-link, missing file, inode replacement and unsafe directory cases. The fixture still requires a dedicated disposable VM. Ordinary-user Polkit allow and deny, live UDisks configuration and rotation, multi-mount restoration and LUKS mapping recovery were unexecuted in this follow-up.
+
+Debian 13.5 WSL passed Meson setup, compilation and staged installation. The default suite passed seven tests, skipped 13 and reported zero failures. The passing cases included the new crypttab inspector parser, storage model, GTK templates and existing mock UDisks coverage. The staged installation verified that the inspector and its policy are packaged. It did not activate the policy or run the schema post-install hook.
+
+Added files are `src/crypttab-inspector.c`, `src/crypttab-inspector-config.h.in`, `data/com.majoris.disks.Crypttab.policy.in` and `tests/crypttab-inspector-test.c`. Updated files are the root and source Meson definitions, `src/udisks-service.vala`, `src/kernel-storage-safety.vala`, `src/storage-operation.vala`, `src/window.vala`, `data/ui/encryption-options-dialog.ui`, `tests/storage-model-test.vala`, `tests/luks-configuration-integration.sh` and this report.
+
+
 Source: Majoris Disks comparative audit, 8 November 2026. IDs follow source matrix order and are stable. This register separates source evidence from executed verification.
 
 The baseline already provides filtered Btrfs balance, read-only scrub, restricted allocated-member removal, thin-pool expansion and eligible empty-pool deactivation/deletion, thin overcommit, ordinary and thin snapshot creation, and restricted two-member RAID1 recovery. Their lifecycle gaps are tracked below.

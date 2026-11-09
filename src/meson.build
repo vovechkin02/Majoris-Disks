@@ -35,3 +35,12 @@ if cryptsetup_dep.found()
     dependencies: [cryptsetup_dep, blkid_c, dependency('json-glib-1.0')],
     install: true, install_dir: get_option('libexecdir'))
 endif
+
+crypttab_config = configuration_data()
+crypttab_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
+configure_file(input: 'crypttab-inspector-config.h.in', output: 'crypttab-inspector-config.h',
+  configuration: crypttab_config)
+configure_file(input: '../data/com.majoris.disks.Crypttab.policy.in', output: 'com.majoris.disks.Crypttab.policy',
+  configuration: crypttab_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
+crypttab_inspector = executable('majoris-disks-crypttab-inspector', 'crypttab-inspector.c',
+  dependencies: dependency('glib-2.0'), install: true, install_dir: get_option('libexecdir'))

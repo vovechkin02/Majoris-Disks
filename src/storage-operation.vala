@@ -190,7 +190,7 @@ namespace MajorisDisks {
         public string device_identity = "";
         public string[] observed_mount_points = {};
         internal string mount_namespace = "";
-        internal string mount_signature = "";
+        internal KernelMountRecord[] mount_topology = {};
         internal string encrypted_backing_path = "";
         internal string encrypted_backing_identity = "";
         internal string encrypted_backing_uuid = "";

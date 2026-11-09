@@ -11,15 +11,16 @@ for tool in unshare dbus-run-session busctl mountpoint udevadm losetup cryptsetu
 done
 udisksd=/usr/libexec/udisks2/udisksd
 [ -x "$udisksd" ] || skip "Debian UDisks daemon unavailable"
-if [ "${2:-}" != private ]; then
+if [ "${3:-}" != private ]; then
     unshare --mount --propagation private true || skip "private mount namespaces unavailable"
-    exec unshare --mount --propagation private dbus-run-session -- sh "$0" "$1" private
+    exec unshare --mount --propagation private dbus-run-session -- sh "$0" "$1" "$2" private
 fi
 [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || skip "private test bus unavailable"
 [ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ] ||
     skip "the configuration fixture requires a private mount namespace"
 export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
 service=$(realpath "$1")
+inspector=$(realpath "$2")
 umask 077
 tmp=$(mktemp -d /var/tmp/majoris-luks.crypttab.XXXXXX)
 name=$(basename "$tmp")
@@ -59,6 +60,41 @@ touch /etc/majoris-private-crypttab
 rm -f -- /etc/crypttab
 touch /etc/crypttab
 if [ -e /etc/luks-keys ] || [ -L /etc/luks-keys ]; then skip "dedicated fixture requires a fresh key directory"; fi
+# Exercise the installed boundary's checks against the private configuration.
+mkdir -m 0700 /etc/luks-keys
+chmod 0600 /etc/crypttab
+key=/etc/luks-keys/inspector-test
+printf '%s' 'fixture bytes' >"$key"
+printf 'inspector-test UUID=fixture %s nofail,vendor-option\n' "$key" > /etc/crypttab
+inspect_key() {
+    "$inspector" inspector-test inspector-test UUID=fixture nofail,vendor-option "$key" "$key"
+}
+expect_inspector_status() {
+    expected=$1
+    actual=0
+    inspect_key >/dev/null || actual=$?
+    [ "$actual" = "$expected" ]
+}
+before_identity=$(inspect_key)
+printf 'foreign UUID=foreign %s none\n' "$key" >> /etc/crypttab
+expect_inspector_status 13
+sed -i '/^foreign /d' /etc/crypttab
+ln "$key" "$key.alias"
+expect_inspector_status 11
+rm -- "$key.alias"
+mv -- "$key" "$key.original"
+ln -s -- "$key.original" "$key"
+expect_inspector_status 11
+rm -- "$key"
+expect_inspector_status 14
+printf '%s' 'replacement bytes' >"$key"
+[ "$(inspect_key)" != "$before_identity" ]
+chmod 0777 /etc/luks-keys
+expect_inspector_status 11
+rm -- "$key" "$key.original"
+rmdir /etc/luks-keys
+: > /etc/crypttab
+
 mount --bind "$tmp/run" /run/udisks2
 touch "$tmp/mounted-run"
 mount --bind "$tmp/state" /var/lib/udisks2

@@ -1,0 +1,3 @@
+#ifndef MAJORIS_CRYPTTAB_INSPECTOR
+#define MAJORIS_CRYPTTAB_INSPECTOR "@LIBEXECDIR@/majoris-disks-crypttab-inspector"
+#endif

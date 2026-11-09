@@ -4048,6 +4048,27 @@ namespace MajorisDisks {
                         var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, block.path, state, "unmount");
                         capture_mount_state (block, entry);
                         journal.add (entry);
+                    }
+                    if (block.swap_active) {
+                        var entry = new StoragePreparationEntry (StoragePreparationKind.SWAP, block.path,
+                            { block.uuid, block.type_id }, "deactivate swap");
+                        entry.device_identity = StoragePreparationJournal.device_identity (block);
+                        journal.add (entry);
+                    }
+                }
+                foreach (var entry in journal.entries ()) {
+                    synchronize ();
+                    token.set_error_if_cancelled ();
+                    var block = snapshot.blocks.lookup (entry.object_path);
+                    if (block == null || !entry.matches_prepared_device (block))
+                        throw new IOError.NOT_FOUND ("A storage dependency changed after preparation was planned.");
+                    if (entry.kind == StoragePreparationKind.MOUNT) {
+                        string namespace_id;
+                        var current = read_mount_topology (block, out namespace_id);
+                        if (!entry.mount_configuration_matches (block.mount_configurations) ||
+                            current.length != 1 || current[0].id != entry.mount_topology[0].id ||
+                            !entry.mount_topology[0].same_mount (current[0]))
+                            throw new IOError.BUSY ("The mount topology changed after preparation was planned.");
                         entry.action_dispatched = true;
                         try {
                             entry.prepared = yield prepare_unmounted (block, token);
@@ -4064,11 +4085,9 @@ namespace MajorisDisks {
                             throw error;
                         }
                     }
-                    if (block.swap_active) {
-                        var entry = new StoragePreparationEntry (StoragePreparationKind.SWAP, block.path,
-                            { block.uuid, block.type_id }, "deactivate swap");
-                        entry.device_identity = StoragePreparationJournal.device_identity (block);
-                        journal.add (entry);
+                    if (entry.kind == StoragePreparationKind.SWAP) {
+                        if (!block.swap_active)
+                            throw new IOError.BUSY ("Swap state changed after preparation was planned.");
                         entry.action_dispatched = true;
                         var swap = require_volume (block, "Swapspace");
                         var options = new VariantBuilder (new VariantType ("a{sv}"));
@@ -4102,21 +4121,39 @@ namespace MajorisDisks {
             }
         }
 
-        private static string[] read_mount_signatures (StorageBlock block, out bool whole_filesystem) throws Error {
+        private static KernelMountRecord[] read_mount_topology (StorageBlock block, out string namespace_id) throws Error {
             if (block.number == 0)
                 throw new IOError.NOT_SUPPORTED ("The kernel mount source could not be identified.");
+            namespace_id = FileUtils.read_link ("/proc/self/ns/mnt");
             string mountinfo;
             FileUtils.get_contents ("/proc/self/mountinfo", out mountinfo);
-            return KernelStorageSafety.mount_signatures (mountinfo,
-                KernelStorageSafety.device_number (block.number), out whole_filesystem);
+            var all_mounts = KernelStorageSafety.parse_mountinfo (mountinfo, namespace_id);
+            string device = KernelStorageSafety.device_number (block.number);
+            KernelMountRecord[] selected = {};
+            foreach (var record in all_mounts) {
+                if (record.device != device) continue;
+                record.block_path = block.path;
+                foreach (var configuration in block.mount_configurations)
+                    if (configuration.directory == record.target)
+                        record.fstab = configuration.backend_item;
+                selected += record;
+            }
+            foreach (var mount in selected) {
+                foreach (var other in all_mounts) {
+                    if (other.id == mount.id) continue;
+                    if (other.target == mount.target || other.parent_id == mount.id)
+                        throw new IOError.NOT_SUPPORTED ("Stacked or nested mounts at %s require manual preparation.".printf (mount.target));
+                }
+            }
+            return selected;
         }
 
         private void capture_mount_state (StorageBlock block, StoragePreparationEntry entry) throws Error {
             entry.device_identity = StoragePreparationJournal.device_identity (block);
             entry.capture_mount_configuration (block.mount_configurations);
-            bool whole_filesystem;
-            var signatures = read_mount_signatures (block, out whole_filesystem);
-            if (entry.mount_point_count () != 1 || signatures.length != 1 || !whole_filesystem)
+            entry.mount_topology = read_mount_topology (block, out entry.mount_namespace);
+            if (entry.mount_point_count () != 1 || entry.mount_topology.length != 1 ||
+                entry.mount_topology[0].root != "/" || entry.mount_topology[0].target != entry.mount_point_at (0))
                 throw new IOError.NOT_SUPPORTED ("Unmount this filesystem manually before continuing. Its mount layout cannot be restored safely.");
             if (!entry.persistent_mount) {
                 string parent = Path.get_dirname (entry.mount_point_at (0));
@@ -4124,8 +4161,6 @@ namespace MajorisDisks {
                 if (parent != "/media/" + user && parent != "/run/media/" + user)
                     throw new IOError.NOT_SUPPORTED ("Unmount this filesystem manually. Its original mount location is managed outside UDisks.");
             }
-            entry.mount_namespace = FileUtils.read_link ("/proc/self/ns/mnt");
-            entry.mount_signature = signatures[0];
             if (block.backing_path != "/") {
                 var backing = snapshot.blocks.lookup (block.backing_path);
                 if (backing == null || backing.encrypted?.mapping != block || backing.uuid == "")
@@ -4171,12 +4206,11 @@ namespace MajorisDisks {
                     entry.actual_state = actual_mounts.length == 0 ? "unmounted" :
                         "mounted at " + string.joinv (", ", actual_mounts);
                     entry.record_mount_restoration (actual_mounts);
-                    if (entry.restored && entry.mount_signature != "") {
+                    if (entry.restored && entry.mount_topology.length != 0) {
                         try {
-                            bool whole_filesystem;
-                            var signatures = read_mount_signatures (block, out whole_filesystem);
-                            if (!whole_filesystem || signatures.length != 1 || signatures[0] != entry.mount_signature ||
-                                FileUtils.read_link ("/proc/self/ns/mnt") != entry.mount_namespace)
+                            string namespace_id;
+                            var current = read_mount_topology (block, out namespace_id);
+                            if (current.length != 1 || !entry.mount_topology[0].same_mount (current[0]))
                                 throw new IOError.FAILED ("The restored mount differs in its kernel source, namespace or options.");
                         } catch (Error error) {
                             entry.restored = false;
@@ -5866,7 +5900,7 @@ namespace MajorisDisks {
         }
 
         private async StorageEncryptionConfiguration? secret_encryption_configuration (StorageBlock block,
-            string desired_name = "", string just_written_keyfile = "") throws Error {
+            string desired_name = "") throws Error {
             if (block.encrypted == null || block.uuid == "")
                 throw new IOError.NOT_SUPPORTED ("Persistent encryption configuration is unavailable.");
             var selected = desired_name == "" ? block.encryption_configuration :
@@ -5878,8 +5912,8 @@ namespace MajorisDisks {
                 if (sibling.passphrase_path == "" || sibling.passphrase_path.has_prefix ("/dev/")) continue;
                 if (!MountOptionService.manages_crypttab_keyfile (sibling.passphrase_path))
                     throw new IOError.NOT_SUPPORTED ("Another entry for this device has an external key source.");
-                validate_crypttab_key_path (sibling.passphrase_path, true,
-                    sibling == selected && sibling.passphrase_path == just_written_keyfile);
+                yield inspect_crypttab (sibling.name, sibling.name, sibling.device,
+                    sibling.options, sibling.passphrase_path, sibling.passphrase_path);
             }
             var options = new VariantBuilder (new VariantType ("a{sv}"));
             var reply = yield require_volume (block, "Block").call ("GetSecretConfiguration",
@@ -5907,84 +5941,50 @@ namespace MajorisDisks {
             synchronize ();
         }
 
-        private static void validate_crypttab_key_path (string path, bool existing, bool just_written = false) throws Error {
-            if (path == "") return;
-            Posix.Stat directory;
-            if (Posix.lstat ("/etc/luks-keys", out directory) != 0) {
-                if (!existing && Posix.errno == Posix.ENOENT) return;
-                throw new IOError.PERMISSION_DENIED ("The managed keyfile directory could not be verified.");
-            }
-            if (!Posix.S_ISDIR (directory.st_mode) || directory.st_uid != 0 ||
-                (directory.st_mode & 0022) != 0)
-                throw new IOError.PERMISSION_DENIED ("The managed keyfile directory is not a protected root-owned directory.");
-            Posix.Stat file;
-            if (Posix.lstat (path, out file) != 0) {
-                if (!existing && Posix.errno == Posix.ENOENT) return;
-                // The daemon may have just created its private directory and
-                // key. Readback is authorized by GetSecretConfiguration.
-                if (just_written && Posix.errno == Posix.EACCES && (directory.st_mode & 0077) == 0) return;
-                throw new IOError.PERMISSION_DENIED ("The existing keyfile could not be verified safely.");
-            }
-            if (!existing) throw new IOError.EXISTS ("The proposed keyfile path is already in use.");
-            if (!Posix.S_ISREG (file.st_mode) || file.st_uid != 0 || file.st_nlink != 1 ||
-                (file.st_mode & 0077) != 0)
-                throw new IOError.PERMISSION_DENIED ("The existing keyfile is not a private, root-owned regular file.");
-        }
+        [CCode (cname = "MAJORIS_CRYPTTAB_INSPECTOR", cheader_filename = "crypttab-inspector-config.h")]
+        private extern const string CRYPTTAB_INSPECTOR;
 
-        private static void check_global_crypttab (string name, string old_name, string device,
-            string old_options, string old_path, string new_path, bool replacing) throws Error {
-            Posix.Stat configuration;
-            if (Posix.lstat ("/etc/crypttab", out configuration) == 0 &&
-                (!Posix.S_ISREG (configuration.st_mode) || configuration.st_uid != 0 ||
-                (configuration.st_mode & 0022) != 0))
-                throw new IOError.PERMISSION_DENIED ("The system-wide crypttab is not a protected root-owned regular file.");
-            string contents;
-            try { FileUtils.get_contents ("/etc/crypttab", out contents); }
-            catch (FileError error) {
-                if (error is FileError.NOENT && !replacing) return;
-                throw new IOError.PERMISSION_DENIED ("The system-wide crypttab could not be checked for conflicting entries.");
+        private async string inspect_crypttab (string name, string old_name, string device,
+            string options, string old_path, string new_path, string? expected = null) throws Error {
+            string[] argv = { CRYPTTAB_INSPECTOR, name, old_name, device, options, old_path, new_path };
+            if (Posix.geteuid () != 0) {
+                if (!FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE))
+                    throw new IOError.NOT_SUPPORTED ("Install pkexec to authorize inspection of protected unlocking configuration.");
+                argv = { "/usr/bin/pkexec", "--disable-internal-agent", CRYPTTAB_INSPECTOR,
+                    name, old_name, device, options, old_path, new_path };
             }
-            Posix.Stat old_key = {};
-            bool compare_inode = old_path != "" && Posix.lstat (old_path, out old_key) == 0;
-            uint matches = 0;
-            foreach (var raw in contents.split ("\n")) {
-                string line = raw.strip ();
-                if (line == "" || line.has_prefix ("#")) continue;
-                string[] fields = Regex.split_simple ("[ \\t]+", line);
-                if (fields.length < 2) continue;
-                string key = fields.length > 2 && fields[2] != "none" && fields[2] != "-" ? fields[2] : "";
-                string options = fields.length > 3 ? fields[3] : "";
-                if (replacing && fields[0] == old_name && fields[1] == device &&
-                    key == old_path && options == old_options) {
-                    matches++;
-                    continue;
-                }
-                if (name != "" && fields[0] == name)
-                    throw new IOError.EXISTS ("Another crypttab entry already uses this mapping name.");
-                if (key != "" && (old_path != "" || new_path != "")) {
-                    string reference = Filename.canonicalize (key.split (":", 2)[0]);
-                    if (reference == old_path || reference == new_path)
-                        throw new IOError.BUSY ("Another crypttab entry references this keyfile.");
-                    Posix.Stat alias = {};
-                    if (compare_inode && Path.is_absolute (key) && !key.contains (":") &&
-                        Posix.stat (key, out alias) == 0 && old_key.st_ino == alias.st_ino && old_key.st_dev == alias.st_dev)
-                        throw new IOError.BUSY ("Another crypttab entry uses an alias of this keyfile.");
-                }
+            if (!FileUtils.test (CRYPTTAB_INSPECTOR, FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("The protected crypttab inspector is unavailable.");
+            var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_SILENCE);
+            string? output;
+            yield process.communicate_utf8_async (null, backend_lifetime, out output, null);
+            if (!process.get_if_exited ())
+                throw new IOError.FAILED ("Protected configuration inspection did not complete.");
+            switch (process.get_exit_status ()) {
+            case 0: break;
+            case 126: case 127:
+                throw new IOError.PERMISSION_DENIED ("Authorization to inspect protected configuration was denied or cancelled.");
+            case 11:
+                throw new IOError.INVALID_DATA ("The crypttab or managed keyfile could not be verified as safe.");
+            case 12:
+                throw new IOError.EXISTS ("A conflicting mapping name exists or the original record changed.");
+            case 13:
+                throw new IOError.BUSY ("Another crypttab entry references this keyfile.");
+            case 14:
+                throw new IOError.NOT_FOUND ("The selected crypttab record or keyfile changed.");
+            case 15:
+                throw new IOError.NOT_SUPPORTED ("This mapping uses an implicit systemd keyfile.");
+            case 16:
+                throw new IOError.NOT_SUPPORTED ("The selected keyfile is externally managed.");
+            default:
+                throw new IOError.FAILED ("Protected crypttab or keyfile metadata could not be inspected.");
             }
-            if (replacing && matches != 1)
-                throw new IOError.NOT_FOUND ("The selected crypttab record changed or is ambiguous.");
-        }
-
-        private static void reject_implicit_crypttab_key (string name) throws Error {
-            if (!MountOptionService.valid_crypttab_name (name))
-                throw new IOError.NOT_SUPPORTED ("The original mapping name cannot be verified safely.");
-            foreach (var directory in new string[] { "/etc/cryptsetup-keys.d", "/run/cryptsetup-keys.d" }) {
-                Posix.Stat key;
-                if (Posix.lstat (directory + "/" + name + ".key", out key) == 0)
-                    throw new IOError.NOT_SUPPORTED ("This mapping uses an implicitly discovered systemd keyfile.");
-                if (Posix.errno != Posix.ENOENT)
-                    throw new IOError.PERMISSION_DENIED ("Implicit systemd keyfile locations could not be checked.");
-            }
+            string identity = output?.strip () ?? "";
+            if (!Regex.match_simple ("^[0-9]+:[0-9]+:-?[0-9]+:[0-9]+$", identity))
+                throw new IOError.INVALID_DATA ("The protected configuration inspector returned an invalid result.");
+            if (expected != null && identity != expected)
+                throw new IOError.NOT_FOUND ("The managed keyfile changed after inspection.");
+            return identity;
         }
 
         private async string crypttab_credential_ticket (StorageBlock block, int fd, StorageJob job) throws Error {
@@ -6024,6 +6024,19 @@ namespace MajorisDisks {
             } finally {
                 Posix.close (first);
                 if (second >= 0) Posix.close (second);
+            }
+        }
+
+        private static void verify_crypttab_mapping_name (StorageBlock block, string name) throws Error {
+            Posix.Stat mapper;
+            string path = "/dev/mapper/" + name;
+            if (Posix.stat (path, out mapper) == 0) {
+                if (!Posix.S_ISBLK (mapper.st_mode) || block.encrypted?.mapping == null ||
+                    (uint64) mapper.st_rdev != block.encrypted.mapping.number)
+                    throw new IOError.EXISTS ("An unrelated active mapping already uses this name.");
+            } else if (Posix.errno != Posix.ENOENT || Posix.lstat (path, out mapper) == 0 ||
+                Posix.errno != Posix.ENOENT) {
+                throw new IOError.FAILED ("The proposed active mapping name could not be verified.");
             }
         }
 
@@ -6117,19 +6130,9 @@ namespace MajorisDisks {
                 }
                 if (key_references > 1)
                     throw new IOError.BUSY ("UDisks reports that multiple crypttab entries share this keyfile. Changing the entry could delete the shared keyfile.");
-                check_global_crypttab (enabled ? name : "", old_name, device, old_options, old_path,
-                    secret_path, original_item != null);
-                if (original_item != null && old_path == "") reject_implicit_crypttab_key (old_name);
-                if (enabled && secret_path == "") reject_implicit_crypttab_key (name);
-                if (enabled) {
-                    Posix.Stat mapper;
-                    string mapper_path = "/dev/mapper/" + name;
-                    if (Posix.stat (mapper_path, out mapper) == 0 &&
-                        (block.encrypted.mapping == null || (uint64) mapper.st_rdev != block.encrypted.mapping.number))
-                        throw new IOError.EXISTS ("An unrelated active mapping already uses this name.");
-                }
-                validate_crypttab_key_path (old_path, true);
-                if (secret_path != old_path) validate_crypttab_key_path (secret_path, false);
+                string key_identity = yield inspect_crypttab (enabled ? name : "", old_name, device,
+                    old_options, old_path, secret_path);
+                if (enabled) verify_crypttab_mapping_name (block, name);
                 bool supplied_credential = new_passphrase != "";
                 Variant secret = new Variant.bytestring (new_passphrase);
                 new_passphrase = "";
@@ -6150,8 +6153,7 @@ namespace MajorisDisks {
                         modification_identity (block) != confirmed_identity ||
                         find_encryption_configuration (block, old_name)?.backend_item?.equal (original_item) != true)
                         throw new IOError.NOT_FOUND ("The encrypted volume or entry changed during authorization.");
-                    check_global_crypttab (name, old_name, device, old_options, old_path, secret_path, true);
-                    validate_crypttab_key_path (old_path, true);
+                    yield inspect_crypttab (name, old_name, device, old_options, old_path, secret_path, key_identity);
                 }
                 bool rotate = old_credential != null && supplied_credential;
                 if (enabled && secret_path != "") {
@@ -6171,8 +6173,7 @@ namespace MajorisDisks {
                     if (rotate) {
                         require_luks_restore_idle (block, snapshot.dependencies);
                         yield KernelStorageSafety.require_idle (block, backend_lifetime);
-                        check_global_crypttab (name, old_name, device, old_options, old_path, secret_path, true);
-                        validate_crypttab_key_path (old_path, true);
+                        yield inspect_crypttab (name, old_name, device, old_options, old_path, secret_path, key_identity);
                         if (modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
                             throw new IOError.NOT_FOUND ("The encrypted device changed before adding the replacement credential.");
                         credential_dispatched = true;
@@ -6186,9 +6187,6 @@ namespace MajorisDisks {
                     if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
                         modification_identity (block) != confirmed_identity)
                         throw new IOError.NOT_FOUND ("The encrypted volume changed before the crypttab write.");
-                    check_global_crypttab (name, old_name, device, old_options, old_path, secret_path, original_item != null);
-                    validate_crypttab_key_path (old_path, true);
-                    if (secret_path != old_path) validate_crypttab_key_path (secret_path, false);
                 }
                 // Adapted from GNOME Disks gdu_encryption_options_dialog_get_new_crypttab.
                 // Copyright (C) 2008-2013 Red Hat, Inc.; Copyright (C) 2023 Purism SPC.
@@ -6202,6 +6200,12 @@ namespace MajorisDisks {
                 details.add ("{sv}", "passphrase-contents", secret);
                 var item = new Variant.tuple ({ new Variant.string ("crypttab"), details.end () });
                 jobs.phase (job, StorageJobState.RUNNING, "Authorizing and applying the crypttab change");
+                yield inspect_crypttab (enabled ? name : "", old_name, device, old_options,
+                    old_path, secret_path, key_identity);
+                if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
+                    modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The encrypted volume changed before the crypttab write.");
+                if (enabled) verify_crypttab_mapping_name (block, name);
                 dispatched = true;
                 if (!enabled && original_item != null)
                     yield proxy.call ("RemoveConfigurationItem", new Variant.tuple ({ original_item, call_options.end () }),
@@ -6234,8 +6238,10 @@ namespace MajorisDisks {
                     if (!verified) yield settle_delay (backend_lifetime);
                 }
                 if (!verified) throw new IOError.FAILED ("UDisks did not publish the requested crypttab configuration.");
+                if (enabled)
+                    yield inspect_crypttab (name, name, device, normalized, secret_path, secret_path);
                 if (secret_path != "") {
-                    var saved = yield secret_encryption_configuration (block, name, secret_path);
+                    var saved = yield secret_encryption_configuration (block, name);
                     var written = saved?.backend_item?.get_child_value (1)?.lookup_value ("passphrase-contents", VariantType.BYTESTRING);
                     if (saved == null || saved.device != device || saved.options != normalized ||
                         saved.passphrase_path != secret_path || written == null || !written.equal (secret))
@@ -6260,7 +6266,8 @@ namespace MajorisDisks {
                         string.joinv (" ", result.completed_steps) + " ";
                     if (credential_dispatched) outcome += "The previous keyslot was retained. Review keyslots and crypttab before retrying. ";
                     else outcome += "The configuration may have changed. Review the entry before retrying. ";
-                    throw new IOError.FAILED (outcome + error.message);
+                    result.technical_error = outcome + error.message;
+                    return result;
                 }
                 throw error;
             } finally {
