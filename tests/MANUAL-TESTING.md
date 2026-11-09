@@ -16,6 +16,18 @@ Use only disposable loop images, removable media with backups, or a virtual mach
 12. Exercise the whole-disk overwrite switch only on a disposable loop image; verify progress appears as a job and the warning does not claim secure erasure.
 13. Edit common GPT and MBR partition types through their readable names, then select Other and verify a custom identifier is preserved.
 
+## Btrfs allocation and degraded discovery
+
+Use a dedicated Debian 13 guest with the loop driver, `btrfs-progs` and `util-linux`. Build Majoris as a normal user, then run the opt-in tests inside the guest.
+
+    sudo env MAJORIS_DISKS_RUN_BTRFS_MOUNT_TESTS=1 meson test -C build --no-rebuild --print-errorlogs btrfs-discovery-integration disposable-btrfs-mount-integration
+
+- On a mounted two-member RAID 1 fixture, open **Btrfs Allocation**. Compare the member IDs and UUIDs with `btrfs filesystem show` and compare data, metadata and system profiles with `btrfs filesystem usage`. Compare logical capacity and the remaining-space estimate with `df`.
+- Mount the fixture read-only and degraded after detaching one image. Verify that the missing member retains its Btrfs device ID and has no physical device path. Check that the report marks the filesystem degraded and withholds complete physical totals.
+- The automated discovery test uses the native Majoris probe. Desktop rendering and UDisks discovery on a degraded mount require a separate interactive check.
+
+Both opt-in tests passed in a Debian 13 QEMU guest with kernel 6.12.115 and btrfs-progs 6.14. The standard Debian 13 Meson run reported 9 passes, 0 failures and 18 prerequisite or opt-in skips.
+
 ## Advanced LVM2
 
 Use a dedicated disposable Debian 13 VM with `udisks2`, `udisks2-lvm2`, `lvm2`, `e2fsprogs`, `util-linux` and a working kernel device mapper and loop driver. If UDisks has yet to load its installed LVM2 module, enable it inside that VM and verify the interface.

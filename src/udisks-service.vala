@@ -1507,7 +1507,7 @@ namespace MajorisDisks {
         [CCode (cname = "majoris_btrfs_allocation", cheader_filename = "btrfs-inspect.h")]
         private extern static Variant? read_btrfs_allocation (string path, string uuid);
 
-        internal async Variant query_btrfs_allocation (StorageBlock block) throws Error {
+        internal async BtrfsFilesystemInfo query_btrfs_allocation (StorageBlock block) throws Error {
             var proxy = require_volume (block, "Filesystem.BTRFS");
             string[] mounts = block.filesystem?.mounts ?? new string[0];
             string uuid = proxy.get_cached_property ("uuid")?.get_string () ?? "";
@@ -1534,7 +1534,7 @@ namespace MajorisDisks {
                 throw new IOError.NOT_FOUND ("The Btrfs filesystem or mount changed during inspection.");
             if (report == null)
                 throw new IOError.FAILED ("The kernel did not return verified Btrfs allocation data.");
-            return report;
+            return new BtrfsFilesystemInfo (uuid, block.label, report);
         }
 
         internal async string btrfs_maintenance (StorageBlock block, string identity, string action, uint usage) throws Error {

@@ -4,10 +4,12 @@
 #include <errno.h>
 #include <linux/btrfs.h>
 #include <linux/btrfs_tree.h>
+#include <stdlib.h>
 #include <sys/statvfs.h>
 #include <linux/openat2.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -175,6 +177,63 @@ allocation_profile (guint64 flags)
     }
 }
 
+static gboolean
+read_device_flag (const char *directory, const char *id, const char *name, gboolean *value)
+{
+    g_autofree char *path = g_build_filename (directory, id, name, NULL);
+    g_autofree char *contents = NULL;
+    if (!g_file_get_contents (path, &contents, NULL, NULL))
+        return FALSE;
+    g_strstrip (contents);
+    if (!g_str_equal (contents, "0") && !g_str_equal (contents, "1"))
+        return FALSE;
+    *value = contents[0] == '1';
+    return TRUE;
+}
+
+/* SPACE_INFO has no stripe counts, so parity overhead is unknown here. */
+static gboolean
+allocation_overhead (guint64 flags, guint64 bytes, guint64 *overhead)
+{
+    guint64 copies;
+    switch (flags & BTRFS_BLOCK_GROUP_PROFILE_MASK) {
+    case 0:
+    case BTRFS_BLOCK_GROUP_RAID0: copies = 1; break;
+    case BTRFS_BLOCK_GROUP_DUP:
+    case BTRFS_BLOCK_GROUP_RAID1:
+    case BTRFS_BLOCK_GROUP_RAID10: copies = 2; break;
+    case BTRFS_BLOCK_GROUP_RAID1C3: copies = 3; break;
+    case BTRFS_BLOCK_GROUP_RAID1C4: copies = 4; break;
+    default: return FALSE;
+    }
+    if (copies > 1 && bytes > G_MAXUINT64 / (copies - 1))
+        return FALSE;
+    *overhead = bytes * (copies - 1);
+    return TRUE;
+}
+
+static gboolean
+verified_device_number (const char *uuid, const struct btrfs_ioctl_dev_info_args *device, guint64 *number)
+{
+    struct stat block, expected, actual;
+    if (memchr (device->path, 0, sizeof device->path) == NULL ||
+        !g_str_has_prefix ((const char *) device->path, "/dev/") ||
+        stat ((const char *) device->path, &block) != 0 || !S_ISBLK (block.st_mode))
+        return FALSE;
+    g_autofree char *sysblock = g_strdup_printf ("/sys/dev/block/%u:%u",
+        major (block.st_rdev), minor (block.st_rdev));
+    g_autofree char *canonical = realpath (sysblock, NULL);
+    if (canonical == NULL)
+        return FALSE;
+    g_autofree char *name = g_path_get_basename (canonical);
+    g_autofree char *link = g_build_filename ("/sys/fs/btrfs", uuid, "devices", name, NULL);
+    if (stat (link, &actual) != 0 || stat (sysblock, &expected) != 0 ||
+        actual.st_dev != expected.st_dev || actual.st_ino != expected.st_ino)
+        return FALSE;
+    *number = block.st_rdev;
+    return TRUE;
+}
+
 GVariant *
 majoris_btrfs_allocation (const char *path, const char *filesystem)
 {
@@ -190,6 +249,7 @@ majoris_btrfs_allocation (const char *path, const char *filesystem)
     spaces->space_slots = slots;
     gboolean valid = ioctl (fd, BTRFS_IOC_FS_INFO, &fs) == 0 && fstatvfs (fd, &vfs) == 0 &&
         vfs.f_frsize > 0 && vfs.f_blocks <= G_MAXUINT64 / vfs.f_frsize &&
+        vfs.f_bavail <= vfs.f_bfree && vfs.f_bfree <= vfs.f_blocks &&
         ioctl (fd, BTRFS_IOC_SPACE_INFO, spaces) == 0 &&
         spaces->total_spaces > 0 && spaces->total_spaces < slots;
     g_autofree char *uuid = format_uuid (fs.fsid);
@@ -198,7 +258,9 @@ majoris_btrfs_allocation (const char *path, const char *filesystem)
         return NULL;
     }
 
-    GVariantBuilder allocations = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(stt)"));
+    GVariantBuilder allocations = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(sttt)"));
+    guint64 reserve = 0, overhead = 0;
+    gboolean overhead_known = TRUE;
     for (guint64 i = 0; i < spaces->total_spaces; i++) {
         struct btrfs_ioctl_space_info *row = &spaces->spaces[i];
         const guint64 types = row->flags & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
@@ -208,32 +270,60 @@ majoris_btrfs_allocation (const char *path, const char *filesystem)
         case BTRFS_BLOCK_GROUP_METADATA: kind = "Metadata"; break;
         case BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA: kind = "Data and metadata"; break;
         case BTRFS_BLOCK_GROUP_SYSTEM: kind = "System"; break;
-        default: continue;
+        default:
+            if (row->flags == BTRFS_SPACE_INFO_GLOBAL_RSV)
+                reserve = row->total_bytes;
+            continue;
         }
+        guint64 extra;
+        if (!allocation_overhead (row->flags, row->total_bytes, &extra) ||
+            extra > G_MAXUINT64 - overhead)
+            overhead_known = FALSE;
+        else
+            overhead += extra;
         g_autofree char *label = g_strdup_printf ("%s (%s)", kind, allocation_profile (row->flags));
-        g_variant_builder_add (&allocations, "(stt)", label, row->total_bytes, row->used_bytes);
+        g_variant_builder_add (&allocations, "(sttt)", label, row->total_bytes, row->used_bytes, row->flags);
     }
 
-    GVariantBuilder members = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(tttt)"));
+    GVariantBuilder members = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(ttttssbb)"));
     g_autofree char *devinfo = g_strdup_printf ("/sys/fs/btrfs/%s/devinfo", uuid);
     g_autoptr(GDir) devices = g_dir_open (devinfo, 0, NULL);
     const char *entry;
     while (devices != NULL && (entry = g_dir_read_name (devices)) != NULL) {
         guint64 id;
-        if (!g_ascii_string_to_unsigned (entry, 10, 1, G_MAXUINT64, &id, NULL))
+        if (!g_ascii_string_to_unsigned (entry, 10, 0, G_MAXUINT64, &id, NULL))
             continue;
         struct btrfs_ioctl_dev_info_args device = { .devid = id };
-        struct stat block;
-        if (ioctl (fd, BTRFS_IOC_DEV_INFO, &device) != 0 ||
-            memchr (device.path, 0, sizeof device.path) == NULL ||
-            stat ((const char *) device.path, &block) != 0 || !S_ISBLK (block.st_mode) ||
-            device.bytes_used > device.total_bytes)
-            continue;
-        g_variant_builder_add (&members, "(tttt)", id, (guint64) block.st_rdev,
-            (guint64) device.total_bytes, (guint64) device.bytes_used);
+        gboolean missing = FALSE, writable = FALSE, replacement = FALSE;
+        gboolean missing_known = read_device_flag (devinfo, entry, "missing", &missing);
+        gboolean writable_known = read_device_flag (devinfo, entry, "writeable", &writable);
+        read_device_flag (devinfo, entry, "replace_target", &replacement);
+        guint64 number = 0;
+        gboolean known = id != 0 && ioctl (fd, BTRFS_IOC_DEV_INFO, &device) == 0 &&
+            device.devid == id && device.total_bytes > 0 && device.bytes_used <= device.total_bytes;
+        gboolean present = missing_known && !missing && known && verified_device_number (uuid, &device, &number);
+        g_autofree char *member_uuid = known ? format_uuid (device.uuid) : g_strdup ("");
+        const char *state = replacement ? "Replacement target" : missing ? "Missing" :
+            !present ? "Unavailable" : !writable_known ? "Present, write state unknown" :
+            writable ? "Present" : "Read-only";
+        struct btrfs_ioctl_get_dev_stats stats = { .devid = id, .nr_items = BTRFS_DEV_STAT_VALUES_MAX };
+        gboolean has_errors = FALSE;
+        if (present && ioctl (fd, BTRFS_IOC_GET_DEV_STATS, &stats) == 0)
+            for (guint i = 0; i < MIN (stats.nr_items, BTRFS_DEV_STAT_VALUES_MAX); i++)
+                has_errors |= stats.values[i] != 0;
+        g_variant_builder_add (&members, "(ttttssbb)", id, number,
+            known ? (guint64) device.total_bytes : 0, known ? (guint64) device.bytes_used : 0,
+            member_uuid, state, known, has_errors);
     }
+    g_autofree char *operation_path = g_build_filename ("/sys/fs/btrfs", uuid, "exclusive_operation", NULL);
+    g_autofree char *operation = NULL;
+    if (!g_file_get_contents (operation_path, &operation, NULL, NULL))
+        operation = g_strdup ("unknown");
     close (fd);
-    return g_variant_ref_sink (g_variant_new ("(tt@a(stt)@a(tttt))",
+    return g_variant_ref_sink (g_variant_new ("(tt@a(sttt)@a(ttttssbb)tttbstb)",
         (guint64) vfs.f_blocks * vfs.f_frsize, (guint64) fs.num_devices,
-        g_variant_builder_end (&allocations), g_variant_builder_end (&members)));
+        g_variant_builder_end (&allocations), g_variant_builder_end (&members),
+        (guint64) (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize,
+        (guint64) vfs.f_bavail * vfs.f_frsize, reserve, (vfs.f_flag & ST_RDONLY) != 0,
+        g_strstrip (operation), overhead, overhead_known));
 }

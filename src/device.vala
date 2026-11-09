@@ -1,4 +1,60 @@
 namespace MajorisDisks {
+    internal class BtrfsMemberInfo : Object {
+        public uint64 id;
+        public uint64 number;
+        public uint64 capacity;
+        public uint64 allocated;
+        public string uuid;
+        public string state;
+        public bool allocation_known;
+        public bool has_errors;
+
+        public BtrfsMemberInfo (Variant row) {
+            row.get ("(ttttssbb)", out id, out number, out capacity, out allocated,
+                out uuid, out state, out allocation_known, out has_errors);
+        }
+    }
+
+    internal class BtrfsAllocationProfile : Object {
+        public string label;
+        public uint64 allocated;
+        public uint64 used;
+        public uint64 flags;
+
+        public BtrfsAllocationProfile (Variant row) {
+            row.get ("(sttt)", out label, out allocated, out used, out flags);
+        }
+    }
+
+    internal class BtrfsFilesystemInfo : Object {
+        public string uuid;
+        public string label;
+        public uint64 capacity;
+        public uint64 member_count;
+        public BtrfsAllocationProfile[] profiles = {};
+        public BtrfsMemberInfo[] members = {};
+        public uint64 used;
+        public uint64 estimated_available;
+        public uint64 global_reserve;
+        public bool read_only;
+        public string exclusive_operation;
+        public uint64 replication_overhead;
+        public bool overhead_known;
+
+        public BtrfsFilesystemInfo (string uuid, string label, Variant report) {
+            this.uuid = uuid;
+            this.label = label;
+            Variant profile_rows, member_rows;
+            report.get ("(tt@a(sttt)@a(ttttssbb)tttbstb)", out capacity, out member_count,
+                out profile_rows, out member_rows, out used, out estimated_available, out global_reserve,
+                out read_only, out exclusive_operation, out replication_overhead, out overhead_known);
+            for (size_t i = 0; i < profile_rows.n_children (); i++)
+                profiles += new BtrfsAllocationProfile (profile_rows.get_child_value (i));
+            for (size_t i = 0; i < member_rows.n_children (); i++)
+                members += new BtrfsMemberInfo (member_rows.get_child_value (i));
+        }
+    }
+
     internal class BtrfsSubvolume : Object {
         public uint64 id;
         public uint64 parent_id;

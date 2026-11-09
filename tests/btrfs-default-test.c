@@ -30,9 +30,10 @@ test_mount_identity (void)
 int
 main (int argc, char **argv)
 {
-    if (argc == 5 && g_str_equal (argv[1], "--allocation")) {
-        guint64 expected;
-        if (!g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &expected, NULL))
+    if ((argc == 5 || argc == 6) && g_str_equal (argv[1], "--allocation")) {
+        guint64 expected, missing_id = 0;
+        if (!g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &expected, NULL) ||
+            (argc == 6 && !g_ascii_string_to_unsigned (argv[5], 10, 1, G_MAXUINT64, &missing_id, NULL)))
             return 2;
         g_autoptr(GVariant) report = majoris_btrfs_allocation (argv[2], argv[3]);
         if (report == NULL)
@@ -40,11 +41,39 @@ main (int argc, char **argv)
         guint64 logical, count;
         g_autoptr(GVariant) allocations = NULL;
         g_autoptr(GVariant) members = NULL;
-        g_variant_get (report, "(tt@a(stt)@a(tttt))", &logical, &count, &allocations, &members);
+        g_variant_get_child (report, 0, "t", &logical);
+        g_variant_get_child (report, 1, "t", &count);
+        allocations = g_variant_get_child_value (report, 2);
+        members = g_variant_get_child_value (report, 3);
         g_print ("Btrfs allocation: %zu profiles, %zu members\n",
             g_variant_n_children (allocations), g_variant_n_children (members));
+        for (gsize i = 0; i < g_variant_n_children (allocations); i++) {
+            g_autoptr(GVariant) row = g_variant_get_child_value (allocations, i);
+            const char *label;
+            g_variant_get_child (row, 0, "&s", &label);
+            g_print ("%s\n", label);
+        }
+        gboolean found_missing = FALSE;
+        for (gsize i = 0; i < g_variant_n_children (members); i++) {
+            g_autoptr(GVariant) member = g_variant_get_child_value (members, i);
+            guint64 id, number;
+            const char *state;
+            gboolean known;
+            g_variant_get_child (member, 0, "t", &id);
+            g_variant_get_child (member, 1, "t", &number);
+            g_variant_get_child (member, 5, "&s", &state);
+            g_variant_get_child (member, 6, "b", &known);
+            if (id == missing_id && missing_id != 0) {
+                if (number != 0 || !g_str_equal (state, "Missing"))
+                    return 1;
+                found_missing = TRUE;
+                continue;
+            }
+            if (number == 0 || !known)
+                return 1;
+        }
         return logical > 0 && count == expected && g_variant_n_children (allocations) >= 2 &&
-            g_variant_n_children (members) == expected ? 0 : 1;
+            g_variant_n_children (members) == expected && found_missing == (missing_id != 0) ? 0 : 1;
     }
     if (argc == 6 && g_str_equal (argv[1], "--mount-use")) {
         guint64 id, expected;

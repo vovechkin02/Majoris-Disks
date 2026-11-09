@@ -35,6 +35,9 @@ test('btrfs-default-helper', btrfs_default_test)
 test('disposable-btrfs-mount-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-btrfs-mount-integration.sh', btrfs_default_test], depends: btrfs_default_helper,
   timeout: 120)
+test('btrfs-discovery-integration', sh,
+  args: [meson.current_source_dir() / 'tests/btrfs-discovery-integration.sh', btrfs_default_test],
+  timeout: 120, is_parallel: false)
 if mount_dep.found()
   test('mount-restoration-integration', sh,
     args: [meson.current_source_dir() / 'tests/mount-restoration-integration.sh', mount_restoration_helper],

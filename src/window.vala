@@ -455,36 +455,51 @@ namespace MajorisDisks {
             backend.query_btrfs_allocation.begin (block, (object, result) => {
                 try {
                     var report = backend.query_btrfs_allocation.end (result);
-                    var allocations = report.get_child_value (2);
-                    var members = report.get_child_value (3);
-                    uint64 total = 0, unallocated = 0;
-                    bool complete = members.n_children () == report.get_child_value (1).get_uint64 ();
+                    uint64 total = 0, unallocated = 0, missing = 0, present = 0;
+                    bool complete = report.members.length == report.member_count;
                     var detail = new StringBuilder ();
-                    detail.append_printf ("Filesystem UUID %s\nLogical capacity reported by the kernel: %s\n\n",
-                        block.uuid, format_size (report.get_child_value (0).get_uint64 ()));
-                    for (size_t i = 0; i < allocations.n_children (); i++) {
-                        var row = allocations.get_child_value (i);
+                    detail.append_printf ("Filesystem UUID %s\n%s · %s\nActive exclusive operation: %s\n",
+                        report.uuid, report.label, report.read_only ? "Read-only mount" : "Read-write mount",
+                        report.exclusive_operation);
+                    detail.append_printf ("Logical capacity %s · %s used\nEstimated remaining usable space %s\n",
+                        format_size (report.capacity), format_size (report.used), format_size (report.estimated_available));
+                    detail.append_printf ("Global reserve %s\n", format_size (report.global_reserve));
+                    if (report.overhead_known)
+                        detail.append_printf ("Replication overhead in allocated chunks %s\n",
+                            format_size (report.replication_overhead));
+                    else
+                        detail.append ("Total replication or parity overhead is unavailable.\n");
+                    detail.append ("\n");
+                    foreach (var profile in report.profiles)
                         detail.append_printf ("%s · %s used of %s allocated\n",
-                            row.get_child_value (0).get_string (), format_size (row.get_child_value (2).get_uint64 ()),
-                            format_size (row.get_child_value (1).get_uint64 ()));
-                    }
+                            profile.label, format_size (profile.used), format_size (profile.allocated));
                     detail.append ("\nPhysical members\n");
-                    for (size_t i = 0; i < members.n_children (); i++) {
-                        var row = members.get_child_value (i);
-                        uint64 number = row.get_child_value (1).get_uint64 ();
-                        uint64 size = row.get_child_value (2).get_uint64 ();
-                        uint64 allocated = row.get_child_value (3).get_uint64 ();
-                        string name = KernelStorageSafety.device_number (number);
-                        foreach (var member in backend.snapshot.blocks.get_values ())
-                            if (member.number == number) { name = member.preferred; break; }
-                        detail.append_printf ("%s · device ID %s · %s capacity · %s allocated\n", name,
-                            row.get_child_value (0).get_uint64 ().to_string (), format_size (size), format_size (allocated));
-                        if (size > uint64.MAX - total) complete = false;
-                        else { total += size; unallocated += size - allocated; }
+                    foreach (var row in report.members) {
+                        detail.append_printf ("Device ID %s · %s", row.id.to_string (), row.state);
+                        if (row.state == "Missing") missing++;
+                        if (row.number != 0) {
+                            present++;
+                            string name = KernelStorageSafety.device_number (row.number);
+                            foreach (var member in backend.snapshot.blocks.get_values ())
+                                if (member.number == row.number) { name = member.preferred; break; }
+                            detail.append_printf (" · %s", name);
+                        }
+                        if (row.allocation_known)
+                            detail.append_printf (" · %s · %s member capacity · %s allocated",
+                                row.uuid, format_size (row.capacity), format_size (row.allocated));
+                        else
+                            detail.append (" · Allocation unknown");
+                        if (row.has_errors) detail.append (" · Recorded device errors");
+                        detail.append ("\n");
+                        if (row.number == 0 || !row.allocation_known || row.capacity > uint64.MAX - total) complete = false;
+                        else { total += row.capacity; unallocated += row.capacity - row.allocated; }
                     }
+                    detail.append_printf ("\n%s expected · %s verified present · %s confirmed missing",
+                        report.member_count.to_string (), present.to_string (), missing.to_string ());
+                    if (missing > 0) detail.append (" · Degraded");
                     if (complete)
-                        detail.append_printf ("\nPhysical capacity %s · %s not allocated to chunks",
-                            format_size (total), format_size (unallocated));
+                        detail.append_printf ("\nPhysical member capacity %s · %s allocated · %s unallocated",
+                            format_size (total), format_size (total - unallocated), format_size (unallocated));
                     else
                         detail.append ("\nSome member information is unavailable. Physical totals could not be verified.");
                     show_check_message ("Btrfs Allocation", detail.str);

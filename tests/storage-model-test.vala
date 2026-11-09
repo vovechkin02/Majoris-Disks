@@ -1484,8 +1484,31 @@ private void test_lvm_cache_report () {
     } catch (Error error) { assert (error is IOError.INVALID_DATA); }
 }
 
+private static void test_btrfs_filesystem_info () {
+    try {
+        var data = Variant.parse (new VariantType ("(tta(sttt)a(ttttssbb)tttbstb)"),
+            "(1000, 2, [('Data (RAID 1)', 600, 100, 17), ('Data (single)', 200, 30, 1)], " +
+            "[(1, 42, 1000, 700, 'present-uuid', 'Present', true, true), " +
+            "(2, 0, 1000, 600, 'missing-uuid', 'Missing', true, false)], " +
+            "130, 500, 10, true, 'none', 600, true)");
+        var info = new BtrfsFilesystemInfo ("fs-uuid", "Example", data);
+        assert (info.uuid == "fs-uuid" && info.label == "Example");
+        assert (info.member_count == 2 && info.members.length == 2);
+        assert (info.members[0].number == 42 && info.members[0].has_errors);
+        assert (info.members[1].id == 2 && info.members[1].number == 0 && info.members[1].state == "Missing");
+        assert (info.members[1].allocation_known && info.members[1].uuid == "missing-uuid");
+        assert (info.profiles.length == 2 && info.profiles[0].flags == 17 && info.profiles[1].flags == 1);
+        assert (info.read_only && info.estimated_available == 500 && info.global_reserve == 10);
+        assert (info.overhead_known && info.replication_overhead == 600);
+    } catch (Error error) {
+        Test.message ("%s", error.message);
+        Test.fail ();
+    }
+}
+
 public static int main (string[] args) {
     Test.init (ref args);
+    Test.add_func ("/storage/btrfs-filesystem-info", test_btrfs_filesystem_info);
     if (Environment.get_variable ("MAJORIS_CAPACITY_LOOP") != null)
         Test.add_func ("/operations/capacity-udisks-fixture", test_capacity_udisks_fixture);
     if (Environment.get_variable ("MAJORIS_CAPACITY_FIXTURE") != null)
