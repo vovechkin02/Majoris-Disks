@@ -159,7 +159,7 @@ namespace MajorisDisks {
             backend.select_requested.connect ((path) => drive_view.select_identity (path));
             drive_view.check_requested.connect ((block, repair) => {
                 if (!repair) {
-                    run_maintenance (block, false);
+                    confirm_check.begin (block);
                     return;
                 }
                 string device = block.preferred;
@@ -172,6 +172,13 @@ namespace MajorisDisks {
                     body = "%s · %s · %s\n\nRepair modifies filesystem structures and may remove damaged files.".printf (
                         device, filesystem, format_size (size))
                 };
+                try {
+                    string[] mounts = backend.restoration_mount_targets (block);
+                    if (mounts.length > 0) dialog.body += "\n\n" + maintenance_mount_message (mounts);
+                } catch (Error error) {
+                    show_check_message ("Could Not Plan Filesystem Repair", operation_error (error));
+                    return;
+                }
                 dialog.response.connect ((response) => {
                     if (response != "repair") return;
                     if (backend.snapshot.blocks.lookup (block.path) != block || block.preferred != device ||
@@ -871,6 +878,7 @@ namespace MajorisDisks {
                 string details = "%s · %s\n%s · %s".printf (device, format_size (block.size),
                     review.version, review.uuid);
                 File? destination = null;
+                RestorationCredentialProvider? credentials = null;
                 if (restore) {
                     if (block.partition != null && block.partition.uuid != "")
                         details += "\nPartition UUID " + block.partition.uuid;
@@ -891,6 +899,15 @@ namespace MajorisDisks {
                     if (!review.checksummed)
                         dialog.body += "\n\nThis file has no saved checksum. Majoris verified its structure and layout, " +
                             "but could not independently check the keyslot bytes for corruption.";
+                    var mapping = block.encrypted?.mapping;
+                    if (mapping != null) {
+                        credentials = new WindowRestorationCredentials (this);
+                        dialog.body += "\n\nMajoris will temporarily close " + mapping.preferred +
+                            " for the header write, then attempt to reopen it. Have an unlocking credential for the backup available.";
+                        string[] mounts = backend.restoration_mount_targets (mapping);
+                        if (mounts.length > 0)
+                            dialog.body += "\n\nMount locations\n" + string.joinv ("\n", mounts);
+                    }
                     string response = yield dialog.choose (this, null);
                     if (response != "restore") return;
                 } else {
@@ -902,9 +919,9 @@ namespace MajorisDisks {
                     chooser.initial_name = review.uuid + ".luks-header";
                     destination = yield chooser.save (this, null);
                 }
-                var result = yield backend.execute_luks_header (block, review, destination);
+                var result = yield backend.execute_luks_header (block, review, destination, credentials);
                 show_check_message (result.successful ? "LUKS Header Operation Complete" : "LUKS Header Operation",
-                    result.summary + (result.technical_error == "" ? "" : "\n\n" + result.technical_error));
+                    operation_result_details (result));
             } catch (Error error) {
                 if (!(error is Gtk.DialogError.DISMISSED) && !(error is Gtk.DialogError.CANCELLED))
                     show_check_message ("LUKS Header Operation Not Started", operation_error (error));
@@ -1256,6 +1273,28 @@ namespace MajorisDisks {
             dialog.present (this);
         }
 
+        private static string maintenance_mount_message (string[] mounts) {
+            return "Majoris will temporarily unmount these locations and attempt to restore them after maintenance.\n\n" +
+                string.joinv ("\n", mounts);
+        }
+
+        private async void confirm_check (StorageBlock block) {
+            try {
+                string identity = backend.modification_identity (block);
+                string[] mounts = backend.restoration_mount_targets (block);
+                if (mounts.length > 0) {
+                    var dialog = new StorageRestorationPlanDialog () { body = maintenance_mount_message (mounts) };
+                    if ((yield dialog.choose (this, null)) != "continue") return;
+                    if (backend.modification_identity (block) != identity ||
+                        string.joinv ("\n", backend.restoration_mount_targets (block)) != string.joinv ("\n", mounts))
+                        throw new IOError.BUSY ("The device or its mount locations changed during confirmation.");
+                }
+                run_maintenance (block, false);
+            } catch (Error error) {
+                show_check_message ("Could Not Plan Filesystem Check", operation_error (error));
+            }
+        }
+
         private void run_maintenance (StorageBlock block, bool repair) {
             if (pending.contains (block.path)) return;
             pending.insert (block.path, block);
@@ -1272,7 +1311,9 @@ namespace MajorisDisks {
                             "Filesystem inconsistencies detected", device);
                     }
                 } catch (Error error) {
-                    show_check_message ((repair ? "Could not repair " : "Could not check ") + device,
+                    string title = (error is StorageRestorationError.INCOMPLETE) ? "Storage Restoration Needs Attention" :
+                        (repair ? "Could not repair " : "Could not check ") + device;
+                    show_check_message (title,
                         operation_error (error));
                 }
             });
@@ -2989,6 +3030,9 @@ namespace MajorisDisks {
     }
     [GtkTemplate (ui = "/com/majoris/disks/ui/operation-result-dialog.ui")]
     public class OperationResultDialog : Adw.AlertDialog {}
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/storage-restoration-plan-dialog.ui")]
+    internal class StorageRestorationPlanDialog : Adw.AlertDialog {}
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/repair-confirmation-dialog.ui")]
     public class RepairConfirmationDialog : Adw.AlertDialog {}

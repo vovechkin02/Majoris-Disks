@@ -1,6 +1,41 @@
 # Feature parity completion register
 
-## Protected crypttab inspection and mount topology follow-up
+
+## Verified storage restoration
+
+| Workflow | Implementation |
+| --- | --- |
+| Multiple mounts and bind mounts | The existing journal records ordered mount IDs, parents, source relationships, roots, targets, effective options, namespace, configuration, backend and observed outcome. UDisks handles a reproducible primary mount. The restricted helper handles eligible additional mounts and subdirectory exposures. Whole-filesystem mounts that share a superblock can be reproduced as nonrecursive clones because mountinfo does not retain how they were originally created. |
+| Preparation and recovery | The helper independently checks device generation, ext4 UUID, mount IDs, target directories and covered inodes. It unmounts children before parents and verifies exclusive block access before maintenance. After a partial failure, the journal reconciles the observed state and restores steps that were removed. |
+| Mount verification | Fresh kernel records verify filesystem identity, root, target, namespace, effective options, propagation and parent relationships. The journal accepts new mount IDs, detects additional mounts and reports verified and missing targets. Safely restored mounts remain available when another target fails. |
+| Temporary LUKS closure | A matching readable LUKS header restore can temporarily close an active mapping. The header worker rechecks the backup and live header before preparation. The journal saves the backing identity, UUID, original cleartext object, mapper name and DM UUID, geometry, read-only state and crypttab record. Reopening requires an acknowledged Lock call and observed disappearance. The explicit Lock action retains its existing behavior. |
+| Authorized reopening | The ordinary unlock action and recovery share the UDisks implementation and authorization. The parent job and storage lock cover preparation through verification. The worker checks the expected header fingerprint before reopening. A verified Majoris-managed crypttab keyfile is used through UDisks. Otherwise the GtkBuilder credential dialog accepts a passphrase or local keyfile and can be cancelled. Credentials stay out of the journal and command arguments. |
+| Rebinding and reporting | The returned cleartext object must match the backing relationship, filesystem UUID and type, mapper name and DM UUID, read-only state and geometry. The journal and helper can reidentify it when its object path or device number changes. The result dialog lists the reopened mapping, verified mount locations and incomplete outcomes. |
+
+The optional mount helper uses Debian 13 libmount to read mountinfo and Linux descriptor APIs for target resolution, detached mounts, attributes and attachment. Ordinary unmount uses a checked root-controlled path because Linux provides no descriptor-based ordinary unmount. The `com.majoris.disks.mount-restoration` Polkit action requires active administrator authorization. The client nominates a block number and primary mount ID. The helper derives and retains its own plan from kernel state and receives no client-selected source, target, filesystem type or options. It compares fstab without editing it. [Linux mount APIs](https://www.kernel.org/pub/linux/docs/man-pages/book/man-pages-6.12.pdf)
+
+The new backend supports private, non-idmapped ext4 mounts in the verified system mount namespace. Helper-managed targets must be under root-controlled directories in `/mnt`. For multi-mount preparation, a supported UDisks primary can use its existing location below `/mnt`, `/media`, `/run/media` or `/srv`. Shared propagation, stacked mounts, unrelated child mounts, foreign namespace use, unsupported flags, unverified paths, active holders and ambiguous plans are rejected. Other filesystem types keep the existing single-mount path. Concurrent changes by other privileged services can still occur after validation. The checks reduce that window and recovery verifies actual state before reporting success.
+
+Temporary LUKS closure supports plain, attached-header LUKS with one verified inner filesystem and the full reproducible mapping size. Unrecognized mapper names, external crypttab key handlers, nested storage stacks and detach-on-idle loops are excluded. An unverified header write leaves the mapping closed for manual recovery. A cancelled or rejected credential can leave the volume closed after a verified header restore. [UDisks encrypted-device interface](https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Encrypted.html)
+
+The attached GNOME Disks archive was reviewed for `gdu_utils_ensure_unused*`, fstab configuration, crypttab and passphrase authorization, and local job coordination. Majoris follows the dependency-first unmount/lock sequence and asynchronous error handling while reusing its configuration adapters and `StorageJobManager`. No additional GNOME C or UI source was copied.
+
+On Debian 13.5 WSL with libmount 2.41.5 and the 6.18 WSL2 kernel, Meson setup, compilation and staged installation passed. The default suite passed 7 tests, skipped 15 opt-in cases and reported zero failures. The storage model covered semantic matching with new mount IDs, changed parents, namespace and filesystem identity. The GTK suite instantiated the plan dialog and checked the reopen dialog's initial response state. The native disposable suite passed ordinary, bind and combined layouts, semantic option and data checks, partial recovery after a busy unmount, symlink and propagation rejection, changed UUID, unexpected mount occupancy and targets outside the helper scope.
+
+
+
+| Verification | Result |
+| --- | --- |
+| Native mount integration | Passed on disposable loop-backed ext4. The suite exercised ordinary mounts, subdirectory binds, a nested read-only bind, distinct per-mount flags, interrupted preparation, partial restoration, foreign namespace and stacked-mount rejection, propagation, UUID changes, target substitution, and unexpected target occupancy. |
+| LUKS mapping integration | Passed through Majoris and private UDisks on disposable LUKS2. The suite exercised passphrase, keyfile and managed unlock, a different cleartext object path, credential cancellation, incorrect passphrase, mapper-name conflict, changed LUKS UUID and partial mount restoration. It verified data after the mapping and dependent mounts returned. |
+| Existing storage regressions | The opt-in LUKS header, mapping resize, partition resize, and crypttab configuration suites passed. The crypttab suite also verified the original UDisks fstab single-mount workflow. |
+| Desktop and daemon fault coverage | Pending verification on a stock Debian desktop with an interactive Polkit agent. Live authorization denial, daemon restart or timeout during unlock, and physical-device removal also remain untested. |
+
+Added files include `src/mount-restoration-helper.c`, `src/mount-restoration-config.h.in`, `src/mount-restoration.vala`, `src/restoration-credential.vala`, `data/com.majoris.disks.MountRestoration.policy.in`, `data/ui/storage-restoration-plan-dialog.ui`, `tests/mount-restoration-integration.sh` and `tests/luks-mapping-restoration-integration.sh`.
+
+Modified files include `meson.build`, `src/meson.build`, `data/com.majoris.disks.gresource.xml`, `src/kernel-storage-safety.vala`, `src/storage-operation.vala`, `src/udisks-service.vala`, `src/luks-header-worker.c`, `src/luks-credential-dialog.vala`, `src/drive-view.vala`, `src/window.vala`, `tests/storage-model-test.vala`, `tests/ui-template-test.vala`, `tests/luks-header-service-test.vala` and this register.
+
+## Previous baseline for crypttab inspection and mount topology
 
 | Area | Status | Scope |
 | --- | --- | --- |

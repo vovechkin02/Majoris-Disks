@@ -170,6 +170,8 @@ namespace MajorisDisks {
 
     public enum StoragePreparationKind { MOUNT, SWAP, ENCRYPTED_MAPPING, LOGICAL_VOLUME, RAID }
 
+    internal errordomain StorageRestorationError { INCOMPLETE }
+
     public enum MountRestorationStatus { FULLY_RESTORED, PARTIALLY_RESTORED, NOT_RESTORED, UNSAFE_TO_RESTORE, UNKNOWN }
 
     public class StoragePreparationEntry : Object {
@@ -191,9 +193,47 @@ namespace MajorisDisks {
         public string[] observed_mount_points = {};
         internal string mount_namespace = "";
         internal KernelMountRecord[] mount_topology = {};
+        internal KernelMountRecord[] observed_mount_topology = {};
+        internal MountRestorationSession? mount_session;
+        internal uint primary_mount_id;
+        internal bool restoration_dispatched;
+
+        internal void verify_mount_topology (KernelMountRecord[] current, string namespace_id) {
+            observed_mount_topology = current;
+            string[] verified = {};
+            foreach (var record in mount_topology) record.restoration_verified = false;
+            foreach (var expected in mount_topology) {
+                uint parent_id = expected.parent_id;
+                foreach (var parent in mount_topology) {
+                    if (parent.id != parent_id) continue;
+                    parent_id = parent.restoration_verified ?
+                        (KernelMountRecord.at_target (current, parent.target)?.id ?? 0) : 0;
+                    break;
+                }
+                var actual = KernelMountRecord.at_target (current, expected.target);
+                expected.restoration_verified = namespace_id == mount_namespace &&
+                    actual != null && parent_id != 0 && expected.same_mount (actual, parent_id);
+                if (expected.restoration_verified) verified += expected.target;
+            }
+            record_mount_restoration (verified);
+            if (restored && current.length != verified.length) {
+                restored = false;
+                mount_restoration = MountRestorationStatus.PARTIALLY_RESTORED;
+                actual_state += ". Unexpected additional mounts found";
+            }
+        }
         internal string encrypted_backing_path = "";
         internal string encrypted_backing_identity = "";
         internal string encrypted_backing_uuid = "";
+        internal string rebound_path = "";
+        internal string mapper_name = "";
+        internal string mapper_uuid = "";
+        internal uint64 mapping_size;
+        internal uint64 backing_size;
+        internal bool mapping_read_only;
+        internal Variant? crypttab;
+        internal string managed_key_identity = "";
+        internal string resolved_path { get { return rebound_path == "" ? object_path : rebound_path; } }
         public MountRestorationStatus mount_restoration = MountRestorationStatus.UNKNOWN;
         public string error { get; set; default = ""; }
         public StoragePreparationEntry (StoragePreparationKind kind, string object_path, string[] state,
@@ -235,7 +275,7 @@ namespace MajorisDisks {
         public string state_at (uint index) { return state_values[index]; }
 
         internal bool matches_prepared_device (StorageBlock block) {
-            return block.available && block.path == object_path && state_length () >= 2 &&
+            return block.available && block.path == resolved_path && state_length () >= 2 &&
                 block.uuid == state_at (0) && block.type_id == state_at (1) &&
                 device_identity == StoragePreparationJournal.device_identity (block);
         }

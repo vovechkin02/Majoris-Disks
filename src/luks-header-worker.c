@@ -793,5 +793,6 @@ int main(int argc, char **argv)
     g_autofree char *written = checksum(DEVICE, saved.extent);
     if (g_strcmp0(written, staged))
         return fail(3, "The header write was attempted, but the device readback differs from the verified backup.");
+    printf("%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT ":%s\n", sequence, capacity, written);
     return 0;
 }

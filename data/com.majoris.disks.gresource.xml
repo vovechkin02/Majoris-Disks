@@ -45,6 +45,7 @@
     <file>ui/luks-header-restore-dialog.ui</file>
     <file>ui/luks-keyslots-dialog.ui</file>
     <file>ui/luks-credential-dialog.ui</file>
+    <file>ui/storage-restoration-plan-dialog.ui</file>
     <file>ui/smart-dialog.ui</file>
     <file>ui/hardware-action-confirmation-dialog.ui</file>
     <file>ui/drive-settings-dialog.ui</file>

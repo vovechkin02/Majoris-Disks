@@ -87,8 +87,14 @@ namespace MajorisDisks {
         internal LuksCredentialDialog (string action, int slot, int[] candidates, bool configured, Gtk.Window parent) {
             this.candidates = candidates;
             remove = action == "remove";
-            identify = action == "identify";
+            identify = action == "identify" || action == "reopen";
             switch (action) {
+                case "reopen":
+                    heading = "Reopen Encrypted Volume";
+                    body = "Enter a passphrase or choose a keyfile to reopen the volume and restore its mounts.";
+                    current.title = "Passphrase";
+                    set_response_label ("apply", "Unlock");
+                    break;
                 case "identify":
                     heading = "Verify Unlocking Credential";
                     body = "Enter a passphrase or choose a keyfile to find an active keyslot it unlocks.";
@@ -180,6 +186,12 @@ namespace MajorisDisks {
                     (other.text == confirmation.text && (current_file != "" || current.text != other.text))))));
         }
 
+        internal RestorationCredential take_restoration_credential () {
+            var credential = new RestorationCredential (current.text, current_file);
+            clear_credentials ();
+            return credential;
+        }
+
         internal int take_credential (bool first) throws Error {
             var entry = first ? current : other;
             try {
@@ -194,6 +206,24 @@ namespace MajorisDisks {
             current.text = "";
             other.text = "";
             confirmation.text = "";
+        }
+    }
+    internal class WindowRestorationCredentials : RestorationCredentialProvider {
+        private weak Gtk.Window parent;
+
+        internal WindowRestorationCredentials (Gtk.Window parent) { this.parent = parent; }
+
+        internal override async RestorationCredential request (string volume) throws Error {
+            if (parent == null) throw new IOError.CANCELLED ("The window was closed before unlocking.");
+            var dialog = new LuksCredentialDialog ("reopen", -1, {}, false, parent);
+            dialog.body = volume + "\n\n" + dialog.body;
+            try {
+                if ((yield dialog.choose (parent, null)) != "apply")
+                    throw new IOError.CANCELLED ("Unlock cancelled. The encrypted volume remains closed.");
+                return dialog.take_restoration_credential ();
+            } finally {
+                dialog.clear_credentials ();
+            }
         }
     }
 }

@@ -518,6 +518,23 @@ private void test_kernel_mount_topology () {
         assert (!original[0].same_mount (changed[0]));
         changed = KernelStorageSafety.parse_mountinfo ("47" + record, "mnt:[10]");
         assert (!original[0].same_mount (changed[0]));
+        var saved = new StoragePreparationEntry (StoragePreparationKind.MOUNT, "/device",
+            { "uuid", "ext4", "/mnt/data drive", "/mnt/bind" });
+        saved.mount_topology = original;
+        saved.mount_namespace = "mnt:[9]";
+        var rebuilt = KernelStorageSafety.parse_mountinfo ("47" + record.replace ("rw,nosuid", "nosuid,rw") +
+            "\n60 47 253:1 /subdir /mnt/bind rw - ext4 /dev/dm-1 rw", "mnt:[9]");
+        saved.verify_mount_topology (rebuilt, "mnt:[9]");
+        assert (saved.mount_restoration == MountRestorationStatus.FULLY_RESTORED);
+        rebuilt[1].parent_id = 35;
+        saved.verify_mount_topology (rebuilt, "mnt:[9]");
+        assert (saved.mount_restoration == MountRestorationStatus.PARTIALLY_RESTORED);
+        rebuilt[1].parent_id = 47;
+        rebuilt[1].device = "253:2";
+        saved.verify_mount_topology (rebuilt, "mnt:[9]");
+        assert (saved.observed_mount_points.length == 1);
+        saved.verify_mount_topology (rebuilt, "mnt:[10]");
+        assert (saved.mount_restoration == MountRestorationStatus.NOT_RESTORED);
     } catch (Error error) {
         Test.fail_printf ("%s", error.message);
     }

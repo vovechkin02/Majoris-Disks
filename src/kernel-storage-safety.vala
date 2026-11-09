@@ -1,4 +1,6 @@
 namespace MajorisDisks {
+    internal enum KernelMountRole { PRIMARY, WHOLE_FILESYSTEM_EXPOSURE, SUBDIRECTORY_EXPOSURE }
+
     internal class KernelMountRecord : Object {
         public uint id;
         public uint parent_id;
@@ -13,14 +15,35 @@ namespace MajorisDisks {
         public string namespace_id;
         public string block_path = "";
         public Variant? fstab;
+        internal KernelMountRole role;
+        internal uint source_mount_id;
+        internal bool uses_udisks;
+        internal bool preparation_removed;
+        internal bool restoration_verified;
 
-        public bool same_mount (KernelMountRecord current) {
-            return parent_id == current.parent_id && device == current.device &&
-                root == current.root && target == current.target && filesystem == current.filesystem &&
-                source == current.source && mount_options == current.mount_options &&
-                super_options == current.super_options && namespace_id == current.namespace_id &&
+        public bool same_mount (KernelMountRecord current, uint expected_parent = 0) {
+            return (expected_parent == 0 ? parent_id : expected_parent) == current.parent_id &&
+                device == current.device && root == current.root && target == current.target &&
+                filesystem == current.filesystem && same_options (mount_options, current.mount_options) &&
+                same_options (super_options, current.super_options) && namespace_id == current.namespace_id &&
                 string.joinv (" ", propagation) == string.joinv (" ", current.propagation);
         }
+
+        private static bool same_options (string expected, string actual) {
+            var wanted = expected.split (",");
+            var found = actual.split (",");
+            if (wanted.length != found.length) return false;
+            foreach (var option in wanted)
+                if (!(option in found)) return false;
+            return true;
+        }
+
+        internal static KernelMountRecord? at_target (KernelMountRecord[] topology, string target) {
+            foreach (var record in topology)
+                if (record.target == target) return record;
+            return null;
+        }
+
     }
 
     public class KernelStorageSafety {
@@ -122,7 +145,7 @@ namespace MajorisDisks {
                 int separator = 6;
                 while (separator < fields.length && fields[separator] != "-") separator++;
                 var record = new KernelMountRecord ();
-                if (separator + 4 != fields.length ||
+                if (separator + 4 != fields.length || fields.length < 10 ||
                     !uint.try_parse (fields[0], out record.id) || record.id == 0 ||
                     !uint.try_parse (fields[1], out record.parent_id) || record.parent_id == 0 ||
                     seen.contains (record.id) || !Regex.match_simple ("^[0-9]+:[0-9]+$", fields[2]) ||

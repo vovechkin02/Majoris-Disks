@@ -521,13 +521,12 @@ namespace MajorisDisks {
             bool header_available = UDisksService.luks_header_available ();
             luks_backup.sensitive = header_available;
             luks_keyslots.visible = luks_backup.visible && header_available;
-            luks_restore.sensitive = header_available && !block.read_only && !block.system_hint &&
-                block.encrypted?.mapping == null;
+            luks_restore.sensitive = header_available && !block.read_only && !block.system_hint;
             luks_recovery.sensitive = header_available;
             luks_backup.tooltip_text = header_available ? null : "The libcryptsetup header worker is unavailable.";
             luks_recovery.tooltip_text = luks_backup.tooltip_text;
             luks_restore.tooltip_text = !header_available ? luks_backup.tooltip_text :
-                !luks_restore.sensitive ? "Restore requires a locked, writable volume outside the running system." : null;
+                !luks_restore.sensitive ? "Restore requires a writable volume outside the running system." : null;
             encryption_menu.label = luks_recovery.visible ? "Advanced Recovery" : "Encryption";
             encryption_menu.visible = unlock_volume.visible || lock_volume.visible || change_passphrase.visible ||
                 luks_backup.visible || luks_recovery.visible;

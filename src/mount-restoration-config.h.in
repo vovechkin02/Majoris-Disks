@@ -1,0 +1,3 @@
+#ifndef MAJORIS_MOUNT_RESTORATION_HELPER
+#define MAJORIS_MOUNT_RESTORATION_HELPER "@LIBEXECDIR@/majoris-disks-mount-restoration"
+#endif

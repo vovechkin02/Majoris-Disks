@@ -34,6 +34,11 @@ test('btrfs-default-helper', btrfs_default_test)
 test('disposable-btrfs-mount-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-btrfs-mount-integration.sh', btrfs_default_test], depends: btrfs_default_helper,
   timeout: 120)
+if mount_dep.found()
+  test('mount-restoration-integration', sh,
+    args: [meson.current_source_dir() / 'tests/mount-restoration-integration.sh', mount_restoration_helper],
+    timeout: 180)
+endif
 test('storage-model', layout_test)
 test('filesystem-capacity-integration', sh,
   args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test])
@@ -58,11 +63,15 @@ test('disposable-partition-xz-integration', imaging_test, args: ['--partition', 
 test('disposable-nbd-integration', imaging_test, args: ['--nbd'], timeout: 300)
 test('virtual-image-growth', imaging_test, args: ['--grow'], timeout: 120)
 if cryptsetup_dep.found()
+  restoration_test_args = []
+  if mount_dep.found()
+    restoration_test_args = ['-DMAJORIS_MOUNT_RESTORATION_HELPER="' + mount_restoration_helper.full_path() + '"']
+  endif
   luks_service_test = executable('luks-header-service-test', 'tests/luks-header-service-test.vala',
     storage_model_sources, 'src/udisks-service.vala',
     include_directories: xz_include,
     c_args: ['-DLUKS_HEADER_WORKER="' + luks_header_worker.full_path() + '"',
-      '-DMAJORIS_CRYPTTAB_INSPECTOR="' + crypttab_inspector.full_path() + '"'],
+      '-DMAJORIS_CRYPTTAB_INSPECTOR="' + crypttab_inspector.full_path() + '"'] + restoration_test_args,
     dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
   luks_worker_faults = shared_module('luks-worker-faults', 'tests/luks-worker-faults.c',
     dependencies: meson.get_compiler('c').find_library('dl'))
@@ -76,6 +85,11 @@ if cryptsetup_dep.found()
   test('luks-partition-resize-integration', sh,
     args: [meson.current_source_dir() / 'tests/luks-resize-integration.sh', luks_service_test, 'partition'],
     timeout: 300)
+  if mount_dep.found()
+    test('luks-mapping-restoration-integration', sh,
+      args: [meson.current_source_dir() / 'tests/luks-mapping-restoration-integration.sh', luks_service_test],
+      depends: [crypttab_inspector, luks_header_worker, mount_restoration_helper], timeout: 300)
+  endif
   test('luks-configuration-integration', sh,
     args: [meson.current_source_dir() / 'tests/luks-configuration-integration.sh', luks_service_test, crypttab_inspector],
     depends: crypttab_inspector,

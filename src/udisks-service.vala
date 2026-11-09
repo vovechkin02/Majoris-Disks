@@ -712,11 +712,11 @@ namespace MajorisDisks {
         }
 
         private async Variant call_tracked_method (StorageJob job, DBusProxy proxy, string method,
-            Variant parameters, Cancellable token) throws Error {
+            Variant parameters, Cancellable token, int timeout = int.MAX) throws Error {
             bool received_reply = false;
             try {
                 var reply = yield proxy.call (method, parameters, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
-                    int.MAX, token);
+                    timeout, token);
                 received_reply = true;
                 return reply;
             } finally {
@@ -951,7 +951,7 @@ namespace MajorisDisks {
                 state.phase = ImageWritePhase.PREPARING;
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.PREPARING, "Preparing the target device");
-                preparation = yield prepare_for_modification (block, lifetime);
+                preparation = yield prepare_for_modification (block, lifetime, job);
                 synchronize ();
                 if (modification_identity (block) != confirmed_identity)
                     throw new IOError.NOT_FOUND ("The target device changed during preparation.");
@@ -3513,7 +3513,7 @@ namespace MajorisDisks {
             try {
                 if ((eject || power_off) && target != null) {
                     jobs.phase (job, StorageJobState.PREPARING, "Preparing active storage");
-                    preparation = yield prepare_for_modification (target, backend_lifetime);
+                    preparation = yield prepare_for_modification (target, backend_lifetime, job);
                 }
                 if (snapshot.drives.lookup (drive.path) != drive || drive.serial != serial || drive.wwn != wwn)
                     throw new IOError.NOT_FOUND ("The drive identity changed before the hardware action.");
@@ -3763,7 +3763,7 @@ namespace MajorisDisks {
             try {
                 if (destructive) {
                     jobs.phase (job, StorageJobState.PREPARING, "Preparing affected storage");
-                    preparation = yield prepare_for_modification (block, lifetime);
+                    preparation = yield prepare_for_modification (block, lifetime, job);
                     validate_modification (block, partition_operation, volume, ownership, false);
                 }
                 if (volume && !rename && !ownership && format != "empty") {
@@ -4022,7 +4022,7 @@ namespace MajorisDisks {
             var proxy = require_volume (block, "Filesystem");
             var options = new VariantBuilder (new VariantType ("a{sv}"));
             yield proxy.call ("Unmount", new Variant.tuple ({ options.end () }),
-                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 90000, token);
             for (int attempt = 0; attempt < 50; attempt++) {
                 synchronize ();
                 if (block.filesystem != null && !block.filesystem.mounted) return true;
@@ -4031,23 +4031,22 @@ namespace MajorisDisks {
             throw new IOError.TIMED_OUT ("The filesystem did not become unmounted.");
         }
 
-        private async StoragePreparationJournal prepare_for_modification (StorageBlock target, Cancellable token) throws Error {
+        private async StoragePreparationJournal prepare_for_modification (StorageBlock target, Cancellable token,
+            StorageJob job) throws Error {
             var journal = new StoragePreparationJournal ();
             journal.capture (target);
             var nodes = snapshot.dependencies.descendants (target);
             try {
+                jobs.phase (job, StorageJobState.PREPARING, "Capturing mount topology and validating restoration");
                 for (int index = nodes.length - 1; index >= 0; index--) {
                     var block = nodes[index] as StorageBlock;
                     if (block == null) continue;
                     var safety = StorageSafetyService.assess (block, snapshot.dependencies);
                     if (safety.system_critical || safety.unknown_dependencies)
                         throw new IOError.BUSY ("Protected or unresolved storage cannot be prepared automatically.");
-                    if (block.filesystem?.mounted == true) {
-                        string[] state = { block.uuid, block.type_id };
-                        foreach (var mount in block.filesystem.mounts) state += mount;
-                        var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, block.path, state, "unmount");
-                        capture_mount_state (block, entry);
-                        journal.add (entry);
+                    if (block.filesystem != null && (block.number != 0 || block.filesystem.mounted)) {
+                        var entry = yield plan_mount_preparation (block, token);
+                        if (entry != null) journal.add (entry);
                     }
                     if (block.swap_active) {
                         var entry = new StoragePreparationEntry (StoragePreparationKind.SWAP, block.path,
@@ -4056,6 +4055,7 @@ namespace MajorisDisks {
                         journal.add (entry);
                     }
                 }
+                jobs.phase (job, StorageJobState.PREPARING, "Preparing verified storage dependencies");
                 foreach (var entry in journal.entries ()) {
                     synchronize ();
                     token.set_error_if_cancelled ();
@@ -4063,27 +4063,7 @@ namespace MajorisDisks {
                     if (block == null || !entry.matches_prepared_device (block))
                         throw new IOError.NOT_FOUND ("A storage dependency changed after preparation was planned.");
                     if (entry.kind == StoragePreparationKind.MOUNT) {
-                        string namespace_id;
-                        var current = read_mount_topology (block, out namespace_id);
-                        if (!entry.mount_configuration_matches (block.mount_configurations) ||
-                            current.length != 1 || current[0].id != entry.mount_topology[0].id ||
-                            !entry.mount_topology[0].same_mount (current[0]))
-                            throw new IOError.BUSY ("The mount topology changed after preparation was planned.");
-                        entry.action_dispatched = true;
-                        try {
-                            entry.prepared = yield prepare_unmounted (block, token);
-                            entry.backend_confirmed = true; entry.expected_state_observed = entry.prepared;
-                            entry.actual_state = entry.prepared ? "unmounted" : "unchanged";
-                        }
-                        catch (Error error) {
-                            synchronize ();
-                            string[]? mounts = block.filesystem?.mounts;
-                            entry.prepared = !entry.matches_prepared_device (block) ||
-                                mounts == null || !entry.mount_set_matches (mounts);
-                            entry.expected_state_observed = entry.matches_prepared_device (block) &&
-                                mounts != null && mounts.length == 0;
-                            throw error;
-                        }
+                        yield prepare_mount_entry (block, entry, token);
                     }
                     if (entry.kind == StoragePreparationKind.SWAP) {
                         if (!block.swap_active)
@@ -4141,26 +4121,58 @@ namespace MajorisDisks {
             foreach (var mount in selected) {
                 foreach (var other in all_mounts) {
                     if (other.id == mount.id) continue;
-                    if (other.target == mount.target || other.parent_id == mount.id)
-                        throw new IOError.NOT_SUPPORTED ("Stacked or nested mounts at %s require manual preparation.".printf (mount.target));
+                    if (other.target == mount.target ||
+                        (other.parent_id == mount.id && other.device != device))
+                        throw new IOError.NOT_SUPPORTED ("Stacked mounts or unrelated child mounts at %s require manual preparation.".printf (mount.target));
                 }
             }
             return selected;
         }
 
-        private void capture_mount_state (StorageBlock block, StoragePreparationEntry entry) throws Error {
+        internal string[] restoration_mount_targets (StorageBlock block) throws Error {
+            string namespace_id;
+            string[] targets = {};
+            foreach (var mount in read_mount_topology (block, out namespace_id)) targets += mount.target;
+            return targets;
+        }
+
+        private async StoragePreparationEntry? plan_mount_preparation (StorageBlock block,
+            Cancellable token) throws Error {
+            string namespace_id;
+            var topology = read_mount_topology (block, out namespace_id);
+            if (topology.length == 0 && block.filesystem?.mounted != true) return null;
+            if (topology.length == 0)
+                throw new IOError.NOT_SUPPORTED ("The reported mounts are unavailable in this mount namespace.");
+            string[] state = { block.uuid, block.type_id };
+            foreach (var record in topology) state += record.target;
+            var entry = new StoragePreparationEntry (StoragePreparationKind.MOUNT, block.path, state, "unmount");
             entry.device_identity = StoragePreparationJournal.device_identity (block);
             entry.capture_mount_configuration (block.mount_configurations);
-            entry.mount_topology = read_mount_topology (block, out entry.mount_namespace);
-            if (entry.mount_point_count () != 1 || entry.mount_topology.length != 1 ||
-                entry.mount_topology[0].root != "/" || entry.mount_topology[0].target != entry.mount_point_at (0))
-                throw new IOError.NOT_SUPPORTED ("Unmount this filesystem manually before continuing. Its mount layout cannot be restored safely.");
-            if (!entry.persistent_mount) {
-                string parent = Path.get_dirname (entry.mount_point_at (0));
-                string user = Environment.get_user_name ();
-                if (parent != "/media/" + user && parent != "/run/media/" + user)
-                    throw new IOError.NOT_SUPPORTED ("Unmount this filesystem manually. Its original mount location is managed outside UDisks.");
+            entry.mount_topology = topology;
+            entry.mount_namespace = namespace_id;
+            foreach (var target in block.filesystem?.mounts ?? new string[0])
+                if (KernelMountRecord.at_target (topology, target) == null)
+                    throw new IOError.NOT_SUPPORTED ("UDisks reports mounts outside the verified mount namespace.");
+
+            uint candidate = 0;
+            uint candidates = 0;
+            string user = Environment.get_user_name ();
+            foreach (var record in topology) {
+                if (record.root != "/") continue;
+                string parent = Path.get_dirname (record.target);
+                if (record.fstab != null || parent == "/media/" + user || parent == "/run/media/" + user) {
+                    candidate = record.id;
+                    candidates++;
+                }
             }
+            if (candidates == 1) {
+                foreach (var record in topology)
+                    if (record.id == candidate && block.filesystem != null &&
+                        record.target in block.filesystem.mounts)
+                        entry.primary_mount_id = candidate;
+            }
+            if (topology.length == 1 && entry.primary_mount_id == 0)
+                throw new IOError.NOT_SUPPORTED ("Unmount this filesystem manually. Its original mount location is managed outside UDisks.");
             if (block.backing_path != "/") {
                 var backing = snapshot.blocks.lookup (block.backing_path);
                 if (backing == null || backing.encrypted?.mapping != block || backing.uuid == "")
@@ -4169,12 +4181,99 @@ namespace MajorisDisks {
                 entry.encrypted_backing_identity = StoragePreparationJournal.device_identity (backing);
                 entry.encrypted_backing_uuid = backing.uuid;
             }
+            uint anchor = entry.primary_mount_id;
+            if (topology.length > 1) {
+                entry.mount_session = new MountRestorationSession (
+                    KernelStorageSafety.device_number (block.number), entry.primary_mount_id);
+                var reply = yield entry.mount_session.exchange (null, token, 120);
+                var fields = reply.split (" ");
+                if (fields.length != topology.length + 1 || fields[0] != "ready")
+                    throw new IOError.BUSY ("The authorized mount plan differs from the captured topology.");
+                KernelMountRecord[] ordered = {};
+                for (int i = 1; i < fields.length; i++) {
+                    uint id;
+                    if (!uint.try_parse (fields[i], out id))
+                        throw new IOError.INVALID_DATA ("The authorized mount plan returned an invalid mount ID.");
+                    foreach (var mount in topology)
+                        if (mount.id == id && !(mount in ordered)) ordered += mount;
+                }
+                if (ordered.length != topology.length)
+                    throw new IOError.BUSY ("A mount changed while authorizing the plan.");
+                entry.mount_topology = ordered;
+                anchor = ordered[0].id;
+            }
+            foreach (var mount in entry.mount_topology) {
+                mount.role = mount.id == anchor ? KernelMountRole.PRIMARY : mount.root == "/" ?
+                    KernelMountRole.WHOLE_FILESYSTEM_EXPOSURE : KernelMountRole.SUBDIRECTORY_EXPOSURE;
+                mount.source_mount_id = mount.id == anchor ? 0 : anchor;
+                mount.uses_udisks = mount.id == entry.primary_mount_id;
+            }
+            return entry;
+        }
+
+        private async bool prepare_mount_entry (StorageBlock block, StoragePreparationEntry entry,
+            Cancellable token) throws Error {
+            string namespace_id;
+            var current = read_mount_topology (block, out namespace_id);
+            if (!entry.matches_prepared_device (block) ||
+                !entry.mount_configuration_matches (block.mount_configurations) ||
+                current.length != entry.mount_topology.length)
+                throw new IOError.BUSY ("The filesystem or mount topology changed after preparation was planned.");
+            foreach (var expected in entry.mount_topology) {
+                var actual = KernelMountRecord.at_target (current, expected.target);
+                if (actual == null || actual.id != expected.id || !expected.same_mount (actual))
+                    throw new IOError.BUSY ("A mount changed after preparation was planned.");
+            }
+            token.set_error_if_cancelled ();
+            entry.action_dispatched = true;
+            // A lost response can follow a successful unmount. Always reconcile.
+            entry.prepared = true;
+            try {
+                if (entry.mount_session != null &&
+                    (yield entry.mount_session.exchange ("prepare\n", backend_lifetime)) != "prepared")
+                    throw new IOError.BUSY ("An eligible mount could not be prepared. Check for active users.");
+                if (entry.primary_mount_id != 0) {
+                    synchronize ();
+                    current = read_mount_topology (block, out namespace_id);
+                    if (current.length != 1 || current[0].id != entry.primary_mount_id)
+                        throw new IOError.BUSY ("Unexpected mounts remain before the primary unmount.");
+                    // Once dispatched, wait for the unmount before honoring job cancellation.
+                    yield prepare_unmounted (block, backend_lifetime);
+                }
+                yield KernelStorageSafety.require_idle (block, token);
+                if (entry.mount_session != null &&
+                    (yield entry.mount_session.exchange ("idle\n", backend_lifetime)) != "idle")
+                    throw new IOError.BUSY ("The kernel could not verify exclusive access to the prepared filesystem.");
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    synchronize ();
+                    if (block.filesystem?.mounted != true) break;
+                    yield settle_delay (token);
+                }
+                if (block.filesystem?.mounted == true)
+                    throw new IOError.TIMED_OUT ("UDisks still reports an active mount.");
+                entry.backend_confirmed = true;
+                entry.expected_state_observed = true;
+                foreach (var step in entry.mount_topology) step.preparation_removed = true;
+                entry.actual_state = "unmounted";
+                return true;
+            } catch (Error error) {
+                synchronize ();
+                try {
+                    current = read_mount_topology (block, out namespace_id);
+                    foreach (var step in entry.mount_topology)
+                        step.preparation_removed = KernelMountRecord.at_target (current, step.target) == null;
+                    entry.verify_mount_topology (current, namespace_id);
+                } catch (Error read_error) {
+                    entry.record_mount_restoration (null);
+                }
+                throw error;
+            }
         }
 
         private void reconcile_preparation (StoragePreparationJournal journal) {
             foreach (var entry in journal.entries ()) {
-                if (!entry.prepared) continue;
-                var block = snapshot.blocks.lookup (entry.object_path);
+                if (!entry.prepared || entry.kind == StoragePreparationKind.ENCRYPTED_MAPPING) continue;
+                var block = snapshot.blocks.lookup (entry.resolved_path);
                 if (block == null || !block.available) {
                     entry.actual_state = entry.encrypted_backing_path != "" ?
                         "original cleartext mapping unavailable" : "device unavailable";
@@ -4202,21 +4301,17 @@ namespace MajorisDisks {
                     continue;
                 }
                 if (entry.kind == StoragePreparationKind.MOUNT) {
-                    string[] actual_mounts = block.filesystem.mounts;
-                    entry.actual_state = actual_mounts.length == 0 ? "unmounted" :
-                        "mounted at " + string.joinv (", ", actual_mounts);
-                    entry.record_mount_restoration (actual_mounts);
-                    if (entry.restored && entry.mount_topology.length != 0) {
-                        try {
-                            string namespace_id;
-                            var current = read_mount_topology (block, out namespace_id);
-                            if (current.length != 1 || !entry.mount_topology[0].same_mount (current[0]))
-                                throw new IOError.FAILED ("The restored mount differs in its kernel source, namespace or options.");
-                        } catch (Error error) {
-                            entry.restored = false;
-                            entry.mount_restoration = MountRestorationStatus.PARTIALLY_RESTORED;
-                            entry.actual_state += " with unverified mount options or namespace";
-                        }
+                    try {
+                        string namespace_id;
+                        var current = read_mount_topology (block, out namespace_id);
+                        string[] targets = {};
+                        foreach (var mount in current) targets += mount.target;
+                        entry.actual_state = targets.length == 0 ? "unmounted" :
+                            "mounted at " + string.joinv (", ", targets);
+                        entry.verify_mount_topology (current, namespace_id);
+                    } catch (Error error) {
+                        entry.record_mount_restoration (null);
+                        entry.actual_state = error.message;
                     }
                 } else if (entry.kind == StoragePreparationKind.SWAP) {
                     entry.actual_state = block.swap_active ? "active" : "inactive";
@@ -4229,7 +4324,7 @@ namespace MajorisDisks {
             var proxy = require_volume (block, "Filesystem");
             var options = new VariantBuilder (new VariantType ("a{sv}"));
             var reply = yield proxy.call ("Mount", new Variant.tuple ({ options.end () }),
-                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
+                DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 90000, token);
             synchronize ();
             return reply.is_of_type (new VariantType ("(s)")) ? reply.get_child_value (0).get_string () : "";
         }
@@ -4244,24 +4339,47 @@ namespace MajorisDisks {
                 synchronize ();
                 reconcile_preparation (journal);
                 if (entry.restored || !entry.restoration_allowed) continue;
-                var block = snapshot.blocks.lookup (entry.object_path);
+                if (entry.kind == StoragePreparationKind.ENCRYPTED_MAPPING) continue;
+                var block = snapshot.blocks.lookup (entry.resolved_path);
                 if (block == null || !entry.matches_prepared_device (block)) {
                     entry.error = "The prepared device or filesystem identity changed."; failures += entry.error; continue;
                 }
                 try {
                     if (entry.kind == StoragePreparationKind.MOUNT) {
-                        if (!entry.mount_configuration_matches (block.mount_configurations)) {
+                        yield refresh_block_configuration (require_volume (block, "Block"), token);
+                        if (!entry.matches_prepared_device (block) ||
+                            !entry.mount_configuration_matches (block.mount_configurations)) {
                             entry.restoration_allowed = false;
                             throw new IOError.FAILED ("The saved mount configuration changed.");
                         }
-                        if (entry.observed_mount_points.length != 0)
-                            throw new IOError.FAILED ("The filesystem is already mounted, but some original mount locations are missing or have changed.");
-                        if (entry.mount_namespace != "" &&
-                            FileUtils.read_link ("/proc/self/ns/mnt") != entry.mount_namespace)
+                        if (entry.restoration_dispatched)
+                            throw new IOError.FAILED ("Restoration was already requested. Review the observed mount state.");
+                        string namespace_id;
+                        var current = read_mount_topology (block, out namespace_id);
+                        if (namespace_id != entry.mount_namespace)
                             throw new IOError.FAILED ("The original mount namespace is unavailable.");
-                        string actual = yield restore_mount (block, token);
-                        if (entry.mount_point_count () != 1 || entry.mount_point_at (0) != actual)
-                            throw new IOError.FAILED ("UDisks mounted the filesystem at %s instead of its previous location.".printf (actual));
+                        entry.restoration_dispatched = true;
+                        if (entry.primary_mount_id != 0) {
+                            KernelMountRecord? primary = null;
+                            foreach (var expected in entry.mount_topology)
+                                if (expected.id == entry.primary_mount_id) primary = expected;
+                            var existing = KernelMountRecord.at_target (current, primary.target);
+                            if (existing == null) {
+                                if (current.length != 0)
+                                    throw new IOError.BUSY ("The primary mount is missing, but other mounts are active.");
+                                string actual = yield restore_mount (block, token);
+                                if (primary.target != actual)
+                                    throw new IOError.FAILED ("UDisks mounted the filesystem at %s instead of %s.".printf (actual, primary.target));
+                            } else if (!primary.same_mount (existing)) {
+                                throw new IOError.BUSY ("The primary mount's identity or options changed.");
+                            }
+                        }
+                        if (entry.mount_session != null &&
+                            (yield entry.mount_session.exchange ("restore\n", token)) != "restored") {
+                            reconcile_preparation (journal);
+                            if (!entry.restored)
+                                throw new IOError.FAILED ("Some mounts could not be restored. " + journal.recovery_details ());
+                        }
                         for (int attempt = 0; attempt < 30; attempt++) {
                             synchronize ();
                             reconcile_preparation (journal);
@@ -4554,7 +4672,7 @@ namespace MajorisDisks {
                     if (plan.requires_unmount) {
                         validate_encrypted_resize (block, mapping, header.identity, mapping_identity, old_size,
                             backing_identity, backing_size, header.uuid);
-                        journal = yield prepare_for_modification (mapping, token);
+                        journal = yield prepare_for_modification (mapping, token, job);
                     }
                     if (shrink) {
                         yield KernelStorageSafety.require_idle (mapping, token);
@@ -4731,24 +4849,15 @@ namespace MajorisDisks {
                     filesystem = require_volume (block, "Filesystem");
                     if (plan.requires_unmount) {
                         jobs.phase (job, StorageJobState.PREPARING, "Unmounting filesystem");
-                        string[] mount_state = { block.uuid, block.type_id };
-                        foreach (var mount in block.filesystem?.mounts ?? new string[0]) mount_state += mount;
-                        var mount_record = new StoragePreparationEntry (StoragePreparationKind.MOUNT,
-                            block.path, mount_state, "unmount");
-                        capture_mount_state (block, mount_record);
-                        journal.add (mount_record);
-                        mount_record.action_dispatched = true;
-                        try {
-                            remount = yield prepare_unmounted (block, token);
-                            mount_record.prepared = remount;
-                            mount_record.backend_confirmed = true;
-                            mount_record.expected_state_observed = remount;
-                        } catch (Error unmount_error) {
-                            synchronize ();
-                            mount_record.prepared = block.available && block.filesystem != null &&
-                                !block.filesystem.mounted;
-                            mount_record.expected_state_observed = mount_record.prepared;
-                            throw unmount_error;
+                        var mount_record = yield plan_mount_preparation (block, token);
+                        if (mount_record != null) {
+                            journal.add (mount_record);
+                            try {
+                                remount = yield prepare_mount_entry (block, mount_record, token);
+                            } catch (Error error) {
+                                remount = mount_record.prepared;
+                                throw error;
+                            }
                         }
                     }
                 }
@@ -5155,8 +5264,11 @@ namespace MajorisDisks {
                     throw new IOError.NOT_SUPPORTED (repair ? "UDisks does not support repairing this filesystem." :
                         "UDisks does not support checking this filesystem.");
                 jobs.phase (job, StorageJobState.PREPARING, "Preparing filesystem");
-                preparation = yield prepare_for_modification (block, lifetime);
-                yield KernelStorageSafety.require_idle (block, lifetime);
+                job.cancelable = true;
+                preparation = yield prepare_for_modification (block, job.cancellable, job);
+                yield KernelStorageSafety.require_idle (block, job.cancellable);
+                job.cancellable.set_error_if_cancelled ();
+                job.cancelable = false;
                 if (lifetime.is_cancelled () || require_volume (block, "Filesystem") != filesystem ||
                     block.type_id != filesystem_type || modification_identity (block) != target_identity)
                     throw new IOError.NOT_FOUND ("The selected volume changed before the check could start.");
@@ -5184,6 +5296,15 @@ namespace MajorisDisks {
                 jobs.finish (job, operation_result);
                 return successful;
             } catch (Error error) {
+                if (operation_result.completed_steps.length > 0 && !preparation.fully_restored ()) {
+                    string summary = repair ? "Filesystem repair returned, but storage restoration is incomplete." :
+                        "Filesystem check returned, but storage restoration is incomplete.";
+                    operation_result.fail (summary, error);
+                    operation_result.partial = true;
+                    operation_result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    jobs.finish (job, operation_result);
+                    throw new StorageRestorationError.INCOMPLETE (summary + "\n" + error.message);
+                }
                 if (!preparation.fully_restored ()) {
                     try { yield restore_preparation (preparation, lifetime); }
                     catch (Error mount_error) {
@@ -5306,21 +5427,57 @@ namespace MajorisDisks {
             if (!luks && keyfile_paths.length != 0)
                 throw new IOError.NOT_SUPPORTED ("Keyfile unlocking through UDisks is available for LUKS.");
 
-            uint8[] keyfile_contents = {};
-            size_t keyfile_size = 0;
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The encrypted volume changed before it could be unlocked.");
-            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.MOUNT,
-                block, snapshot.dependencies);
-            if (!eligibility.allowed || eligibility.unknown)
-                throw new IOError.PERMISSION_DENIED (eligibility.reason);
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("Unlock encrypted volume", block, snapshot.dependencies);
             var result = new StorageOperationResult ();
             try {
-                var lifetime = backend_lifetime;
-                if (keyfile_paths.length == 1) {
-                    string keyfile_path = keyfile_paths[0];
+                var credential = new RestorationCredential (passphrase, keyfile_paths.length == 1 ? keyfile_paths[0] : "");
+                passphrase = "";
+                string cleartext_path;
+                var mapping = yield unlock_in_job (block, credential, confirmed_identity, read_only,
+                    job, backend_lifetime, int.MAX, out cleartext_path);
+                if (mapping == null) {
+                    result.completed ("UDisks accepted the credential and returned " + cleartext_path);
+                    result.partial = true;
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    result.summary = "The encrypted volume may be unlocked. Refresh to verify the resulting mapping.";
+                    result.resulting_path = cleartext_path;
+                    result.actual_state = "unlock outcome requires reconciliation";
+                } else {
+                    result.successful = true;
+                    result.status = StorageOperationStatus.SUCCEEDED;
+                    result.summary = "Encrypted volume unlocked";
+                    result.resulting_path = mapping.path;
+                    result.actual_state = mapping.preferred;
+                }
+                jobs.finish (job, result);
+                return result;
+            } catch (Error error) {
+                result.fail ("The encrypted volume could not be unlocked", error);
+                jobs.finish (job, result);
+                throw error;
+            } finally {
+                locks.release (block);
+            }
+        }
+
+        private async StorageBlock? unlock_in_job (StorageBlock block, RestorationCredential credential,
+            string confirmed_identity, bool read_only, StorageJob job, Cancellable lifetime,
+            int timeout, out string cleartext_path) throws Error {
+            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.MOUNT,
+                block, snapshot.dependencies);
+            if (!eligibility.allowed || eligibility.unknown)
+                throw new IOError.PERMISSION_DENIED (eligibility.reason);
+            uint8[] keyfile_contents = {};
+            size_t keyfile_size = 0;
+            cleartext_path = "";
+            try {
+                if (!credential.managed && credential.passphrase == "" && credential.keyfile == "")
+                    throw new IOError.INVALID_ARGUMENT ("An unlocking credential is required.");
+                if (credential.keyfile != "") {
+                    string keyfile_path = credential.keyfile;
                     if (!Path.is_absolute (keyfile_path))
                         throw new IOError.INVALID_ARGUMENT ("The keyfile must be an absolute local path.");
                     const int max_keyfile_size = 8 * 1024 * 1024;
@@ -5341,6 +5498,7 @@ namespace MajorisDisks {
                     } finally { stream = null; }
                 }
                 lifetime.set_error_if_cancelled ();
+                synchronize ();
                 jobs.phase (job, StorageJobState.RUNNING, "Authorizing and unlocking encrypted storage");
                 if (modification_identity (block) != confirmed_identity || block.encrypted?.mapping != null)
                     throw new IOError.NOT_FOUND ("The encrypted volume changed before the unlock request was sent.");
@@ -5353,11 +5511,13 @@ namespace MajorisDisks {
                 var encrypted = require_volume (block, "Encrypted");
                 jobs.expect_backend (job, "encrypted-unlock", block.path);
                 var reply = yield call_tracked_method (job, encrypted, "Unlock",
-                    new Variant ("(s@a{sv})", passphrase, options.end ()), lifetime);
-                passphrase = "";
+                    new Variant ("(s@a{sv})", credential.passphrase, options.end ()), lifetime, timeout);
+                credential.passphrase = "";
                 if (keyfile_contents.length != 0)
                     Memory.set (keyfile_contents, 0, keyfile_contents.length);
-                string cleartext_path = reply.get_child_value (0).get_string ();
+                if (!reply.is_of_type (new VariantType ("(o)")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid cleartext object path.");
+                cleartext_path = reply.get_child_value (0).get_string ();
                 StorageBlock? mapping = null;
                 for (int attempt = 0; attempt < 50 && mapping == null; attempt++) {
                     synchronize ();
@@ -5365,23 +5525,13 @@ namespace MajorisDisks {
                     if (mapping == null) yield settle_delay (backend_lifetime);
                 }
                 if (mapping == null || mapping.backing_path != block.path ||
-                    ((read_only || block.read_only) && !mapping.read_only)) {
-                    result.completed ("UDisks accepted the credential and returned " + cleartext_path);
-                    result.partial = true; result.status = StorageOperationStatus.NEEDS_ATTENTION;
-                    result.summary = "The encrypted volume may be unlocked, but the clear-text mapping could not be verified. Refresh before trying again.";
-                    result.resulting_path = cleartext_path; result.actual_state = "unlock outcome requires reconciliation";
-                    jobs.finish (job, result); return result;
-                }
-                result.successful = true; result.status = StorageOperationStatus.SUCCEEDED;
-                result.summary = "Encrypted volume unlocked"; result.resulting_path = mapping.path;
-                result.actual_state = mapping.preferred; jobs.finish (job, result);
-                return result;
-            } catch (Error error) {
-                result.fail ("The encrypted volume could not be unlocked", error); jobs.finish (job, result); throw error;
+                    ((read_only || block.read_only) && !mapping.read_only))
+                    return null;
+                return mapping;
             } finally {
+                credential.passphrase = "";
                 if (keyfile_contents.length != 0)
                     Memory.set (keyfile_contents, 0, keyfile_contents.length);
-                locks.release (block);
             }
         }
 
@@ -5399,7 +5549,7 @@ namespace MajorisDisks {
             var result = new StorageOperationResult (); StoragePreparationJournal? preparation = null;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Preparing the clear-text mapping");
-                preparation = yield prepare_for_modification (mapping, backend_lifetime);
+                preparation = yield prepare_for_modification (mapping, backend_lifetime, job);
                 if (modification_identity (block) != confirmed_identity || block.encrypted?.mapping != mapping)
                     throw new IOError.NOT_FOUND ("The encrypted mapping changed during preparation.");
                 jobs.phase (job, StorageJobState.RUNNING, "Locking encrypted storage");
@@ -5503,7 +5653,8 @@ namespace MajorisDisks {
             return "";
         }
 
-        private void validate_luks_target (StorageBlock block, string identity, bool restore, bool advanced)
+        private void validate_luks_target (StorageBlock block, string identity, bool restore, bool advanced,
+            bool review_active = false)
             throws Error {
             synchronize ();
             if (!luks_header_available ())
@@ -5513,7 +5664,210 @@ namespace MajorisDisks {
                 throw new IOError.NOT_FOUND ("The selected device changed after it was confirmed.");
             if (!(advanced ? is_luks_recovery_candidate (block) : is_luks_header_candidate (block)))
                 throw new IOError.NOT_SUPPORTED ("The selected volume does not support this header operation.");
-            if (restore) require_luks_restore_idle (block, snapshot.dependencies);
+            if (restore) {
+                if (review_active && !advanced && block.encrypted?.mapping != null)
+                    require_luks_restorable_mapping (block);
+                else require_luks_restore_idle (block, snapshot.dependencies);
+            }
+        }
+
+        private StorageBlock require_luks_restorable_mapping (StorageBlock block) throws Error {
+            var mapping = block.encrypted?.mapping;
+            var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+            if (mapping == null || !mapping.available || mapping.filesystem == null || mapping.uuid == "" ||
+                safety.system_critical || safety.unknown_dependencies || block.read_only ||
+                block.table != null || block.partition?.container == true || block.backing_path != "/" ||
+                block.raid_path != "/" || block.raid_member_path != "/" || block.logical_volume_path != "/" ||
+                block.physical_volume_group_path != "/" || snapshot.dependencies.descendants (block).length != 2 ||
+                snapshot.dependencies.descendants (mapping).length != 1 || mapping.swap_active)
+                throw new IOError.NOT_SUPPORTED ("Temporary closure requires a non-system LUKS device with a single supported filesystem.");
+            var physical_backing = block.partition == null ? block :
+                snapshot.blocks.lookup (block.partition.table_path);
+            if (physical_backing?.loop != null) {
+                string autoclear;
+                FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (physical_backing.number) +
+                    "/loop/autoclear", out autoclear);
+                if (autoclear.strip () != "0")
+                    throw new IOError.NOT_SUPPORTED ("The loop backing device is configured to detach when idle.");
+            }
+            return mapping;
+        }
+
+        private static string dm_property (StorageBlock mapping, string property) throws Error {
+            string value;
+            FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (mapping.number) +
+                "/dm/" + property, out value);
+            return value.strip ();
+        }
+
+        private StoragePreparationEntry capture_luks_mapping (StorageBlock block, StorageBlock mapping,
+            LuksHeaderReview review) throws Error {
+            if (review.confidence != "readable" || review.uuid != block.uuid || review.data_offset >= block.size ||
+                review.encryption_sector_size == 0 || block.encryption_configurations.length > 1)
+                throw new IOError.NOT_SUPPORTED ("The original LUKS header, geometry or crypttab entry is ambiguous.");
+            uint64 payload = block.size - review.data_offset;
+            payload -= payload % review.encryption_sector_size;
+            var entry = new StoragePreparationEntry (StoragePreparationKind.ENCRYPTED_MAPPING, block.path,
+                { mapping.uuid, mapping.type_id, mapping.path }, "close LUKS mapping for header restore");
+            entry.device_identity = StoragePreparationJournal.device_identity (block);
+            entry.encrypted_backing_uuid = block.uuid;
+            entry.mapper_name = dm_property (mapping, "name");
+            entry.mapper_uuid = dm_property (mapping, "uuid");
+            entry.mapping_size = mapping.size;
+            entry.backing_size = block.size;
+            entry.mapping_read_only = mapping.read_only;
+            var config = block.encryption_configuration;
+            entry.crypttab = config?.backend_item;
+            string expected_name = config != null && config.name != "" ? config.name : "luks-" + block.uuid;
+            if (!MountOptionService.valid_crypttab_name (entry.mapper_name) || entry.mapper_name != expected_name ||
+                (config != null && (entry.crypttab == null || MountOptionService.external_crypttab_options (config.options) ||
+                    (config.passphrase_path != "" && !MountOptionService.manages_crypttab_keyfile (config.passphrase_path)))) ||
+                mapping.size != payload || KernelStorageSafety.block_capacity (mapping) != payload ||
+                !entry.mapper_uuid.has_prefix ("CRYPT-" + review.version + "-" + block.uuid.replace ("-", "") + "-"))
+                throw new IOError.NOT_SUPPORTED ("UDisks cannot safely reproduce the original mapper name, options or payload geometry.");
+            return entry;
+        }
+
+        private async void close_luks_for_maintenance (StorageBlock block, StorageBlock mapping,
+            StoragePreparationEntry entry, string identity, StorageJob job) throws Error {
+            yield KernelStorageSafety.require_idle (mapping, job.cancellable);
+            yield KernelStorageSafety.require_sole_dm_dependency (block, mapping, job.cancellable);
+            synchronize ();
+            if (modification_identity (block) != identity || block.encrypted?.mapping != mapping ||
+                dm_property (mapping, "uuid") != entry.mapper_uuid || dm_property (mapping, "name") != entry.mapper_name)
+                throw new IOError.NOT_FOUND ("The original LUKS mapping changed before closure.");
+            job.cancellable.set_error_if_cancelled ();
+            jobs.phase (job, StorageJobState.PREPARING, "Closing the encrypted mapping for header maintenance");
+            var encrypted = require_volume (block, "Encrypted");
+            jobs.expect_backend (job, "encrypted-lock", block.path);
+            entry.action_dispatched = true;
+            try {
+                yield call_tracked_method (job, encrypted, "Lock", new Variant ("(@a{sv})",
+                    new VariantBuilder (VariantType.VARDICT).end ()), backend_lifetime, 60000);
+                entry.backend_confirmed = true;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    synchronize ();
+                    if (snapshot.blocks.lookup (block.path) == block && block.encrypted != null &&
+                        block.encrypted.mapping == null && snapshot.blocks.lookup (mapping.path) == null) {
+                        entry.prepared = true;
+                        entry.expected_state_observed = true;
+                        entry.actual_state = "closed by Majoris";
+                        return;
+                    }
+                    yield settle_delay (backend_lifetime);
+                }
+                throw new IOError.TIMED_OUT ("The original mapping did not disappear after closure.");
+            } catch (Error error) {
+                synchronize ();
+                entry.actual_state = block.encrypted?.mapping == mapping ? "original mapping remains active" :
+                    "closure outcome uncertain. Automatic reopening withheld";
+                throw new IOError.FAILED (error.message + " " + entry.actual_state);
+            }
+        }
+
+        private void verify_luks_reopen_target (StorageBlock block, StoragePreparationEntry entry) throws Error {
+            synchronize ();
+            var configuration = block.encryption_configuration?.backend_item;
+            if (snapshot.blocks.lookup (block.path) != block || !is_luks_header_candidate (block) ||
+                block.uuid != entry.encrypted_backing_uuid || block.size != entry.backing_size ||
+                StoragePreparationJournal.device_identity (block) != entry.device_identity ||
+                KernelStorageSafety.block_capacity (block) != entry.backing_size ||
+                block.encryption_configurations.length > 1 ||
+                (entry.crypttab == null ? configuration != null : configuration == null || !entry.crypttab.equal (configuration)))
+                throw new IOError.NOT_FOUND ("The original LUKS device, geometry or crypttab configuration changed.");
+            if (block.encrypted.mapping != null || FileUtils.test ("/dev/mapper/" + entry.mapper_name, FileTest.EXISTS))
+                throw new IOError.EXISTS ("The encrypted device or its original mapper name is already active.");
+        }
+
+        private async void restore_luks_mapping (StorageBlock block, StoragePreparationEntry entry,
+            StoragePreparationJournal journal, RestorationCredentialProvider provider, StorageJob job,
+            string header_fingerprint) throws Error {
+            if (!entry.prepared || !entry.backend_confirmed || entry.restoration_dispatched)
+                throw new IOError.BUSY ("Majoris could not establish that it closed the mapping.");
+            yield refresh_block_configuration (require_volume (block, "Block"), backend_lifetime);
+            verify_luks_reopen_target (block, entry);
+            if (header_fingerprint == "")
+                throw new IOError.INVALID_DATA ("A verified header fingerprint is required for reopening.");
+            var config = block.encryption_configuration;
+            RestorationCredential credential;
+            if (config != null && MountOptionService.manages_crypttab_keyfile (config.passphrase_path)) {
+                yield inspect_crypttab (config.name, config.name, config.device, config.options,
+                    config.passphrase_path, config.passphrase_path, entry.managed_key_identity);
+                credential = new RestorationCredential ("", "", true);
+            } else {
+                entry.actual_state = "closed and awaiting an unlocking credential";
+                try {
+                    credential = yield provider.request (block.preferred);
+                } catch (Error error) {
+                    entry.actual_state = (error is IOError.CANCELLED) ?
+                        "closed after credential cancellation" : "closed with no available credential";
+                    throw error;
+                }
+            }
+            try {
+                verify_luks_reopen_target (block, entry);
+                int fd = yield open_block (block, "r", Posix.O_CLOEXEC, backend_lifetime);
+                try {
+                    string output, detail;
+                    int status = yield run_luks_worker (fd, "inspect", "", luks_source_binding (block),
+                        "", block.uuid, false, job, -1, -1, "", "", out output, out detail);
+                    var lines = output.split ("\n");
+                    if (status != 0 || lines.length != 2 || lines[1] != header_fingerprint)
+                        throw new IOError.INVALID_DATA ("The LUKS header changed after it was verified.");
+                } finally { Posix.close (fd); }
+                yield refresh_block_configuration (require_volume (block, "Block"), backend_lifetime);
+                verify_luks_reopen_target (block, entry);
+                entry.restoration_dispatched = true;
+                entry.actual_state = "unlock requested with an unverified outcome";
+                string actual_path;
+                StorageBlock? mapping;
+                try {
+                    mapping = yield unlock_in_job (block, credential, modification_identity (block),
+                        entry.mapping_read_only, job, backend_lifetime, 90000, out actual_path);
+                } catch (Error error) {
+                    synchronize ();
+                    string remote = DBusError.get_remote_error (error) ?? "";
+                    if (remote.has_prefix ("org.freedesktop.UDisks2.Error.NotAuthorized") ||
+                        error is DBusError.ACCESS_DENIED) {
+                        entry.actual_state = "unlock authorization denied";
+                    } else if (snapshot.blocks.lookup (block.path) == block && block.encrypted?.mapping == null &&
+                        remote == "org.freedesktop.UDisks2.Error.Failed") {
+                        entry.actual_state = "closed after UDisks reported unlock failure";
+                    }
+                    throw error;
+                }
+                if (mapping != null) {
+                    for (int attempt = 0; attempt < 50; attempt++) {
+                        synchronize ();
+                        if (block.encrypted?.mapping == mapping && mapping.filesystem != null && mapping.uuid != "")
+                            break;
+                        yield settle_delay (backend_lifetime);
+                    }
+                }
+                if (mapping == null || block.encrypted?.mapping != mapping ||
+                    mapping.filesystem == null || mapping.uuid != entry.state_at (0) ||
+                    mapping.type_id != entry.state_at (1) || mapping.size != entry.mapping_size ||
+                    mapping.read_only != entry.mapping_read_only || block.uuid != entry.encrypted_backing_uuid ||
+                    snapshot.blocks.lookup (block.path) != block || block.size != entry.backing_size ||
+                    StoragePreparationJournal.device_identity (block) != entry.device_identity ||
+                    KernelStorageSafety.block_capacity (mapping) != entry.mapping_size ||
+                    dm_property (mapping, "name") != entry.mapper_name || dm_property (mapping, "uuid") != entry.mapper_uuid)
+                    throw new IOError.INVALID_DATA ("UDisks returned a mapping whose original identity or geometry could not be verified.");
+                yield KernelStorageSafety.require_sole_dm_dependency (block, mapping, backend_lifetime);
+                entry.rebound_path = mapping.path;
+                entry.actual_state = "verified mapping reopened at " + mapping.path;
+                entry.restored = true;
+                foreach (var dependent in journal.entries ()) {
+                    if (dependent.kind != StoragePreparationKind.MOUNT || dependent.object_path != entry.state_at (2))
+                        continue;
+                    dependent.rebound_path = mapping.path;
+                    dependent.device_identity = StoragePreparationJournal.device_identity (mapping);
+                    foreach (var record in dependent.mount_topology)
+                        record.device = KernelStorageSafety.device_number (mapping.number);
+                }
+            } finally {
+                credential.passphrase = "";
+            }
         }
 
         internal static void require_luks_restore_idle (StorageBlock block, StorageDependencyService graph)
@@ -5649,7 +6003,7 @@ namespace MajorisDisks {
             bool restore = backup_file != null;
             string? path = restore ? backup_file.get_path () : "";
             if (path == null) throw new IOError.INVALID_ARGUMENT ("Choose a local backup file.");
-            validate_luks_target (block, identity, restore, advanced);
+            validate_luks_target (block, identity, restore, advanced, true);
             locks.acquire (block, snapshot.dependencies);
             var lifetime = backend_lifetime;
             var job = jobs.begin (list_keyslots ? "List LUKS keyslots" : "Validate LUKS header", block, snapshot.dependencies);
@@ -5659,11 +6013,11 @@ namespace MajorisDisks {
             try {
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.PREPARING, "Checking the device and available backend");
-                if (restore) yield KernelStorageSafety.require_idle (block, job.cancellable);
+                if (restore && block.encrypted?.mapping == null) yield KernelStorageSafety.require_idle (block, job.cancellable);
                 yield detect_luks_methods (require_volume (block, "Block"), job.cancellable);
                 jobs.phase (job, StorageJobState.PREPARING, "Authorizing read-only device access");
                 fd = yield open_block (block, "r", Posix.O_CLOEXEC, job.cancellable);
-                validate_luks_target (block, identity, restore, advanced);
+                validate_luks_target (block, identity, restore, advanced, true);
                 job.cancellable.set_error_if_cancelled ();
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.RUNNING, "Reading and validating LUKS metadata");
@@ -5671,7 +6025,7 @@ namespace MajorisDisks {
                 int status = yield run_luks_worker (fd, list_keyslots ? "list-keyslots" : restore ? "preview" : "inspect", path,
                     luks_source_binding (block), "", block.uuid, advanced, job, -1, -1, "", "", out output, out detail);
                 if (status != 0) throw new IOError.INVALID_DATA (detail != "" ? detail : "The header could not be verified.");
-                validate_luks_target (block, identity, restore, advanced);
+                validate_luks_target (block, identity, restore, advanced, true);
                 var lines = output.split ("\n");
                 var fields = lines[0].split (" ");
                 if ((list_keyslots ? lines.length < 3 : lines.length != (restore ? 5 : 2)) || fields.length != 8)
@@ -5708,14 +6062,16 @@ namespace MajorisDisks {
         }
 
         internal async StorageOperationResult execute_luks_header (StorageBlock block,
-            LuksHeaderReview review, File? destination = null) throws Error {
+            LuksHeaderReview review, File? destination = null,
+            RestorationCredentialProvider? credential_provider = null) throws Error {
             bool restore = destination == null;
             if (restore && review.confidence == "unestablished")
                 throw new IOError.NOT_SUPPORTED ("The backup cannot be linked to this unreadable target. Use offline expert recovery.");
             string? path = restore ? review.file_path : destination.get_path ();
             if (path == null || path == "" || (restore == (review.file_path == "")))
                 throw new IOError.INVALID_ARGUMENT ("Choose a local header backup file.");
-            validate_luks_target (block, review.identity, restore, review.advanced);
+            bool close_mapping = restore && block.encrypted?.mapping != null && credential_provider != null;
+            validate_luks_target (block, review.identity, restore, review.advanced, close_mapping);
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin (restore ? "Restore LUKS header" : "Back up LUKS header", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
@@ -5723,15 +6079,48 @@ namespace MajorisDisks {
             ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
             int fd = -1;
             bool dispatched = false;
+            bool header_verified = false;
+            string header_fingerprint = "";
+            StoragePreparationJournal? journal = null;
+            StoragePreparationEntry? mapping_entry = null;
+            string locked_identity = review.identity;
             try {
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.PREPARING, "Checking the selected volume and its dependencies");
+                if (close_mapping) {
+                    var ticket_fields = review.ticket.split (":", 4);
+                    if (ticket_fields.length != 4)
+                        throw new IOError.INVALID_DATA ("The original header fingerprint is unavailable.");
+                    header_fingerprint = string.joinv (":", ticket_fields[0:3]);
+                    yield refresh_block_configuration (require_volume (block, "Block"), job.cancellable);
+                    var mapping = require_luks_restorable_mapping (block);
+                    int preview_fd = yield open_block (block, "r", Posix.O_CLOEXEC, job.cancellable);
+                    try {
+                        string preview, detail;
+                        int verified = yield run_luks_worker (preview_fd, "preview", path, luks_source_binding (block),
+                            "", block.uuid, false, job, -1, -1, "", "", out preview, out detail);
+                        var lines = preview.split ("\n");
+                        if (verified != 0 || lines.length != 5 || lines[1] != review.ticket)
+                            throw new IOError.INVALID_DATA ("The LUKS header or backup changed before preparation.");
+                    } finally { Posix.close (preview_fd); }
+                    validate_luks_target (block, review.identity, true, false, true);
+                    mapping_entry = capture_luks_mapping (block, mapping, review);
+                    var config = block.encryption_configuration;
+                    if (config != null && MountOptionService.manages_crypttab_keyfile (config.passphrase_path))
+                        mapping_entry.managed_key_identity = yield inspect_crypttab (config.name, config.name,
+                            config.device, config.options, config.passphrase_path, config.passphrase_path);
+                    jobs.phase (job, StorageJobState.PREPARING, "Capturing and preparing dependent mounts");
+                    journal = yield prepare_for_modification (mapping, job.cancellable, job);
+                    journal.add (mapping_entry);
+                    yield close_luks_for_maintenance (block, mapping, mapping_entry, review.identity, job);
+                    locked_identity = modification_identity (block);
+                }
                 if (restore) yield KernelStorageSafety.require_idle (block, job.cancellable);
                 jobs.phase (job, StorageJobState.PREPARING, "Authorizing device access");
                 fd = yield open_block (block, restore ? "rw" : "r",
                     Posix.O_CLOEXEC | (restore ? Posix.O_EXCL : 0), job.cancellable);
                 if (restore) yield KernelStorageSafety.require_idle (block, job.cancellable);
-                validate_luks_target (block, review.identity, restore, review.advanced);
+                validate_luks_target (block, locked_identity, restore, review.advanced);
                 job.cancellable.set_error_if_cancelled ();
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.RUNNING, restore ?
@@ -5742,6 +6131,8 @@ namespace MajorisDisks {
                     luks_source_binding (block), review.ticket, block.uuid, review.advanced, job, -1, -1, "", "", out output, out detail);
                 Posix.close (fd);
                 fd = -1;
+                header_verified = status == 0 || status == 2;
+                if (restore && status == 0) header_fingerprint = output;
                 if (status != 0) {
                     record_luks_worker_failure (outcome, status, restore, detail);
                 } else {
@@ -5786,6 +6177,34 @@ namespace MajorisDisks {
                 }
             } finally {
                 if (fd >= 0) Posix.close (fd);
+                if (journal != null && mapping_entry != null) {
+                    outcome.restoration_attempted = true;
+                    try {
+                        if (mapping_entry.prepared) {
+                            if (dispatched && !header_verified)
+                                throw new IOError.FAILED ("The mapping remains closed because the header write could not be verified.");
+                            yield restore_luks_mapping (block, mapping_entry, journal, credential_provider, job,
+                                header_fingerprint);
+                            outcome.completed ("Verified encrypted mapping reopened");
+                            outcome.actual_state = mapping_entry.actual_state;
+                            outcome.resulting_path = mapping_entry.rebound_path;
+                        }
+                        jobs.phase (job, StorageJobState.FINALIZING, "Restoring and verifying original mount locations");
+                        yield restore_preparation (journal, lifetime);
+                        outcome.restoration_succeeded = true;
+                        foreach (var entry in journal.entries ())
+                            if (entry.kind == StoragePreparationKind.MOUNT && entry.restored)
+                                outcome.completed ("Verified mounts restored at " + string.joinv (", ", entry.observed_mount_points));
+                    } catch (Error error) {
+                        if (outcome.successful)
+                            outcome.summary = "Header restored and verified. Storage restoration needs attention.";
+                        outcome.successful = false;
+                        outcome.partial = true;
+                        outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                        outcome.technical_error += (outcome.technical_error == "" ? "" : "\n") +
+                            error.message + "\n" + journal.recovery_details ();
+                    }
+                }
                 lifetime.disconnect (disconnected);
                 jobs.finish (job, outcome);
                 locks.release (block);
@@ -5929,7 +6348,7 @@ namespace MajorisDisks {
 
         private bool crypttab_write_pending;
 
-        private async void refresh_crypttab_configuration (DBusProxy proxy, Cancellable token) throws Error {
+        private async void refresh_block_configuration (DBusProxy proxy, Cancellable token) throws Error {
             // Read from the daemon even if the proxy missed PropertiesChanged.
             var reply = yield proxy.get_connection ().call (proxy.get_name_owner (), proxy.get_object_path (),
                 "org.freedesktop.DBus.Properties", "Get", new Variant ("(ss)", PREFIX + "Block", "Configuration"),
@@ -6091,7 +6510,7 @@ namespace MajorisDisks {
             int credential_device = -1;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Validating encryption configuration");
-                yield refresh_crypttab_configuration (proxy, backend_lifetime);
+                yield refresh_block_configuration (proxy, backend_lifetime);
                 if (snapshot.blocks.lookup (block.path) != block ||
                     modification_identity (block) != confirmed_identity || block.uuid != confirmed_uuid)
                     throw new IOError.NOT_FOUND ("The encrypted volume changed immediately before the configuration write.");
@@ -6148,7 +6567,7 @@ namespace MajorisDisks {
                         throw new IOError.NOT_SUPPORTED ("The backend did not return a supported existing keyfile.");
                     old_credential = contents;
                     if (!supplied_credential) secret = contents;
-                    yield refresh_crypttab_configuration (proxy, backend_lifetime);
+                    yield refresh_block_configuration (proxy, backend_lifetime);
                     if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
                         modification_identity (block) != confirmed_identity ||
                         find_encryption_configuration (block, old_name)?.backend_item?.equal (original_item) != true)
@@ -6183,7 +6602,7 @@ namespace MajorisDisks {
                         ticket = yield crypttab_credential_ticket (block, credential_device, job);
                         yield verify_crypttab_credential (block, credential_device, ticket, secret, job);
                     }
-                    yield refresh_crypttab_configuration (proxy, backend_lifetime);
+                    yield refresh_block_configuration (proxy, backend_lifetime);
                     if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
                         modification_identity (block) != confirmed_identity)
                         throw new IOError.NOT_FOUND ("The encrypted volume changed before the crypttab write.");
@@ -6220,7 +6639,7 @@ namespace MajorisDisks {
                 jobs.phase (job, StorageJobState.RUNNING, "Verifying the resulting crypttab entry");
                 bool verified = false;
                 for (int attempt = 0; attempt < 50 && !verified; attempt++) {
-                    yield refresh_crypttab_configuration (proxy, backend_lifetime);
+                    yield refresh_block_configuration (proxy, backend_lifetime);
                     if (snapshot.blocks.lookup (block.path) != block || block.uuid != confirmed_uuid ||
                         modification_identity (block) != confirmed_identity)
                         throw new IOError.NOT_FOUND ("The encrypted device changed after the configuration request.");

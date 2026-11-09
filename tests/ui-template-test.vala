@@ -79,6 +79,11 @@ private void test_luks_capabilities_and_safety () throws Error {
     UDisksService.record_luks_worker_failure (outcome, -1, true, "");
     assert (outcome.status == StorageOperationStatus.NEEDS_ATTENTION && outcome.summary == "Outcome uncertain");
 
+    var plan = new StorageRestorationPlanDialog ();
+    assert (plan.get_default_response () == "cancel");
+    var reopen = new LuksCredentialDialog ("reopen", -1, {}, false, new Gtk.Window ());
+    assert (!reopen.get_response_enabled ("apply"));
+    assert (reopen.get_response_label ("apply") == "Unlock");
     int pipe = UDisksService.credential_pipe ("fixture passphrase");
     uint8[] buffer = new uint8[32];
     assert (Posix.read (pipe, buffer, buffer.length) == 18);
@@ -221,7 +226,7 @@ public static int main (string[] args) {
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
         new DriveInformationDialog (drive, block), new InformationRow ("Test", "Value", false),
         new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new BtrfsBalanceDialog (true), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
-        new OperationResultDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
+        new OperationResultDialog (), new StorageRestorationPlanDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
         new FormatDiskDialog (), new FormatVolumeDialog (backend, block),
         new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block), encrypted_resize,
         new JobRow (backend, job), new JobsPopover (backend), new ActiveJobsDialog (),
@@ -244,6 +249,7 @@ public static int main (string[] args) {
         "create-partition-dialog.ui", "resize-volume-dialog.ui", "encrypted-resize-dialog.ui", "job-row.ui", "jobs-popover.ui",
         "active-jobs-dialog.ui", "mount-options-dialog.ui", "unlock-volume-dialog.ui",
          "lock-volume-confirmation-dialog.ui", "change-passphrase-dialog.ui",
+        "storage-restoration-plan-dialog.ui",
         "luks-header-backup-dialog.ui", "luks-header-restore-dialog.ui", "luks-keyslots-dialog.ui", "luks-credential-dialog.ui", "encryption-options-dialog.ui",
         "smart-dialog.ui", "hardware-action-confirmation-dialog.ui", "drive-settings-dialog.ui", "health-preferences.ui", "benchmark-dialog.ui", "disk-image-confirmation.ui", "create-blank-image-dialog.ui", "virtual-image-dialog.ui"
     };
