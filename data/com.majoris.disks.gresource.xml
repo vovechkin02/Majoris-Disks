@@ -17,6 +17,9 @@
     <file>ui/information-row.ui</file>
     <file>ui/edit-filesystem-dialog.ui</file>
     <file>ui/lvm-rename-dialog.ui</file>
+    <file>ui/lvm-recovery-dialog.ui</file>
+    <file>ui/lvm-cache-dialog.ui</file>
+    <file>ui/lvm-layout-dialog.ui</file>
     <file>ui/lvm-lifecycle-dialog.ui</file>
     <file>ui/storage-removal-dialog.ui</file>
     <file>ui/lvm-create-dialog.ui</file>

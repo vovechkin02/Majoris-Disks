@@ -40,6 +40,14 @@ if mount_dep.found()
     timeout: 180)
 endif
 test('storage-model', layout_test)
+lvm_device_test = executable('lvm-device-test', 'tests/lvm-device-test.vala', storage_model_sources,
+  'src/udisks-service.vala', include_directories: xz_include,
+  dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+foreach scenario : ['recovery', 'cache', 'layout']
+  test('lvm-' + scenario + '-integration', sh,
+    args: [meson.current_source_dir() / ('tests/lvm-' + scenario + '-integration.sh'), lvm_device_test],
+    timeout: 1200, is_parallel: false)
+endforeach
 test('filesystem-capacity-integration', sh,
   args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test])
 test('filesystem-capacity-udisks', sh,

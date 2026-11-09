@@ -39,6 +39,14 @@
 <child><object class="AdwActionRow" id="advanced_manage"><property name="activatable">True</property></object></child>
 <child><object class="AdwActionRow" id="advanced_maintenance"><property name="activatable">True</property></object></child>
 <child><object class="AdwActionRow" id="advanced_recovery"><property name="activatable">True</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_rename"><property name="title">Rename Volume Group…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_refresh"><property name="title">Refresh and Reassess</property><property name="activatable">True</property><property name="visible">False</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_repair"><property name="title">Repair LVM RAID 1…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_cleanup"><property name="title">Remove Missing Physical-Volume Records…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_cache"><property name="title">Attach Cache…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_uncache"><property name="title">Split or Remove Cache…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_cache_status"><property name="title">Inspect Cache Status…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
+<child><object class="AdwActionRow" id="advanced_lvm_layout"><property name="title">Create Logical Volume with Physical Placement…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
 </object></child>
 <child><object class="AdwPreferencesGroup" id="advanced_members"><property name="title">Members and Volumes</property></object></child>
 </object></property></object></property>

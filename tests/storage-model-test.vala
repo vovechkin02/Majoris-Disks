@@ -1379,6 +1379,101 @@ private void test_nbd_device_identity () {
     assert (!VirtualDiskAttachment.parse_device ("/dev/sda", out index));
 }
 
+private Variant lvm_leaf (string name, string key, string pv, uint64 size, uint64 mapped) {
+    var node = new VariantBuilder (new VariantType ("a{sv}"));
+    node.add ("{sv}", "name", new Variant.string (name));
+    node.add ("{sv}", "type", new Variant.string ("linear"));
+    node.add ("{sv}", "size", new Variant.uint64 (size));
+    var segments = new VariantBuilder (new VariantType ("a(tto)"));
+    if (mapped != 0) segments.add ("(tto)", (uint64) 0, mapped, pv);
+    node.add ("{sv}", key, segments.end ());
+    return node.end ();
+}
+
+private Variant lvm_raid (bool degraded) {
+    var node = new VariantBuilder (new VariantType ("a{sv}"));
+    node.add ("{sv}", "name", new Variant.string ("mirror"));
+    node.add ("{sv}", "type", new Variant.string ("raid1"));
+    node.add ("{sv}", "size", new Variant.uint64 (64));
+    var data = new VariantBuilder (new VariantType ("aa{sv}"));
+    data.add_value (lvm_leaf ("data0", "segments", "/pv0", 64, 64));
+    data.add_value (lvm_leaf ("data1", "segs", degraded ? "/" : "/pv1", 64, 64));
+    node.add ("{sv}", "data", data.end ());
+    var metadata = new VariantBuilder (new VariantType ("aa{sv}"));
+    metadata.add_value (lvm_leaf ("meta0", "segments", "/pv0", 4, 4));
+    metadata.add_value (lvm_leaf ("meta1", "segs", degraded ? "/" : "/pv1", 4, 4));
+    node.add ("{sv}", "metadata", metadata.end ());
+    return node.end ();
+}
+
+private void test_lvm_structure () {
+    var snapshot = new StorageSnapshot ();
+    foreach (var path in new string[] { "/pv0", "/pv1" }) {
+        var pv = new StorageBlock (path);
+        pv.physical_volume_group_path = "/vg";
+        snapshot.blocks.insert (path, pv);
+    }
+    var complete = LvmStructure.parse (lvm_raid (false));
+    assert (complete != null && complete.data.length == 2 && complete.metadata.length == 2);
+    assert (complete.allocation (snapshot, "/vg") == LvmAllocation.COMPLETE);
+    assert (complete.verifies_placement ({ "/pv0", "/pv1" }));
+    assert (!complete.verifies_placement ({ "/pv0", "/pv2" }));
+    assert (complete.raid1_replacement_bytes (snapshot, "/vg") == 0);
+    var degraded = LvmStructure.parse (lvm_raid (true));
+    assert (degraded != null && degraded.allocation (snapshot, "/vg") == LvmAllocation.INCOMPLETE);
+    assert (degraded.raid1_replacement_bytes (snapshot, "/vg") == 68);
+    snapshot.blocks.remove ("/pv0");
+    assert (degraded.raid1_replacement_bytes (snapshot, "/vg") == 0);
+    var linear = LvmStructure.parse (lvm_leaf ("linear", "segments", "/pv1", 64, 32));
+    assert (linear != null && linear.allocation (snapshot, "/vg") == LvmAllocation.INCOMPLETE);
+    assert (linear.raid1_replacement_bytes (snapshot, "/vg") == 0);
+    assert (LvmStructure.parse (new Variant.string ("invalid")) == null);
+    assert (LvmStructure.parse (Variant.parse (new VariantType ("a{sv}"),
+        "{'name': <'bad'>, 'type': <'linear'>, 'size': <uint64 64>, 'segments': <'bad'>}")) == null);
+}
+
+private void test_lvm_layout_capacity () {
+    assert (LvmLayout.required_per_pv ("linear", 1, 64, 4) == 64);
+    assert (LvmLayout.required_per_pv ("linear", 2, 64, 4) == 0);
+    assert (LvmLayout.required_per_pv ("raid0", 2, 64, 4) == 32);
+    assert (LvmLayout.required_per_pv ("raid1", 2, 64, 4) == 68);
+    assert (LvmLayout.required_per_pv ("raid5", 3, 64, 4) == 36);
+    assert (LvmLayout.required_per_pv ("raid6", 4, 64, 4) == 36);
+    assert (LvmLayout.required_per_pv ("raid10", 4, 64, 4) == 36);
+    assert (LvmLayout.required_per_pv ("raid10", 5, 64, 4) == 0);
+    assert (LvmLayout.required_per_pv ("raid6", 3, 64, 4) == 0);
+    assert (LvmLayout.required_per_pv ("raid5", 4, 64, 4) == 0);
+    assert (LvmLayout.required_per_pv ("raid1", 2, uint64.MAX, 1) == 0);
+    assert (LvmLayout.required_per_pv ("unknown", 4, 64, 4) == 0);
+}
+
+private void test_lvm_cache_report () {
+    string report = """
+        {"report":[{"lv":[{"vg_uuid":"vg","lv_uuid":"origin","lv_name":"origin","segtype":"cache",
+        "pool_lv":"[pool]","pool_lv_uuid":"pool","cache_mode":"writeback","cache_dirty_blocks":"0","cache_total_blocks":"200",
+        "lv_attr":"Cwi-a-C---","lv_health_status":"","lv_check_needed":""},
+        {"vg_uuid":"vg","lv_uuid":"pool","lv_name":"[pool]","segtype":"cache-pool"}]}]}
+        """;
+    try {
+        var entries = LvmCacheStatus.parse_report (report, "vg");
+        var origin = LvmCacheStatus.find (entries, "origin");
+        assert (origin != null && origin.clean ());
+        assert (LvmCacheStatus.find (entries, origin.pool_name)?.layout == "cache-pool");
+        entries = LvmCacheStatus.parse_report (report.replace ("\"cache_dirty_blocks\":\"0\"", "\"cache_dirty_blocks\":\"2\""), "vg");
+        assert (!entries[0].clean ());
+        entries = LvmCacheStatus.parse_report (report.replace ("\"cache_dirty_blocks\":\"0\"", "\"cache_dirty_blocks\":false"), "vg");
+        assert (!entries[0].clean ());
+        entries = LvmCacheStatus.parse_report (report.replace ("\"lv_health_status\":\"\"", "\"lv_health_status\":\"partial\""), "vg");
+        assert (!entries[0].clean ());
+        entries = LvmCacheStatus.parse_report (report.replace ("\"lv_check_needed\":\"\"", "\"lv_check_needed\":\"check needed\""), "vg");
+        assert (!entries[0].clean ());
+    } catch (Error error) { assert_not_reached (); }
+    try {
+        LvmCacheStatus.parse_report (report, "wrong-vg");
+        assert_not_reached ();
+    } catch (Error error) { assert (error is IOError.INVALID_DATA); }
+}
+
 public static int main (string[] args) {
     Test.init (ref args);
     if (Environment.get_variable ("MAJORIS_CAPACITY_LOOP") != null)
@@ -1440,5 +1535,8 @@ public static int main (string[] args) {
     Test.add_func ("/features/xz-restore-preflight", test_xz_workflow);
     Test.add_func ("/features/raw-image-and-benchmark", test_image_workflows);
     Test.add_func ("/operations/mock-open-device", test_mock_open_device);
+    Test.add_func ("/lvm/structure", test_lvm_structure);
+    Test.add_func ("/lvm/layout-capacity", test_lvm_layout_capacity);
+    Test.add_func ("/lvm/cache-report", test_lvm_cache_report);
     return Test.run ();
 }

@@ -1,7 +1,7 @@
 resources = gnome.compile_resources('majoris-disks-resources',
   '../data/com.majoris.disks.gresource.xml', source_dir: '../data')
 
-storage_model_sources = files('device.vala', 'layout.vala', 'hierarchy.vala', 'safety.vala',
+storage_model_sources = files('device.vala', 'layout.vala', 'hierarchy.vala', 'safety.vala', 'lvm-structure.vala',
   'storage-operation.vala', 'health-monitor.vala', 'disk-benchmark.vala', 'disk-image-copy.vala', 'xz-stream.c', 'nbd-identity.c', 'btrfs-inspect.c', 'virtual-disk.vala', 'virtual-disk-attachment.vala', 'blkid.vapi', 'filesystem-resize.vala', 'kernel-storage-safety.vala', 'mount-restoration.vala', 'restoration-credential.vala')
 luks_ui_sources = files('luks-credential-dialog.vala')
 sources = storage_model_sources + luks_ui_sources + files('main.vala', 'health-preferences.vala', 'benchmark-dialog.vala', 'udisks-service.vala', 'window.vala',
@@ -44,6 +44,14 @@ configure_file(input: '../data/com.majoris.disks.Crypttab.policy.in', output: 'c
   configuration: crypttab_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
 crypttab_inspector = executable('majoris-disks-crypttab-inspector', 'crypttab-inspector.c',
   dependencies: dependency('glib-2.0'), install: true, install_dir: get_option('libexecdir'))
+
+lvm_cache_config = configuration_data()
+lvm_cache_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
+configure_file(input: 'lvm-cache-inspector-config.h.in', output: 'lvm-cache-inspector-config.h', configuration: lvm_cache_config)
+configure_file(input: '../data/com.majoris.disks.LvmCache.policy.in', output: 'com.majoris.disks.LvmCache.policy',
+  configuration: lvm_cache_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
+executable('majoris-disks-lvm-cache-inspector', 'lvm-cache-inspector.c',
+  install: true, install_dir: get_option('libexecdir'))
 
 mount_restoration_config = configuration_data()
 mount_restoration_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))

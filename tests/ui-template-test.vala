@@ -16,6 +16,11 @@ private class DelayedPollFixture : Object, PollFixture {
 }
 
 private async void exercise_lvm_poll (DBusProxy proxy, DelayedPollFixture fixture) throws Error {
+    yield UDisksService.require_lvm_method (proxy, "Poll", new Cancellable ());
+    try {
+        yield UDisksService.require_lvm_method (proxy, "RemoveMissingPhysicalVolumes", new Cancellable ());
+        assert_not_reached ();
+    } catch (Error error) { assert (error is IOError.NOT_SUPPORTED); }
     for (int state = 0; state < 3; state++) {
         fixture.requested = false;
         fixture.published = false;
@@ -168,6 +173,25 @@ private void test_advanced_navigation (Gtk.Application app) {
     backend.changed ();
     assert (advanced.get_selected_row () == null && states.visible_child != overview);
     assert (sidebar.get_selected_row () != null);
+    var missing = new StorageVolumeGroup ("/test/missing") { name = "Missing", uuid = "fixture-vg",
+        missing_pvs_known = true, missing_pv_uuids = { "missing-pv-uuid" } };
+    var volume = new StorageLogicalVolume ("/test/missing/volume") { name = "Volume", uuid = "fixture-lv",
+        group_path = missing.path, lvm_layout = "linear" };
+    backend.snapshot.advanced.insert (missing.path, missing);
+    backend.snapshot.advanced.insert (volume.path, volume);
+    backend.changed ();
+    var detail = (Adw.ActionRow) window.get_template_child (typeof (DisksWindow), "advanced_details");
+    for (int i = 0; ; i++) {
+        var row = advanced.get_row_at_index (i) as VolumeRow;
+        if (row == null) break;
+        if (row.device == missing) {
+            advanced.select_row (row);
+            assert (detail.subtitle.contains ("missing-pv-uuid"));
+        } else if (row.device == volume) {
+            advanced.select_row (row);
+            assert (detail.subtitle.contains ("fixture-lv") && detail.subtitle.contains ("Physical allocation unknown"));
+        }
+    }
     window.destroy ();
 }
 
@@ -225,7 +249,11 @@ public static int main (string[] args) {
         new PartitionMap (), new PartitionSegment (), new DriveView (), window,
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
         new DriveInformationDialog (drive, block), new InformationRow ("Test", "Value", false),
-        new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"), new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new BtrfsBalanceDialog (true), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
+        new LabelDialog (block), new LvmRenameDialog ("old_lv", "/dev/testvg/old_lv"),
+        new LvmRecoveryDialog (true, "fixture", new Gtk.StringList ({ "Replacement PV" })),
+        new LvmCacheDialog ("origin", false, new Gtk.StringList ({ "Cache candidate" })),
+        new LvmLayoutDialog (backend, new StorageVolumeGroup ("/test/group")),
+        new LvmLifecycleDialog ({}, "/"), new StorageRemovalDialog (true), new CreateLogicalVolumeDialog (new StorageVolumeGroup ("/test/group")), new CreateStorageGroupDialog (backend, true), new BtrfsSubvolumesDialog (new BtrfsSubvolumeList (), false), new BtrfsBalanceDialog (true), new OwnershipDialog (block), new PartitionMetadataDialog (block, partition, true),
         new OperationResultDialog (), new StorageRestorationPlanDialog (), new RepairConfirmationDialog (), new DeleteConfirmationDialog (),
         new FormatDiskDialog (), new FormatVolumeDialog (backend, block),
         new CreatePartitionDialog (backend, disk, gap), new ResizeVolumeDialog (backend, block), encrypted_resize,
@@ -241,6 +269,7 @@ public static int main (string[] args) {
         new DriveSettingsDialog (drive), new HealthPreferences (), new BenchmarkDialog (backend, drive), new DiskImageConfirmation (), new BlankDiskImageDialog (), new VirtualImageDialog ()
     };
     string[] resources = {
+        "lvm-recovery-dialog.ui", "lvm-cache-dialog.ui", "lvm-layout-dialog.ui",
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
         "device-row.ui", "volume-row.ui", "information-row.ui", "sidebar-group-heading.ui",
         "drive-information-dialog.ui", "edit-filesystem-dialog.ui", "lvm-rename-dialog.ui", "lvm-lifecycle-dialog.ui", "storage-removal-dialog.ui", "lvm-create-dialog.ui", "create-storage-group-dialog.ui", "btrfs-subvolumes-dialog.ui", "btrfs-balance-dialog.ui", "edit-partition-dialog.ui",
@@ -258,6 +287,10 @@ public static int main (string[] args) {
         catch (Error error) { critical ("Missing resource %s: %s", name, error.message); return 1; }
     }
     assert (instances.length == resources.length);
+    assert (new LvmRenameDialog ("old_vg", "old_vg", true).heading == "Rename Volume Group");
+    assert (new LvmRecoveryDialog (false, "fixture", new Gtk.StringList (null)).heading ==
+        "Remove Missing Physical-Volume Records");
+    assert (new LvmCacheDialog ("origin", true, new Gtk.StringList (null)).heading == "Separate LVM Cache");
     var mount_item = new Variant.string ("original fstab entry");
     var crypt_item = new Variant.string ("original crypttab entry");
     block.mount_configurations = {

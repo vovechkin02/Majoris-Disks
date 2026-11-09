@@ -1,0 +1,25 @@
+<interface>
+  <template class="MajorisDisksLvmLayoutDialog" parent="AdwAlertDialog">
+    <property name="heading">Create Logical Volume with Physical Placement</property>
+    <property name="body">Choose the layout and physical volumes. Deactivate the existing volumes in this group first.</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesPage">
+        <child>
+          <object class="AdwPreferencesGroup">
+            <child><object class="AdwEntryRow" id="volume_entry"><property name="title">Logical volume name</property></object></child>
+            <child><object class="AdwEntryRow" id="size_entry"><property name="title">Logical size in extents</property><property name="input-purpose">digits</property></object></child>
+            <child><object class="AdwComboRow" id="layout_entry"><property name="title">Layout</property></object></child>
+            <child><object class="AdwActionRow" id="allocation"><property name="title">Allocation</property></object></child>
+          </object>
+        </child>
+        <child><object class="AdwPreferencesGroup" id="physical_volumes"><property name="title">Physical Volumes</property></object></child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="create" appearance="suggested">Create</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

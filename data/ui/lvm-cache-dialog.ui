@@ -1,0 +1,17 @@
+<interface>
+  <template class="MajorisDisksLvmCacheDialog" parent="AdwAlertDialog">
+    <property name="extra-child">
+      <object class="AdwComboRow" id="candidate">
+        <property name="title">Empty cache candidate</property>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="attach" appearance="destructive">Convert and Attach</response>
+      <response id="split">Split and Keep Pool</response>
+      <response id="detach" appearance="destructive">Remove Cache Pool</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

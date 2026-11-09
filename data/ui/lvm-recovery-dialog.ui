@@ -1,0 +1,15 @@
+<interface>
+  <template class="MajorisDisksLvmRecoveryDialog" parent="AdwAlertDialog">
+    <property name="extra-child">
+      <object class="AdwComboRow" id="replacement">
+        <property name="title">Replacement physical volume</property>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="apply" appearance="destructive">Apply</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

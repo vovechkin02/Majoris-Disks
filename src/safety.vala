@@ -7,6 +7,10 @@ namespace MajorisDisks {
     }
 
     public class StorageVolumeGroup : StorageDevice {
+        public string uuid = "";
+        public string[] missing_pv_uuids = {};
+        public bool missing_pvs_known;
+        public bool needs_polling;
         public uint64 size;
         public uint64 free_size;
         public uint64 extent_size;
@@ -23,6 +27,18 @@ namespace MajorisDisks {
         public string lvm_type = "";
         public string thin_pool_path = "/";
         public string origin_path = "/";
+        public string lvm_layout = "";
+        public LvmStructure? structure;
+        public double sync_ratio = -1;
+        public Variant? child_configuration;
+        public string block_path = "/";
+
+        public LvmAllocation allocation (StorageSnapshot snapshot) {
+            if (structure?.layout == "error") return LvmAllocation.INCOMPLETE;
+            if (structure == null || structure.layout != lvm_layout || lvm_layout == "")
+                return LvmAllocation.UNKNOWN;
+            return structure.allocation (snapshot, group_path);
+        }
         public StorageLogicalVolume (string path) { base (path); }
     }
 

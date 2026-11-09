@@ -366,6 +366,11 @@ namespace MajorisDisks {
                 group.size = property (item, "VolumeGroup", "Size")?.get_uint64 () ?? 0;
                 group.free_size = property (item, "VolumeGroup", "FreeSize")?.get_uint64 () ?? 0;
                 group.extent_size = property (item, "VolumeGroup", "ExtentSize")?.get_uint64 () ?? 0;
+                group.uuid = LvmStructure.typed (property (item, "VolumeGroup", "UUID"), "s")?.get_string () ?? "";
+                var missing = LvmStructure.typed (property (item, "VolumeGroup", "MissingPhysicalVolumes"), "as");
+                group.missing_pvs_known = missing != null;
+                group.missing_pv_uuids = missing != null ? missing.dup_strv () : new string[0];
+                group.needs_polling = LvmStructure.typed (property (item, "VolumeGroup", "NeedsPolling"), "b")?.get_boolean () ?? false;
                 device = group;
             } else if (has (item, "LogicalVolume")) {
                 var volume = (previous.lookup (path) as StorageLogicalVolume) ?? new StorageLogicalVolume (path);
@@ -379,6 +384,11 @@ namespace MajorisDisks {
                 volume.lvm_type = property (item, "LogicalVolume", "Type")?.get_string () ?? "";
                 volume.thin_pool_path = property (item, "LogicalVolume", "ThinPool")?.get_string () ?? "/";
                 volume.origin_path = property (item, "LogicalVolume", "Origin")?.get_string () ?? "/";
+                volume.lvm_layout = LvmStructure.typed (property (item, "LogicalVolume", "Layout"), "s")?.get_string () ?? "";
+                volume.structure = LvmStructure.parse (property (item, "LogicalVolume", "Structure"));
+                volume.sync_ratio = LvmStructure.typed (property (item, "LogicalVolume", "SyncRatio"), "d")?.get_double () ?? -1;
+                volume.child_configuration = LvmStructure.typed (property (item, "LogicalVolume", "ChildConfiguration"), "a(sa{sv})");
+                volume.block_path = LvmStructure.typed (property (item, "LogicalVolume", "BlockDevice"), "o")?.get_string () ?? "/";
                 device = volume;
             }
             if (device != null) snapshot.advanced.insert (path, device);
@@ -2553,6 +2563,724 @@ namespace MajorisDisks {
                     if (watched.contains (affected.get_child_value (i).get_string ())) return true;
             }
             return false;
+        }
+
+        private StorageBlock[] lvm_members (StorageVolumeGroup group) {
+            StorageBlock[] members = {};
+            foreach (var block in snapshot.blocks.get_values ())
+                if (block.volume_group == group) members += block;
+            return members;
+        }
+
+        private DBusProxy require_lvm_context (StorageBlock anchor, string identity, string uuid,
+            bool recovery, out StorageVolumeGroup group) throws Error {
+            require_volume (anchor, "PhysicalVolume");
+            var current = anchor.volume_group;
+            var proxy = current != null ? manager?.get_interface (current.path, PREFIX + "VolumeGroup") as DBusProxy : null;
+            if (current == null || proxy == null || uuid == "" || current.uuid != uuid ||
+                identity == "" || storage_membership_identity (anchor, false) != identity)
+                throw new IOError.NOT_FOUND ("The volume group or its physical members changed.");
+            if (!current.missing_pvs_known || (!recovery && current.missing_pv_uuids.length != 0))
+                throw new IOError.BUSY ("Physical-volume membership is incomplete or unknown.");
+            if (volume_group_has_backend_job (current, lvm_members (current)))
+                throw new IOError.BUSY ("Another UDisks job is using this volume group.");
+            group = current;
+            return proxy;
+        }
+
+        private void fail_lvm_operation (StorageOperationResult result, string operation, bool dispatched, Error error) {
+            string remote = DBusError.get_remote_error (error) ?? "";
+            bool rejected = remote.has_prefix ("org.freedesktop.UDisks2.Error.NotAuthorized") ||
+                remote == "org.freedesktop.UDisks2.Error.NotSupported" ||
+                remote == "org.freedesktop.DBus.Error.UnknownMethod" ||
+                remote == "org.freedesktop.DBus.Error.InvalidArgs";
+            if (dispatched && !rejected) {
+                result.fail (operation + " requires attention", error);
+                result.status = StorageOperationStatus.NEEDS_ATTENTION;
+            } else {
+                result.fail (operation + (rejected ? " was rejected" : " was not started"), error);
+            }
+        }
+
+        private void require_lvm_job_succeeded (StorageJob job) throws Error {
+            if (job.backend_completed && !job.backend_successful)
+                throw new IOError.FAILED ("The backend job reported a failure: " + job.error_message);
+        }
+
+        private void require_lvm_idle (StorageVolumeGroup group, StorageBlock[] members,
+            StorageLogicalVolume? active_target = null, StorageLogicalVolume? active_candidate = null) throws Error {
+            foreach (var member in members) {
+                var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                if (safety.system_critical || safety.unknown_dependencies || (active_target == null && safety.active_dependents) ||
+                    safety.mounted || !member.available || member.read_only ||
+                    member.mount_configurations.length != 0 || member.encryption_configurations.length != 0)
+                    throw new IOError.BUSY ("Deactivate the logical volumes and close their dependencies. Protected or unresolved storage cannot be modified.");
+            }
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var lv = item as StorageLogicalVolume;
+                if (lv == null || lv.group_path != group.path) continue;
+                if ((lv != active_target && lv != active_candidate && (lv.active || lv.block_path != "/")) ||
+                    lv.child_configuration == null ||
+                    lv.child_configuration.n_children () != 0)
+                    throw new IOError.BUSY ("An active logical volume or persistent configuration prevents this operation.");
+            }
+        }
+
+        internal StorageBlock? lvm_anchor (StorageVolumeGroup group) {
+            foreach (var block in lvm_members (group))
+                if (block.available && !block.ignored && !block.read_only && !block.system_hint) return block;
+            return null;
+        }
+
+        private StorageBlock require_lvm_offline_mapping (StorageLogicalVolume lv) throws Error {
+            var block = snapshot.blocks.lookup (lv.block_path);
+            if (!lv.active || block == null || block.logical_volume != lv || block.read_only ||
+                lv.child_configuration == null || lv.child_configuration.n_children () != 0)
+                throw new IOError.BUSY ("An active, identifiable logical-volume mapping with no persistent configuration is required.");
+            var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+            if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || safety.mounted ||
+                block.swap_active || block.mount_configurations.length != 0 || block.encryption_configurations.length != 0)
+                throw new IOError.BUSY ("Unmount the logical volume and close its dependent devices first.");
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var dependent = item as StorageLogicalVolume;
+                if (dependent != null && (dependent.origin_path == lv.path || dependent.thin_pool_path == lv.path))
+                    throw new IOError.BUSY ("The logical volume has dependent snapshots or thin volumes.");
+            }
+            return block;
+        }
+
+        private bool lvm_cache_plain (StorageLogicalVolume volume) {
+            return volume.uuid != "" && volume.lvm_type == "block" && volume.lvm_layout == "linear" &&
+                volume.origin_path == "/" && volume.thin_pool_path == "/" &&
+                volume.allocation (snapshot) == LvmAllocation.COMPLETE;
+        }
+
+        internal StorageLogicalVolume[] lvm_cache_candidates (StorageLogicalVolume volume) {
+            StorageLogicalVolume[] choices = {};
+            if (!lvm_cache_plain (volume) || !volume.active) return choices;
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var candidate = item as StorageLogicalVolume;
+                if (candidate == null || candidate == volume || candidate.group_path != volume.group_path ||
+                    !lvm_cache_plain (candidate) || !candidate.active) continue;
+                var block = snapshot.blocks.lookup (candidate.block_path);
+                if (block != null && block.usage == "" && block.type_id == "" && block.table == null)
+                    choices += candidate;
+            }
+            return choices;
+        }
+
+        private async void require_zero_cache_candidate (StorageBlock block, StorageJob job, Cancellable token) throws Error {
+            int fd = yield open_block (block, "r", Posix.O_EXCL, token);
+            var input = new UnixInputStream (fd, true);
+            uint64 remaining = block.size;
+            uint8[] buffer = new uint8[1024 * 1024];
+            try {
+                if (remaining == 0 || KernelStorageSafety.block_capacity (block) != remaining)
+                    throw new IOError.INVALID_DATA ("The cache candidate's capacity could not be verified.");
+                while (remaining > 0) {
+                    int count = (int) uint64.min (remaining, buffer.length);
+                    ssize_t bytes = yield input.read_async (buffer[0:count], Priority.DEFAULT, token);
+                    if (bytes <= 0) throw new IOError.INVALID_DATA ("Could not read the entire cache candidate.");
+                    for (int i = 0; i < bytes; i++)
+                        if (buffer[i] != 0) throw new IOError.NOT_SUPPORTED ("The cache candidate contains data.");
+                    remaining -= bytes;
+                    jobs.progress (job, "Checking that the cache candidate is empty", 1.0 - (double) remaining / block.size, true);
+                }
+            } finally {
+                try { input.close (); }
+                catch (Error error) { debug ("Closing the cache inspection descriptor: %s", error.message); }
+            }
+        }
+
+        [CCode (cname = "MAJORIS_LVM_CACHE_INSPECTOR", cheader_filename = "lvm-cache-inspector-config.h")]
+        private extern const string LVM_CACHE_INSPECTOR;
+
+        private async LvmCacheStatus[] read_lvm_cache_report (StorageVolumeGroup group, Cancellable token) throws Error {
+            if (!FileUtils.test (LVM_CACHE_INSPECTOR, FileTest.IS_EXECUTABLE) ||
+                !FileUtils.test ("/usr/sbin/lvs", FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("Install the LVM cache inspector and LVM2 tools to verify cache state.");
+            if (!valid_lvm_name (group.name) || group.uuid == "")
+                throw new IOError.INVALID_ARGUMENT ("The volume group cannot be identified.");
+            string name = group.name;
+            string uuid = group.uuid;
+            string[] argv = { LVM_CACHE_INSPECTOR, name };
+            if (Posix.geteuid () != 0)
+                argv = { "/usr/bin/pkexec", "--disable-internal-agent", LVM_CACHE_INSPECTOR, name };
+            var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_SILENCE);
+            string? output;
+            yield process.communicate_utf8_async (null, token, out output, null);
+            if (!process.get_successful () || output == null)
+                throw new IOError.FAILED ("The cache inspector could not read a verified LVM report.");
+            synchronize ();
+            if (group.uuid != uuid || group.name != name || snapshot.advanced.lookup (group.path) != group)
+                throw new IOError.NOT_FOUND ("The volume group changed during cache inspection.");
+            return LvmCacheStatus.parse_report (output, uuid);
+        }
+
+        internal async LvmCacheStatus inspect_lvm_cache (string group_path, string group_uuid, string name, string uuid) throws Error {
+            synchronize ();
+            var group = snapshot.advanced.lookup (group_path) as StorageVolumeGroup;
+            if (group == null || group.uuid != group_uuid || lvm_volume_by_uuid (group, uuid)?.name != name)
+                throw new IOError.NOT_FOUND ("The cache volume changed.");
+            var report = yield read_lvm_cache_report (group, backend_lifetime);
+            var status = LvmCacheStatus.find (report, name);
+            if (status == null || status.uuid != uuid || lvm_volume_by_uuid (group, uuid)?.name != name)
+                throw new IOError.NOT_FOUND ("The cache identity could not be verified.");
+            return status;
+        }
+
+        internal async void change_lvm_cache (StorageBlock anchor, string identity, string group_uuid,
+            string origin_uuid, string candidate_uuid, bool detach) throws Error {
+            synchronize ();
+            StorageVolumeGroup group;
+            var vg = require_lvm_context (anchor, identity, group_uuid, false, out group);
+            var members = lvm_members (group);
+            var origin = lvm_volume_by_uuid (group, origin_uuid);
+            if (origin == null) throw new IOError.NOT_FOUND ("The origin logical volume changed.");
+            var proxy = manager?.get_interface (origin.path, PREFIX + "LogicalVolume") as DBusProxy;
+            if (proxy == null) throw new IOError.NOT_SUPPORTED ("UDisks does not expose the origin logical volume.");
+            bool attach = candidate_uuid != "";
+            string method = attach ? "CacheAttach" : detach ? "CacheDetach" : "CacheSplit";
+            string title = attach ? "Attach LVM cache" : detach ? "Remove LVM cache" : "Split LVM cache";
+            locks.acquire_members (anchor, members, snapshot.dependencies);
+            var job = jobs.begin (title, anchor, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            var token = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking the origin and cache allocation");
+                yield require_lvm_method (proxy, method, token);
+                var origin_block = require_lvm_offline_mapping (origin);
+                string origin_identity = modification_identity (origin_block);
+                string origin_name = origin.name;
+                var candidate = lvm_volume_by_uuid (group, candidate_uuid);
+                string cache_name;
+                string pool_uuid = "";
+                var options = new Variant ("a{sv}", null);
+                Variant parameters;
+                StorageBlock? candidate_block = null;
+                string candidate_identity = "";
+                var before = yield read_lvm_cache_report (group, token);
+                var original = LvmCacheStatus.find (before, origin_name);
+                if (original == null || original.uuid != origin_uuid || original.layout != origin.lvm_layout)
+                    throw new IOError.BUSY ("The cache origin changed during inspection.");
+                if (attach) {
+                    if (candidate == null || !(candidate in lvm_cache_candidates (origin)))
+                        throw new IOError.NOT_SUPPORTED ("Choose an unused, active linear logical volume in the same group.");
+                    candidate_block = require_lvm_offline_mapping (candidate);
+                    candidate_identity = modification_identity (candidate_block);
+                    cache_name = candidate.name;
+                    var resource = LvmCacheStatus.find (before, cache_name);
+                    if (resource == null || resource.uuid != candidate_uuid || resource.layout != "linear")
+                        throw new IOError.BUSY ("The cache candidate changed during inspection.");
+                    parameters = new Variant ("(s@a{sv})", cache_name, options);
+                } else {
+                    cache_name = original.pool_name;
+                    var pool = LvmCacheStatus.find (before, cache_name);
+                    if (!original.clean () || pool == null || pool.uuid != original.pool_uuid || pool.layout != "cache-pool" ||
+                        pool.health != "" || pool.attributes.length != 10 || pool.attributes[8] != '-' ||
+                        origin.allocation (snapshot) == LvmAllocation.INCOMPLETE)
+                        throw new IOError.NOT_SUPPORTED ("The cache pool is damaged, has pending writes, or its state cannot be verified.");
+                    pool_uuid = pool.uuid;
+                    parameters = new Variant ("(@a{sv})", options);
+                }
+                require_lvm_idle (group, members, origin, candidate);
+                yield KernelStorageSafety.require_idle (origin_block, token);
+                if (candidate_block != null) {
+                    yield KernelStorageSafety.require_idle (candidate_block, token);
+                    yield require_zero_cache_candidate (candidate_block, job, token);
+                }
+                if (!attach) {
+                    var refreshed = yield read_lvm_cache_report (group, token);
+                    var observed = LvmCacheStatus.find (refreshed, origin_name);
+                    var pool = LvmCacheStatus.find (refreshed, cache_name);
+                    if (observed == null || observed.uuid != origin_uuid || observed.pool_name != cache_name ||
+                        observed.pool_uuid != pool_uuid ||
+                        !observed.clean () || pool == null || pool.uuid != pool_uuid || pool.layout != "cache-pool" ||
+                        pool.health != "" || pool.attributes.length != 10 || pool.attributes[8] != '-')
+                        throw new IOError.BUSY ("The cache relationship or pending-write state changed.");
+                }
+                synchronize ();
+                if (require_lvm_context (anchor, identity, group_uuid, false, out group) != vg ||
+                    lvm_volume_by_uuid (group, origin_uuid) != origin || origin.name != origin_name ||
+                    manager?.get_interface (origin.path, PREFIX + "LogicalVolume") != proxy ||
+                    require_lvm_offline_mapping (origin) != origin_block ||
+                    modification_identity (origin_block) != origin_identity)
+                    throw new IOError.BUSY ("The cache origin or volume group changed.");
+                require_lvm_idle (group, members, origin, candidate);
+                if (attach) {
+                    if (candidate == null || candidate_block == null || candidate.name != cache_name ||
+                        lvm_volume_by_uuid (group, candidate_uuid) != candidate ||
+                        !(candidate in lvm_cache_candidates (origin)) || require_lvm_offline_mapping (candidate) != candidate_block ||
+                        modification_identity (candidate_block) != candidate_identity)
+                        throw new IOError.BUSY ("The cache candidate changed.");
+                } else if (origin.lvm_layout != "cache" || origin.allocation (snapshot) == LvmAllocation.INCOMPLETE) {
+                    throw new IOError.BUSY ("The cache relationship changed.");
+                }
+                uint64 size = origin_block.size;
+                string content_uuid = origin_block.uuid;
+                string content_type = origin_block.type_id;
+                jobs.phase (job, StorageJobState.RUNNING, attach ? "Converting the empty cache candidate" : "Waiting for LVM to flush and separate the cache");
+                jobs.expect_backend (job, attach ? "lvm-lv-make-cache" : "lvm-lv-split-cache", origin.path);
+                dispatched = true;
+                var reply = yield call_tracked_method (job, proxy, method, parameters, token);
+                if (!reply.is_of_type (new VariantType ("()")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid cache reply.");
+                for (int i = 0; i < 100; i++) {
+                    if (i % 10 == 0) yield poll_volume_group (vg, token);
+                    yield settle_delay (token);
+                    synchronize ();
+                    var current = lvm_volume_by_uuid (group, origin_uuid);
+                    if (group.uuid != group_uuid || current == null || current.name != origin_name ||
+                        current.lvm_layout != (attach ? "cache" : "linear") ||
+                        current.allocation (snapshot) == LvmAllocation.INCOMPLETE ||
+                        volume_group_has_backend_job (group, members)) continue;
+                    var mapping = snapshot.blocks.lookup (current.block_path);
+                    if (mapping == null || mapping.logical_volume != current || mapping.size != size ||
+                        mapping.uuid != content_uuid || mapping.type_id != content_type) continue;
+                    var report = yield read_lvm_cache_report (group, token);
+                    var observed = LvmCacheStatus.find (report, origin_name);
+                    var pool = LvmCacheStatus.find (report, cache_name);
+                    if (observed == null || observed.uuid != origin_uuid || observed.layout != current.lvm_layout) continue;
+                    if (attach) {
+                        if (observed.pool_name != cache_name || pool == null || pool.uuid != observed.pool_uuid ||
+                            pool.layout != "cache-pool") continue;
+                    } else {
+                        if (observed.pool_name != "" ||
+                            (detach ? pool != null : pool == null || pool.uuid != pool_uuid || pool.layout != "cache-pool")) continue;
+                    }
+                    require_lvm_job_succeeded (job);
+                    result.successful = true;
+                    result.summary = attach ? "LVM cache relationship verified" : "LVM cache separated and origin mapping verified";
+                    return;
+                }
+                throw new IOError.TIMED_OUT ("The backend did not publish enough information to verify the cache operation. Reassess the volume before further changes.");
+            } catch (Error error) {
+                fail_lvm_operation (result, "Cache operation", dispatched, error);
+                throw error;
+            } finally {
+                jobs.finish (job, result);
+                locks.release (anchor);
+            }
+        }
+
+        internal async void refresh_lvm_assessment (string path, string uuid) throws Error {
+            synchronize ();
+            var group = snapshot.advanced.lookup (path) as StorageVolumeGroup;
+            var proxy = manager?.get_interface (path, PREFIX + "VolumeGroup") as DBusProxy;
+            if (group == null || proxy == null || uuid == "" || group.uuid != uuid)
+                throw new IOError.NOT_FOUND ("The selected volume group changed.");
+            yield poll_volume_group (proxy, backend_lifetime);
+            yield settle_delay (backend_lifetime);
+            synchronize ();
+            changed ();
+        }
+
+        internal uint64 lvm_pv_free (StorageBlock block) {
+            var pv = manager?.get_interface (block.path, PREFIX + "PhysicalVolume") as DBusProxy;
+            return LvmStructure.typed (pv?.get_cached_property ("FreeSize"), "t")?.get_uint64 () ?? 0;
+        }
+
+        internal string lvm_pv_domain (StorageBlock block) {
+            foreach (var device in snapshot.dependencies.ancestors (block)) {
+                var parent = device as StorageBlock;
+                if (parent?.loop != null && parent.loop.backing_file != "")
+                    return "loop:" + parent.loop.backing_file;
+            }
+            return block.drive_path != "/" ? "drive:" + block.drive_path : "";
+        }
+
+        internal StorageBlock[] lvm_placement_candidates (StorageVolumeGroup group) {
+            StorageBlock[] result = {};
+            foreach (var member in lvm_members (group)) {
+                if (member.available && !member.read_only && !member.system_hint && member.uuid != "" &&
+                    member.number != 0 && lvm_pv_domain (member) != "" && lvm_pv_free (member) > 0)
+                    result += member;
+            }
+            return result;
+        }
+
+        internal async string[] available_lvm_layouts (string path, string uuid) throws Error {
+            var group = snapshot.advanced.lookup (path) as StorageVolumeGroup;
+            var proxy = manager?.get_interface (path, PREFIX + "VolumeGroup") as DBusProxy;
+            if (group == null || group.uuid != uuid || proxy == null)
+                throw new IOError.NOT_FOUND ("The volume group changed.");
+            var token = backend_lifetime;
+            yield require_lvm_method (proxy, "CreatePlainVolumeWithLayout", token);
+            if (!FileUtils.test ("/usr/sbin/lvm", FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("The installed LVM2 layout capabilities are unavailable.");
+            var launcher = new SubprocessLauncher (SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_SILENCE);
+            launcher.setenv ("LVM_SYSTEM_DIR", "", true);
+            launcher.setenv ("LC_ALL", "C", true);
+            var process = launcher.spawnv ({ "/usr/sbin/lvm", "segtypes" });
+            string? output;
+            yield process.communicate_utf8_async (null, token, out output, null);
+            if (!process.get_successful () || output == null)
+                throw new IOError.NOT_SUPPORTED ("LVM2 did not report its available layouts.");
+            string[] layouts = {};
+            foreach (var entry in output.split ("\n")) {
+                string layout = entry.strip ();
+                if (layout != "") layouts += layout;
+            }
+            return layouts;
+        }
+
+        private void require_lvm_placement (StorageVolumeGroup group, string name, uint64 size,
+            string layout, string[] paths) throws Error {
+            if (!valid_lvm_name (name) || name == "snapshot" || name == "pvmove")
+                throw new IOError.INVALID_ARGUMENT ("Enter a valid logical-volume name.");
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var lv = item as StorageLogicalVolume;
+                if (lv != null && lv.group_path == group.path && lv.name == name)
+                    throw new IOError.EXISTS ("A logical volume in this group already has this name.");
+            }
+            uint64 per_pv = LvmLayout.required_per_pv (layout, paths.length, size, group.extent_size);
+            if (per_pv == 0)
+                throw new IOError.INVALID_ARGUMENT ("The physical-volume count or extent alignment is invalid for this layout.");
+            if (per_pv > group.free_size / paths.length)
+                throw new IOError.NO_SPACE ("The group has too few free extents for this layout.");
+            string[] domains = {};
+            var candidates = lvm_placement_candidates (group);
+            foreach (var path in paths) {
+                var pv = snapshot.blocks.lookup (path);
+                if (pv == null || !(pv in candidates))
+                    throw new IOError.NOT_FOUND ("A selected physical volume is unavailable.");
+                string domain = lvm_pv_domain (pv);
+                if (domain == "" || domain in domains)
+                    throw new IOError.INVALID_ARGUMENT ("Select distinct physical devices for the layout.");
+                domains += domain;
+                if (lvm_pv_free (pv) < per_pv)
+                    throw new IOError.NO_SPACE ("A selected physical volume has too few free extents.");
+            }
+        }
+
+        internal async void create_lvm_layout (StorageBlock anchor, string identity, string uuid, string name,
+            uint64 size, string layout, string[] paths) throws Error {
+            synchronize ();
+            StorageVolumeGroup group;
+            var proxy = require_lvm_context (anchor, identity, uuid, false, out group);
+            var members = lvm_members (group);
+            locks.acquire_members (anchor, members, snapshot.dependencies);
+            var job = jobs.begin ("Create logical volume with placement", anchor, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            var token = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking physical placement and free extents");
+                var supported = yield available_lvm_layouts (group.path, group.uuid);
+                if (!(layout in supported)) throw new IOError.NOT_SUPPORTED ("The installed LVM2 backend does not advertise this layout.");
+                require_lvm_idle (group, members);
+                foreach (var member in members) yield KernelStorageSafety.require_idle (member, token);
+                yield poll_volume_group (proxy, token);
+                yield settle_delay (token);
+                synchronize ();
+                if (require_lvm_context (anchor, identity, uuid, false, out group) != proxy)
+                    throw new IOError.NOT_FOUND ("The volume-group object changed.");
+                require_lvm_idle (group, members);
+                require_lvm_placement (group, name, size, layout, paths);
+                jobs.phase (job, StorageJobState.RUNNING, "Allocating the requested layout");
+                jobs.expect_backend (job, "lvm-vg-create-volume", group.path);
+                dispatched = true;
+                var reply = yield call_tracked_method (job, proxy, "CreatePlainVolumeWithLayout",
+                    new Variant ("(sts@ao@a{sv})", name, size, layout, new Variant.objv (paths),
+                        new Variant ("a{sv}", null)), token);
+                if (!reply.is_of_type (new VariantType ("(o)")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid logical-volume path.");
+                string path = reply.get_child_value (0).get_string ();
+                string created_uuid = "";
+                bool redundant = layout != "linear" && layout != "raid0";
+                double last_progress = -1;
+                int64 deadline = get_monotonic_time () + (redundant ? 180 : 10) * TimeSpan.SECOND;
+                for (int i = 0; get_monotonic_time () < deadline; i++) {
+                    if (i % 10 == 0) yield poll_volume_group (proxy, token);
+                    yield settle_delay (token);
+                    synchronize ();
+                    var created = snapshot.advanced.lookup (path) as StorageLogicalVolume;
+                    if (created == null || created.group_path != group.path || group.uuid != uuid ||
+                        created.uuid == "" || created.name != name) continue;
+                    if (created_uuid != "" && created_uuid != created.uuid)
+                        throw new IOError.NOT_FOUND ("The created logical volume changed identity.");
+                    created_uuid = created.uuid;
+                    if (redundant && created.sync_ratio > last_progress && created.sync_ratio <= 1) {
+                        last_progress = created.sync_ratio;
+                        deadline = get_monotonic_time () + 180 * TimeSpan.SECOND;
+                        jobs.progress (job, "Waiting for initial synchronization", created.sync_ratio,
+                            created.sync_ratio >= 0 && created.sync_ratio <= 1);
+                    }
+                    if (created.size != size || created.lvm_layout != layout ||
+                        created.allocation (snapshot) != LvmAllocation.COMPLETE ||
+                        created.structure?.verifies_placement (paths) != true ||
+                        (redundant && created.sync_ratio != 1) || volume_group_has_backend_job (group, members)) continue;
+                    require_lvm_job_succeeded (job);
+                    result.successful = true;
+                    result.summary = "Logical-volume layout and physical placement verified";
+                    return;
+                }
+                throw new IOError.TIMED_OUT ("The backend did not confirm the requested layout, placement and synchronization.");
+            } catch (Error error) {
+                fail_lvm_operation (result, "Layout creation", dispatched, error);
+                throw error;
+            } finally {
+                jobs.finish (job, result);
+                locks.release (anchor);
+            }
+        }
+
+        internal StorageBlock[] lvm_repair_candidates (StorageLogicalVolume lv) {
+            var group = snapshot.advanced.lookup (lv.group_path) as StorageVolumeGroup;
+            var tree = lv.structure;
+            if (group == null || !group.missing_pvs_known || group.missing_pv_uuids.length == 0 ||
+                tree == null || lv.lvm_layout != "raid1" || lv.uuid == "" || !lv.active ||
+                lv.sync_ratio != 1 || lv.origin_path != "/" || lv.thin_pool_path != "/") return {};
+            uint64 needed = tree.raid1_replacement_bytes (snapshot, group.path);
+            if (needed == 0 || group.extent_size == 0 || needed % group.extent_size != 0 ||
+                tree.raid1_surviving_pv (snapshot, group.path) == "/") return {};
+            StorageBlock[] eligible = {};
+            foreach (var member in lvm_members (group)) {
+                if (!member.available || member.read_only || member.system_hint || member.uuid == "" ||
+                    member.number == 0 || tree.uses_pv (member.path) || lvm_pv_free (member) < needed) continue;
+                string domain = lvm_pv_domain (member);
+                bool shared = domain == "";
+                foreach (var existing in lvm_members (group))
+                    if (tree.uses_pv (existing.path) && (lvm_pv_domain (existing) == "" ||
+                        lvm_pv_domain (existing) == domain || member.number == existing.number)) shared = true;
+                if (!shared) eligible += member;
+            }
+            return eligible;
+        }
+
+        private StorageLogicalVolume? lvm_volume_by_uuid (StorageVolumeGroup group, string uuid) {
+            if (uuid == "") return null;
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var lv = item as StorageLogicalVolume;
+                if (lv != null && lv.group_path == group.path && lv.uuid == uuid) return lv;
+            }
+            return null;
+        }
+
+        private string[] lvm_cleanup_volumes (StorageVolumeGroup group) throws Error {
+            string[] volumes = {};
+            foreach (var item in snapshot.advanced.get_values ()) {
+                var lv = item as StorageLogicalVolume;
+                if (lv == null || lv.group_path != group.path) continue;
+                if (lv.uuid == "" || lv.allocation (snapshot) != LvmAllocation.COMPLETE)
+                    throw new IOError.NOT_SUPPORTED ("A logical volume has incomplete or unresolved allocation. Reconnect the missing devices or assess repair first.");
+                volumes += lv.uuid;
+            }
+            return volumes;
+        }
+
+        internal async void recover_lvm (StorageBlock anchor, string identity, string uuid,
+            string missing, string repair_uuid, string replacement_path) throws Error {
+            synchronize ();
+            StorageVolumeGroup group;
+            var vg = require_lvm_context (anchor, identity, uuid, true, out group);
+            var members = lvm_members (group);
+            bool repairing = repair_uuid != "";
+            string method = repairing ? "Repair" : "RemoveMissingPhysicalVolumes";
+            string title = repairing ? "Repair LVM RAID 1" : "Remove missing physical-volume records";
+            locks.acquire_members (anchor, members, snapshot.dependencies);
+            var job = jobs.begin (title, anchor, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            var token = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking allocation, identities and dependencies");
+                var lv = lvm_volume_by_uuid (group, repair_uuid);
+                var proxy = repairing && lv != null ? manager?.get_interface (lv.path, PREFIX + "LogicalVolume") as DBusProxy : vg;
+                if (proxy == null || (repairing && lv == null))
+                    throw new IOError.NOT_FOUND ("The logical volume changed.");
+                yield require_lvm_method (proxy, method, token);
+                yield poll_volume_group (vg, token);
+                yield settle_delay (token);
+                synchronize ();
+                require_lvm_idle (group, members, lv);
+                var active_block = lv != null ? snapshot.blocks.lookup (lv.block_path) : null;
+                string block_identity = active_block != null ? modification_identity (active_block) : "";
+                if (repairing) {
+                    if (active_block == null || active_block.logical_volume != lv || active_block.read_only)
+                        throw new IOError.NOT_SUPPORTED ("The active RAID mapping could not be identified.");
+                    var safety = StorageSafetyService.assess (active_block, snapshot.dependencies);
+                    if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || safety.mounted ||
+                        active_block.mount_configurations.length != 0 ||
+                        active_block.encryption_configurations.length != 0 || active_block.swap_active)
+                        throw new IOError.BUSY ("Unmount the RAID volume and close its dependent devices first.");
+                    yield KernelStorageSafety.require_idle (active_block, token);
+                    var replacement = snapshot.blocks.lookup (replacement_path);
+                    if (replacement == null || !(replacement in lvm_repair_candidates (lv)))
+                        throw new IOError.BUSY ("The replacement volume is unavailable or has insufficient space.");
+                    yield KernelStorageSafety.require_idle (replacement, token);
+                } else {
+                    foreach (var member in members) yield KernelStorageSafety.require_idle (member, token);
+                }
+                synchronize ();
+                if (require_lvm_context (anchor, identity, uuid, true, out group) != vg ||
+                    group.missing_pv_uuids.length == 0 || string.joinv ("\n", group.missing_pv_uuids) != missing)
+                    throw new IOError.BUSY ("The missing physical-volume list changed after confirmation.");
+                require_lvm_idle (group, members, lv);
+                string[] volumes = {};
+                uint64 size = 0;
+                string survivor = "/";
+                var options = new Variant ("a{sv}", null);
+                Variant parameters;
+                if (repairing) {
+                    var replacement = snapshot.blocks.lookup (replacement_path);
+                    if (lv == null || active_block == null || modification_identity (active_block) != block_identity ||
+                        require_lvm_offline_mapping (lv) != active_block || lvm_volume_by_uuid (group, repair_uuid) != lv ||
+                        manager?.get_interface (lv.path, PREFIX + "LogicalVolume") != proxy ||
+                        !(replacement in lvm_repair_candidates (lv)))
+                        throw new IOError.BUSY ("The RAID layout or replacement capacity changed.");
+                    size = lv.size;
+                    survivor = lv.structure.raid1_surviving_pv (snapshot, group.path);
+                    parameters = new Variant ("(@ao@a{sv})", new Variant.objv ({ replacement_path }), options);
+                } else {
+                    volumes = lvm_cleanup_volumes (group);
+                    parameters = new Variant ("(@a{sv})", options);
+                }
+                jobs.phase (job, StorageJobState.RUNNING, title);
+                jobs.expect_backend (job, repairing ? "lvm-lvol-repair" : "lvm-vg-rem-device",
+                    repairing ? lv.path : group.path);
+                dispatched = true;
+                var reply = yield call_tracked_method (job, proxy, method, parameters, token);
+                if (!reply.is_of_type (new VariantType ("()")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid recovery reply.");
+                double last_progress = -1;
+                int64 deadline = get_monotonic_time () + (repairing ? 180 : 10) * TimeSpan.SECOND;
+                for (int i = 0; get_monotonic_time () < deadline; i++) {
+                    if (i % 10 == 0) yield poll_volume_group (vg, token);
+                    yield settle_delay (token);
+                    synchronize ();
+                    if (group.uuid != uuid || snapshot.advanced.lookup (group.path) != group)
+                        throw new IOError.NOT_FOUND ("The volume group disappeared during verification.");
+                    if (repairing) {
+                        var repaired = lvm_volume_by_uuid (group, repair_uuid);
+                        if (repaired == null) continue;
+                        double progress = repaired.sync_ratio;
+                        if (progress > last_progress && progress <= 1) {
+                            last_progress = progress;
+                            deadline = get_monotonic_time () + 180 * TimeSpan.SECOND;
+                            jobs.progress (job, "Waiting for RAID reconstruction", progress, progress >= 0);
+                        }
+                        if (repaired.size != size || repaired.lvm_layout != "raid1" || progress != 1 ||
+                            repaired.allocation (snapshot) != LvmAllocation.COMPLETE ||
+                            repaired.structure?.verifies_placement ({ survivor, replacement_path }) != true) continue;
+                    } else {
+                        if (!group.missing_pvs_known || group.missing_pv_uuids.length != 0) continue;
+                        foreach (var id in volumes) {
+                            var remaining = lvm_volume_by_uuid (group, id);
+                            if (remaining == null || remaining.allocation (snapshot) != LvmAllocation.COMPLETE)
+                                throw new IOError.FAILED ("A previously verified logical volume is absent or its allocation is unresolved.");
+                        }
+                    }
+                    if (volume_group_has_backend_job (group, members)) continue;
+                    require_lvm_job_succeeded (job);
+                    result.successful = true;
+                    result.summary = repairing ? "RAID reconstruction and replacement allocation verified" :
+                        "Missing records removed and remaining allocations verified";
+                    return;
+                }
+                throw new IOError.TIMED_OUT ("UDisks has yet to confirm the requested recovery outcome. Reassess the group before making further changes.");
+            } catch (Error error) {
+                fail_lvm_operation (result, "Recovery", dispatched, error);
+                throw error;
+            } finally {
+                jobs.finish (job, result);
+                locks.release (anchor);
+            }
+        }
+
+        internal static async void require_lvm_method (DBusProxy proxy, string method, Cancellable token) throws Error {
+            var reply = yield proxy.get_connection ().call (proxy.get_name_owner (), proxy.get_object_path (),
+                "org.freedesktop.DBus.Introspectable", "Introspect", null, new VariantType ("(s)"),
+                DBusCallFlags.NONE, 5000, token);
+            if (!has_luks_method (reply.get_child_value (0).get_string (), proxy.get_interface_name (), method))
+                throw new IOError.NOT_SUPPORTED ("The installed UDisks LVM2 module does not advertise " + method + ".");
+        }
+
+        private void require_lvm_rename_name (StorageVolumeGroup group, string name) throws Error {
+            if (!valid_lvm_name (name) || name == group.name)
+                throw new IOError.INVALID_ARGUMENT ("Enter a different valid LVM volume-group name.");
+            foreach (var item in snapshot.advanced.get_values ())
+                if (item is StorageVolumeGroup && item.name == name)
+                    throw new IOError.EXISTS ("A volume group already has this name.");
+            string mapper = group.name.replace ("-", "--") + "-";
+            foreach (string path in new string[] { "/proc/cmdline", "/etc/fstab", "/etc/crypttab" }) {
+                string contents;
+                try {
+                    FileUtils.get_contents (path, out contents);
+                } catch (FileError error) {
+                    if (path != "/proc/cmdline" && error is FileError.NOENT) continue;
+                    throw new IOError.PERMISSION_DENIED ("Cannot inspect persistent storage references in " + path + ".");
+                }
+                if (contents.contains ("/dev/" + group.name + "/") || contents.contains ("/dev/mapper/" + mapper) ||
+                    contents.contains ("rd.lvm.lv=" + group.name + "/") || contents.contains ("rd.lvm.vg=" + group.name))
+                    throw new IOError.BUSY ("A persistent reference to this volume group was found in " + path + ".");
+            }
+        }
+
+        internal async void rename_volume_group (StorageBlock anchor, string identity, string uuid, string name) throws Error {
+            synchronize ();
+            StorageVolumeGroup group;
+            var proxy = require_lvm_context (anchor, identity, uuid, false, out group);
+            var members = lvm_members (group);
+            locks.acquire_members (anchor, members, snapshot.dependencies);
+            var job = jobs.begin ("Rename volume group", anchor, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            var token = backend_lifetime;
+            bool dispatched = false;
+            try {
+                jobs.phase (job, StorageJobState.PREPARING, "Checking persistent references and inactive storage");
+                yield require_lvm_method (proxy, "Rename", token);
+                require_lvm_idle (group, members);
+                foreach (var member in members) yield KernelStorageSafety.require_idle (member, token);
+                synchronize ();
+                if (require_lvm_context (anchor, identity, uuid, false, out group) != proxy)
+                    throw new IOError.NOT_FOUND ("The volume-group object changed.");
+                require_lvm_idle (group, members);
+                require_lvm_rename_name (group, name);
+                string[] volumes = {};
+                foreach (var item in snapshot.advanced.get_values ()) {
+                    var lv = item as StorageLogicalVolume;
+                    if (lv != null && lv.group_path == group.path) {
+                        if (lv.uuid == "") throw new IOError.NOT_SUPPORTED ("A logical volume has no stable identity.");
+                        volumes += lv.uuid;
+                    }
+                }
+                jobs.phase (job, StorageJobState.RUNNING, "Renaming the volume group");
+                jobs.expect_backend (job, "lvm-vg-rename", group.path);
+                dispatched = true;
+                var reply = yield call_tracked_method (job, proxy, "Rename",
+                    new Variant ("(s@a{sv})", name, new Variant ("a{sv}", null)), token);
+                if (!reply.is_of_type (new VariantType ("(o)")))
+                    throw new IOError.INVALID_DATA ("UDisks returned an invalid volume-group path.");
+                string path = reply.get_child_value (0).get_string ();
+                for (int i = 0; i < 100; i++) {
+                    synchronize ();
+                    var changed = snapshot.advanced.lookup (path) as StorageVolumeGroup;
+                    if (changed != null && changed.uuid == uuid && changed.name == name &&
+                        anchor.volume_group == changed && storage_membership_identity (anchor, false) == identity) {
+                        int found = 0;
+                        foreach (var item in snapshot.advanced.get_values ()) {
+                            var lv = item as StorageLogicalVolume;
+                            if (lv != null && lv.group_path == path && lv.uuid in volumes) found++;
+                        }
+                        if (found == volumes.length && !volume_group_has_backend_job (changed, members)) {
+                            require_lvm_job_succeeded (job);
+                            outcome.successful = true;
+                            outcome.summary = "Volume group renamed and membership verified";
+                            return;
+                        }
+                    }
+                    yield settle_delay (token);
+                }
+                throw new IOError.TIMED_OUT ("UDisks did not confirm the renamed volume group and its members.");
+            } catch (Error error) {
+                fail_lvm_operation (outcome, "Volume-group rename", dispatched, error);
+                throw error;
+            } finally {
+                jobs.finish (job, outcome);
+                locks.release (anchor);
+            }
         }
 
         internal static async void poll_volume_group (DBusProxy proxy, Cancellable token) throws Error {

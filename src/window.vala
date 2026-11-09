@@ -11,6 +11,14 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow advanced_manage;
         [GtkChild] private unowned Adw.ActionRow advanced_maintenance;
         [GtkChild] private unowned Adw.ActionRow advanced_recovery;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_rename;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_refresh;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_cleanup;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_repair;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_cache;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_uncache;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_cache_status;
+        [GtkChild] private unowned Adw.ActionRow advanced_lvm_layout;
         private string selected_storage = "";
         private StorageBlock? advanced_context;
         private StorageDevice? advanced_device;
@@ -81,6 +89,44 @@ namespace MajorisDisks {
                 if (advanced_device is StorageRaid) confirm_degraded_raid (context);
                 else manage_btrfs_balance (context);
             });
+            advanced_lvm_rename.activated.connect (() => {
+                var group = advanced_device as StorageVolumeGroup;
+                var anchor = advanced_context;
+                if (group == null || anchor == null) return;
+                string identity = backend.storage_membership_identity (anchor, false);
+                string uuid = group.uuid;
+                var dialog = new LvmRenameDialog (group.name, group.name, true);
+                dialog.response.connect ((response) => {
+                    if (response != "apply") return;
+                    backend.rename_volume_group.begin (anchor, identity, uuid, dialog.new_name, (obj, result) => {
+                        try {
+                            backend.rename_volume_group.end (result);
+                            update_devices ();
+                            notifications.add_toast (new Adw.Toast ("Volume group renamed"));
+                        } catch (Error error) {
+                            show_check_message ("Could not confirm the volume-group rename", operation_error (error));
+                        }
+                    });
+                });
+                dialog.present (this);
+            });
+            advanced_lvm_refresh.activated.connect (() => {
+                var group = selected_lvm_group ();
+                if (group == null) return;
+                backend.refresh_lvm_assessment.begin (group.path, group.uuid, (obj, result) => {
+                    try { backend.refresh_lvm_assessment.end (result); }
+                    catch (Error error) { show_check_message ("Could not refresh LVM", operation_error (error)); }
+                });
+            });
+            advanced_lvm_cleanup.activated.connect (() => confirm_lvm_recovery (null));
+            advanced_lvm_repair.activated.connect (() => {
+                var lv = advanced_device as StorageLogicalVolume;
+                if (lv != null) confirm_lvm_recovery (lv);
+            });
+            advanced_lvm_cache.activated.connect (() => confirm_lvm_cache (false));
+            advanced_lvm_uncache.activated.connect (() => confirm_lvm_cache (true));
+            advanced_lvm_cache_status.activated.connect (inspect_lvm_cache);
+            advanced_lvm_layout.activated.connect (create_lvm_layout);
             var create_vg = new SimpleAction ("create-vg", null);
             var create_raid = new SimpleAction ("create-raid", null);
             add_action (create_vg);
@@ -1668,14 +1714,17 @@ namespace MajorisDisks {
         }
 
         private static string storage_key (StorageDevice device) {
+            var group = device as StorageVolumeGroup;
+            if (group != null && group.uuid != "") return "lvm-vg:" + group.uuid;
             var block = device as StorageBlock;
-            return block != null && block.uuid != "" ? "btrfs:" + block.uuid : device.path;
+            return block != null && block.type_id == "btrfs" && block.uuid != "" ? "btrfs:" + block.uuid : device.path;
         }
 
         private VolumeRow? update_advanced_rows () {
             var objects = new HashTable<string, StorageDevice> (str_hash, str_equal);
             foreach (var item in backend.snapshot.advanced.get_values ())
-                if (item is StorageVolumeGroup || item is StorageRaid) objects.insert (storage_key (item), item);
+                if (item is StorageVolumeGroup || item is StorageRaid || item is StorageLogicalVolume)
+                    objects.insert (storage_key (item), item);
             foreach (var block in backend.snapshot.blocks.get_values ()) {
                 if (block.ignored || block.type_id != "btrfs") continue;
                 string key = storage_key (block);
@@ -1701,6 +1750,7 @@ namespace MajorisDisks {
                     advanced_sidebar.append (row);
                 } else row.update (item);
                 if (item is StorageVolumeGroup) row.subtitle = "LVM Volume Group";
+                else if (item is StorageLogicalVolume) row.subtitle = "LVM Logical Volume";
                 else if (item is StorageRaid) row.subtitle = "RAID Array";
                 else row.subtitle = "Btrfs Filesystem";
                 if (storage_key (item) == selected_storage) chosen = row;
@@ -1737,10 +1787,15 @@ namespace MajorisDisks {
             advanced_context = null;
             advanced_summary.title = item.name != "" ? item.name : "Storage Object";
             advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible = false;
+            advanced_lvm_rename.visible = advanced_lvm_refresh.visible = advanced_lvm_cleanup.visible =
+                advanced_lvm_repair.visible = advanced_lvm_cache.visible = advanced_lvm_uncache.visible = false;
+            advanced_lvm_layout.visible = false;
+            advanced_lvm_cache_status.visible = false;
             foreach (var row in member_rows) advanced_members.remove (row);
             member_rows = {};
 
             var group = item as StorageVolumeGroup;
+            var logical = item as StorageLogicalVolume;
             var array = item as StorageRaid;
             var filesystem = item as StorageBlock;
             var blocks = backend.snapshot.blocks.get_values ();
@@ -1748,6 +1803,7 @@ namespace MajorisDisks {
             foreach (var block in blocks) {
                 bool member = group != null ? block.volume_group == group :
                     array != null ? block.raid_membership == array || block.raid == array :
+                    logical != null ? block.logical_volume == logical :
                     block.type_id == "btrfs" && storage_key (block) == storage_key (item);
                 if (!member) continue;
                 add_advanced_member (block);
@@ -1764,6 +1820,12 @@ namespace MajorisDisks {
             if (group != null) {
                 advanced_details.title = "LVM Volume Group";
                 advanced_details.subtitle = "%s available of %s".printf (format_size (group.free_size), format_size (group.size));
+                advanced_details.subtitle += "\nUUID: " + (group.uuid != "" ? group.uuid : "Unavailable");
+                if (group.extent_size > 0)
+                    advanced_details.subtitle += "\n%llu free extents".printf (group.free_size / group.extent_size);
+                if (!group.missing_pvs_known) advanced_details.subtitle += "\nMissing PV information unavailable";
+                else if (group.missing_pv_uuids.length != 0)
+                    advanced_details.subtitle += "\nMissing physical volumes:\n" + string.joinv ("\n", group.missing_pv_uuids);
                 var volumes = backend.snapshot.advanced.get_values ();
                 volumes.sort ((a, b) => strcmp (a.path, b.path));
                 foreach (var candidate in volumes) {
@@ -1772,6 +1834,40 @@ namespace MajorisDisks {
                 }
                 advanced_manage.title = "Manage Logical Volumes";
                 advanced_manage.visible = advanced_context != null;
+                advanced_lvm_rename.visible = advanced_context != null && group.uuid != "" &&
+                    group.missing_pvs_known && group.missing_pv_uuids.length == 0;
+                advanced_lvm_refresh.visible = group.uuid != "";
+                advanced_lvm_cleanup.visible = advanced_context != null && group.missing_pv_uuids.length != 0;
+                advanced_lvm_layout.visible = advanced_lvm_rename.visible && backend.lvm_placement_candidates (group).length > 0;
+            } else if (logical != null) {
+                advanced_details.title = "LVM Logical Volume";
+                advanced_details.subtitle = describe_lvm_volume (logical) + "\nUUID: " +
+                    (logical.uuid != "" ? logical.uuid : "Unavailable");
+                var owning_group = selected_lvm_group ();
+                advanced_lvm_refresh.visible = owning_group != null && owning_group.uuid != "";
+                advanced_lvm_repair.visible = backend.lvm_repair_candidates (logical).length > 0;
+                bool intact = owning_group != null && owning_group.missing_pvs_known && owning_group.missing_pv_uuids.length == 0;
+                var cache = logical.structure?.cache_pool ();
+                if (cache != null)
+                    advanced_details.subtitle += "\nCache pool: %s · %s".printf (cache.name, format_size (cache.size));
+                advanced_lvm_cache_status.visible = logical.lvm_layout == "cache" ||
+                    logical.lvm_layout == "cache-pool" || logical.lvm_layout == "writecache";
+                advanced_lvm_cache.visible = intact && backend.lvm_cache_candidates (logical).length > 0;
+                advanced_lvm_uncache.visible = intact && logical.lvm_layout == "cache" && logical.active &&
+                    logical.allocation (backend.snapshot) != LvmAllocation.INCOMPLETE;
+                if (logical.structure != null) {
+                    foreach (var block in blocks)
+                        if (logical.structure.uses_pv (block.path)) add_advanced_member (block);
+                    foreach (var component in logical.structure.data) add_lvm_component (component, "Data");
+                    foreach (var component in logical.structure.metadata) add_lvm_component (component, "Metadata");
+                }
+                if (logical.sync_ratio >= 0 && logical.sync_ratio <= 1 && logical.lvm_layout.has_prefix ("raid"))
+                    advanced_details.subtitle += "\nSynchronization: %.1f%%".printf (logical.sync_ratio * 100);
+                foreach (string path in new string[] { logical.origin_path, logical.thin_pool_path }) {
+                    var related = backend.snapshot.advanced.lookup (path) as StorageLogicalVolume;
+                    if (related != null)
+                        advanced_details.subtitle += (path == logical.origin_path ? "\nOrigin: " : "\nThin pool: ") + related.name;
+                }
             } else if (array != null) {
                 advanced_details.title = "RAID Array";
                 advanced_details.subtitle = "%s · %s · %u missing members".printf (array.level, array.state, array.degraded);
@@ -1807,7 +1903,7 @@ namespace MajorisDisks {
             var lv = device as StorageLogicalVolume;
             if (block != null && block.preferred != "") row.title = block.preferred;
             if (lv != null) {
-                row.subtitle = "%s · %s".printf (format_size (lv.size), lv.active ? "Active" : "Inactive");
+                row.subtitle = describe_lvm_volume (lv);
                 if (lv.lvm_type == "pool") {
                     var usage = new ThinPoolUsage (backend.snapshot, lv);
                     row.subtitle = "%s data capacity · %s".printf (format_size (usage.physical_size),
@@ -1819,12 +1915,202 @@ namespace MajorisDisks {
                         "\nData %.1f%% used · Metadata %.1f%% used".printf (usage.data_ratio * 100.0,
                             usage.metadata_ratio * 100.0) :
                         "\nData and metadata usage unavailable";
+                    row.subtitle += "\n" + describe_lvm_volume (lv);
                 }
             }
+            row.selectable = false;
+            row.activatable = lv != null || block?.volume_group != null;
+            if (lv != null) {
+                row.activated.connect (() => {
+                    for (int i = 0; ; i++) {
+                        var target = advanced_sidebar.get_row_at_index (i) as VolumeRow;
+                        if (target == null) break;
+                        if (target.device != device) continue;
+                        advanced_sidebar.select_row (target);
+                        break;
+                    }
+                });
+            } else if (block?.volume_group != null) {
+                row.subtitle = "%s · %s free".printf (format_size (block.size), format_size (backend.lvm_pv_free (block)));
+                row.activated.connect (() => {
+                    var current = backend.snapshot.blocks.lookup (block.path);
+                    if (current != block || !current.available || current.volume_group == null) return;
+                    show_check_message ("LVM Physical Volume", "%s\nUUID: %s\nVolume group: %s\nFree space: %s".printf (
+                        current.preferred, current.uuid != "" ? current.uuid : "Unavailable", current.volume_group.name,
+                        format_size (backend.lvm_pv_free (current))));
+                });
+            }
+            member_rows += row;
+            advanced_members.add (row);
+        }
+
+        private void add_lvm_component (LvmStructure component, string role) {
+            var row = new VolumeRow (new StorageDevice ("/"));
+            row.title = "%s · %s".printf (role, component.name);
+            row.subtitle = "%s · %s".printf (component.layout, format_size (component.size));
             row.selectable = false;
             row.activatable = false;
             member_rows += row;
             advanced_members.add (row);
+        }
+
+        private string describe_lvm_volume (StorageLogicalVolume volume) {
+            var state = volume.allocation (backend.snapshot);
+            string allocation = state == LvmAllocation.INCOMPLETE ? "Physical allocation incomplete" :
+                state == LvmAllocation.COMPLETE ? "Physical allocation accounted for" : "Physical allocation unknown";
+            if (state == LvmAllocation.INCOMPLETE) {
+                if (backend.lvm_repair_candidates (volume).length != 0)
+                    allocation += "\nA RAID 1 replacement is available for preflight";
+                else
+                    allocation += "\nRecovery could not be established. Reconnect missing devices and reassess.";
+            }
+            return "%s · %s · %s\n%s".printf (format_size (volume.size), volume.active ? "Active" : "Inactive",
+                volume.lvm_layout != "" ? volume.lvm_layout : "Layout unavailable", allocation);
+        }
+
+        private StorageVolumeGroup? selected_lvm_group () {
+            var lv = advanced_device as StorageLogicalVolume;
+            return lv == null ? advanced_device as StorageVolumeGroup :
+                backend.snapshot.advanced.lookup (lv.group_path) as StorageVolumeGroup;
+        }
+
+        private void confirm_lvm_recovery (StorageLogicalVolume? lv) {
+            var group = selected_lvm_group ();
+            if (group == null || group.missing_pv_uuids.length == 0) return;
+            StorageBlock? anchor = null;
+            foreach (var block in backend.snapshot.blocks.get_values ()) {
+                if (block.volume_group == group && block.available && !block.system_hint) {
+                    anchor = block;
+                    break;
+                }
+            }
+            if (anchor == null) return;
+            string identity = backend.storage_membership_identity (anchor, false);
+            string uuid = group.uuid;
+            string missing = string.joinv ("\n", group.missing_pv_uuids);
+            string lv_uuid = lv?.uuid ?? "";
+            var candidates = lv != null ? backend.lvm_repair_candidates (lv) : new StorageBlock[0];
+            if (lv != null && candidates.length == 0) return;
+            string details = "%s (%s)\nMissing physical volumes:\n%s".printf (group.name, uuid, missing);
+            if (lv != null) details += "\n\nLogical volume: " + lv.name + "\n" + describe_lvm_volume (lv);
+            else {
+                foreach (var item in backend.snapshot.advanced.get_values ()) {
+                    var volume = item as StorageLogicalVolume;
+                    if (volume != null && volume.group_path == group.path &&
+                        volume.allocation (backend.snapshot) != LvmAllocation.COMPLETE)
+                        details += "\n\n" + volume.name + "\n" + describe_lvm_volume (volume);
+                }
+            }
+            var labels = new Gtk.StringList (null);
+            foreach (var pv in candidates)
+                labels.append ("%s · %s free".printf (pv.preferred, format_size (backend.lvm_pv_free (pv))));
+            var dialog = new LvmRecoveryDialog (lv != null, details, labels);
+            dialog.response.connect ((response) => {
+                if (response != "apply" || (lv_uuid != "" && dialog.selection >= candidates.length)) return;
+                string path = lv_uuid != "" ? candidates[dialog.selection].path : "";
+                backend.recover_lvm.begin (anchor, identity, uuid, missing, lv_uuid, path, (obj, result) => {
+                    try {
+                        backend.recover_lvm.end (result);
+                        update_devices ();
+                        notifications.add_toast (new Adw.Toast (lv_uuid != "" ?
+                            "RAID reconstruction verified" : "Missing physical-volume records removed"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm LVM recovery", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
+        private void confirm_lvm_cache (bool attached) {
+            var origin = advanced_device as StorageLogicalVolume;
+            var group = selected_lvm_group ();
+            if (origin == null || group == null) return;
+            var anchor = backend.lvm_anchor (group);
+            if (anchor == null) return;
+            string identity = backend.storage_membership_identity (anchor, false);
+            string group_uuid = group.uuid;
+            string origin_uuid = origin.uuid;
+            var choices = attached ? new StorageLogicalVolume[0] : backend.lvm_cache_candidates (origin);
+            string[] uuids = {};
+            var labels = new Gtk.StringList (null);
+            foreach (var candidate in choices) {
+                uuids += candidate.uuid;
+                labels.append ("%s · %s".printf (candidate.name, format_size (candidate.size)));
+            }
+            var dialog = new LvmCacheDialog (origin.name, attached, labels);
+            dialog.response.connect ((response) => {
+                if (response != "attach" && response != "split" && response != "detach") return;
+                if (!attached && dialog.selection >= uuids.length) return;
+                backend.change_lvm_cache.begin (anchor, identity, group_uuid, origin_uuid,
+                    attached ? "" : uuids[dialog.selection], response == "detach", (obj, result) => {
+                    try {
+                        backend.change_lvm_cache.end (result);
+                        update_devices ();
+                        notifications.add_toast (new Adw.Toast ("LVM cache change verified"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm LVM cache change", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
+        private void inspect_lvm_cache () {
+            var lv = advanced_device as StorageLogicalVolume;
+            var group = selected_lvm_group ();
+            if (lv == null || group == null) return;
+            backend.inspect_lvm_cache.begin (group.path, group.uuid, lv.name, lv.uuid, (obj, result) => {
+                try {
+                    var status = backend.inspect_lvm_cache.end (result);
+                    string detail = "%s · %s".printf (status.name, status.layout);
+                    if (status.pool_name != "") detail += "\nCache pool: " + status.pool_name;
+                    if (status.mode != "") detail += "\nCache mode: " + status.mode;
+                    detail += status.usage_known ? "\n%llu dirty blocks of %llu".printf (status.dirty_blocks, status.total_blocks) :
+                        "\nDirty-block count unavailable";
+                    if (status.health != "") detail += "\nHealth: " + status.health;
+                    show_check_message ("LVM Cache Status", detail);
+                } catch (Error error) {
+                    show_check_message ("Could not inspect LVM cache", operation_error (error));
+                }
+            });
+        }
+
+        private void create_lvm_layout () {
+            var group = selected_lvm_group ();
+            if (group == null) return;
+            string uuid = group.uuid;
+            backend.available_lvm_layouts.begin (group.path, uuid, (obj, result) => {
+                try {
+                    var supported = backend.available_lvm_layouts.end (result);
+                    if (selected_lvm_group () == group && group.uuid == uuid)
+                        present_lvm_layout (group, supported);
+                } catch (Error error) {
+                    show_check_message ("LVM placement is unavailable", operation_error (error));
+                }
+            });
+        }
+
+        private void present_lvm_layout (StorageVolumeGroup group, string[] supported) {
+            var anchor = backend.lvm_anchor (group);
+            if (anchor == null) return;
+            string identity = backend.storage_membership_identity (anchor, false);
+            string uuid = group.uuid;
+            var dialog = new LvmLayoutDialog (backend, group, supported);
+            dialog.response.connect ((response) => {
+                if (response != "create") return;
+                backend.create_lvm_layout.begin (anchor, identity, uuid, dialog.volume_name, dialog.bytes,
+                    dialog.layout, dialog.selected_paths (), (obj, result) => {
+                        try {
+                            backend.create_lvm_layout.end (result);
+                            update_devices ();
+                            notifications.add_toast (new Adw.Toast ("Logical volume and physical placement verified"));
+                        } catch (Error error) {
+                            show_check_message ("Could not confirm logical-volume layout", operation_error (error));
+                        }
+                    });
+            });
+            dialog.present (this);
         }
 
         private void show_selection () {
@@ -2903,13 +3189,134 @@ namespace MajorisDisks {
         }
     }
 
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-layout-dialog.ui")]
+    internal class LvmLayoutDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.EntryRow volume_entry;
+        [GtkChild] private unowned Adw.EntryRow size_entry;
+        [GtkChild] private unowned Adw.ComboRow layout_entry;
+        [GtkChild] private unowned Adw.PreferencesGroup physical_volumes;
+        [GtkChild] private unowned Adw.ActionRow allocation;
+        private StorageBlock[] candidates;
+        private Adw.SwitchRow[] toggles = {};
+        private uint64[] free = {};
+        private string[] domains = {};
+        private string[] layouts = {};
+        private uint64 extent;
+        public string volume_name { owned get { return volume_entry.text; } }
+        public uint64 bytes { get; private set; }
+        public string layout { owned get { return layout_entry.selected < layouts.length ? layouts[layout_entry.selected] : ""; } }
+
+        public LvmLayoutDialog (UDisksService backend, StorageVolumeGroup group, string[] supported = {}) {
+            extent = group.extent_size;
+            candidates = backend.lvm_placement_candidates (group);
+            var names = new Gtk.StringList (null);
+            string[] values = { "linear", "raid0", "raid1", "raid5", "raid6", "raid10" };
+            string[] labels = { "Linear", "Striped (RAID 0)", "RAID 1", "RAID 5", "RAID 6", "RAID 10" };
+            int[] minimum = { 1, 2, 2, 3, 4, 4 };
+            string[] distinct = {};
+            foreach (var pv in candidates) {
+                string domain = backend.lvm_pv_domain (pv);
+                domains += domain;
+                if (!(domain in distinct)) distinct += domain;
+            }
+            for (int i = 0; i < values.length; i++) {
+                if (distinct.length < minimum[i] || !(values[i] in supported)) continue;
+                layouts += values[i];
+                names.append (labels[i]);
+            }
+            layout_entry.model = names;
+            foreach (var pv in candidates) {
+                uint64 available = backend.lvm_pv_free (pv);
+                var toggle = new Adw.SwitchRow ();
+                toggle.use_markup = false;
+                toggle.title = pv.preferred;
+                toggle.subtitle = "%s available".printf (format_size (available));
+                toggles += toggle;
+                free += available;
+                physical_volumes.add (toggle);
+                toggle.notify["active"].connect (validate);
+            }
+            size_entry.changed.connect (validate);
+            volume_entry.changed.connect (validate);
+            layout_entry.notify["selected"].connect (validate);
+            validate ();
+        }
+
+        public string[] selected_paths () {
+            string[] paths = {};
+            for (int i = 0; i < candidates.length; i++)
+                if (toggles[i].active) paths += candidates[i].path;
+            return paths;
+        }
+
+        private void validate () {
+            uint64 extents = 0;
+            bytes = extent != 0 && uint64.try_parse (size_entry.text, out extents) &&
+                extents <= uint64.MAX / extent ? extents * extent : 0;
+            uint64 per_pv = LvmLayout.required_per_pv (layout, selected_paths ().length, bytes, extent);
+            bool capacity_ok = per_pv != 0;
+            string[] selected_domains = {};
+            for (int i = 0; i < toggles.length; i++) {
+                if (!toggles[i].active) continue;
+                if (free[i] < per_pv || domains[i] in selected_domains) capacity_ok = false;
+                selected_domains += domains[i];
+            }
+            allocation.subtitle = capacity_ok ? "%s required on each selected physical volume".printf (format_size (per_pv)) :
+                "Choose a compatible physical-volume count and extent count. Each extent is %s.".printf (format_size (extent));
+            set_response_enabled ("create", capacity_ok && UDisksService.valid_lvm_name (volume_name));
+        }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-cache-dialog.ui")]
+    internal class LvmCacheDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow candidate;
+        public uint selection { get { return candidate.selected; } }
+
+        public LvmCacheDialog (string origin, bool attached, Gtk.StringList choices) {
+            heading = attached ? "Separate LVM Cache" : "Attach LVM Cache";
+            body = attached ?
+                "Splitting or removing the cache for %s requires a verified clean cache with no pending writes. Split keeps the cache pool. Remove deletes the cache pool and keeps the origin.".printf (origin) :
+                "The selected volume will be converted to a cache pool for %s. Its entire contents must be empty. Unmount both volumes before continuing.".printf (origin);
+            candidate.visible = !attached;
+            candidate.model = choices;
+            if (attached) remove_response ("attach");
+            else {
+                remove_response ("split");
+                remove_response ("detach");
+                set_response_enabled ("attach", choices.get_n_items () > 0);
+            }
+        }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-recovery-dialog.ui")]
+    internal class LvmRecoveryDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow replacement;
+        public uint selection { get { return replacement.selected; } }
+
+        public LvmRecoveryDialog (bool repair, string details, Gtk.StringList choices) {
+            heading = repair ? "Repair LVM RAID 1" : "Remove Missing Physical-Volume Records";
+            body = details + (repair ?
+                "\n\nLVM will attempt to rebuild the damaged component on the selected physical volume." :
+                "\n\nReconnect the original devices and reassess first. Removing their records permanently changes the volume-group metadata and can complicate later recovery. Majoris requires all remaining allocations to be accounted for before removal.");
+            replacement.visible = repair;
+            replacement.model = choices;
+            set_response_label ("apply", repair ? "Repair" : "Remove Records");
+            set_response_enabled ("apply", !repair || choices.get_n_items () > 0);
+        }
+    }
+
     [GtkTemplate (ui = "/com/majoris/disks/ui/lvm-rename-dialog.ui")]
     public class LvmRenameDialog : Adw.AlertDialog {
         [GtkChild] private unowned Adw.EntryRow entry;
         public string new_name { owned get { return entry.text; } }
 
-        public LvmRenameDialog (string original, string device) {
+        public LvmRenameDialog (string original, string device, bool group = false) {
             body = "Renaming changes the device path for %s. Update any external references that use its current name.".printf (device);
+            if (group) {
+                heading = "Rename Volume Group";
+                entry.title = "Volume group name";
+                body = "Renaming %s changes its logical-volume device paths. Deactivate its volumes first. Review references in boot, mount, encryption and application configuration.".printf (device);
+            }
             entry.text = original;
             set_response_enabled ("apply", false);
             entry.changed.connect (() => {
