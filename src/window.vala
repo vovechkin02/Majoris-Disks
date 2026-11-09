@@ -20,6 +20,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_cache_status;
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_layout;
         private string selected_storage = "";
+        private string renaming_lvm_group = "";
         private StorageBlock? advanced_context;
         private StorageDevice? advanced_device;
         private VolumeRow[] member_rows = {};
@@ -93,17 +94,21 @@ namespace MajorisDisks {
                 var group = advanced_device as StorageVolumeGroup;
                 var anchor = advanced_context;
                 if (group == null || anchor == null) return;
-                string identity = backend.storage_membership_identity (anchor, false);
+                string identity = backend.lvm_membership_identity (anchor);
                 string uuid = group.uuid;
                 var dialog = new LvmRenameDialog (group.name, group.name, true);
                 dialog.response.connect ((response) => {
                     if (response != "apply") return;
+                    string key = storage_key (group);
+                    renaming_lvm_group = key;
                     backend.rename_volume_group.begin (anchor, identity, uuid, dialog.new_name, (obj, result) => {
+                        if (renaming_lvm_group == key) renaming_lvm_group = "";
                         try {
                             backend.rename_volume_group.end (result);
                             update_devices ();
                             notifications.add_toast (new Adw.Toast ("Volume group renamed"));
                         } catch (Error error) {
+                            update_devices ();
                             show_check_message ("Could not confirm the volume-group rename", operation_error (error));
                         }
                     });
@@ -1759,7 +1764,7 @@ namespace MajorisDisks {
             while ((extra = advanced_sidebar.get_row_at_index (index)) != null)
                 advanced_sidebar.remove (extra);
             advanced_sidebar.visible = index != 0;
-            if (chosen == null) selected_storage = "";
+            if (chosen == null && selected_storage != renaming_lvm_group) selected_storage = "";
             return chosen;
         }
 
@@ -1858,11 +1863,16 @@ namespace MajorisDisks {
                 if (logical.structure != null) {
                     foreach (var block in blocks)
                         if (logical.structure.uses_pv (block.path)) add_advanced_member (block);
-                    foreach (var component in logical.structure.data) add_lvm_component (component, "Data");
-                    foreach (var component in logical.structure.metadata) add_lvm_component (component, "Metadata");
+                    foreach (var component in logical.structure.data) add_lvm_component (component, "Data", logical.group_path);
+                    foreach (var component in logical.structure.metadata) add_lvm_component (component, "Metadata", logical.group_path);
                 }
-                if (logical.sync_ratio >= 0 && logical.sync_ratio <= 1 && logical.lvm_layout.has_prefix ("raid"))
-                    advanced_details.subtitle += "\nSynchronization: %.1f%%".printf (logical.sync_ratio * 100);
+                if (logical.lvm_layout.has_prefix ("raid") && logical.lvm_layout != "raid0") {
+                    if (logical.sync_ratio >= 0 && logical.sync_ratio < 1)
+                        advanced_details.subtitle += "\nSynchronization: %.1f%%".printf (logical.sync_ratio * 100);
+                    else if (logical.sync_ratio == 1 && logical.allocation (backend.snapshot) == LvmAllocation.COMPLETE)
+                        advanced_details.subtitle += "\nBackend reports synchronization complete";
+                    else advanced_details.subtitle += "\nSynchronization could not be verified";
+                }
                 foreach (string path in new string[] { logical.origin_path, logical.thin_pool_path }) {
                     var related = backend.snapshot.advanced.lookup (path) as StorageLogicalVolume;
                     if (related != null)
@@ -1944,10 +1954,13 @@ namespace MajorisDisks {
             advanced_members.add (row);
         }
 
-        private void add_lvm_component (LvmStructure component, string role) {
+        private void add_lvm_component (LvmStructure component, string role, string group_path) {
             var row = new VolumeRow (new StorageDevice ("/"));
             row.title = "%s · %s".printf (role, component.name);
             row.subtitle = "%s · %s".printf (component.layout, format_size (component.size));
+            var state = component.allocation (backend.snapshot, group_path);
+            if (state == LvmAllocation.INCOMPLETE) row.subtitle += " · Incomplete physical allocation";
+            else if (state == LvmAllocation.UNKNOWN) row.subtitle += " · Allocation unverified";
             row.selectable = false;
             row.activatable = false;
             member_rows += row;
@@ -1985,7 +1998,7 @@ namespace MajorisDisks {
                 }
             }
             if (anchor == null) return;
-            string identity = backend.storage_membership_identity (anchor, false);
+            string identity = backend.lvm_membership_identity (anchor);
             string uuid = group.uuid;
             string missing = string.joinv ("\n", group.missing_pv_uuids);
             string lv_uuid = lv?.uuid ?? "";
@@ -2028,7 +2041,22 @@ namespace MajorisDisks {
             if (origin == null || group == null) return;
             var anchor = backend.lvm_anchor (group);
             if (anchor == null) return;
-            string identity = backend.storage_membership_identity (anchor, false);
+            if (attached) {
+                backend.inspect_lvm_cache.begin (group.path, group.uuid, origin.name, origin.uuid, (obj, result) => {
+                    try {
+                        var status = backend.inspect_lvm_cache.end (result);
+                        if (advanced_device == origin && selected_lvm_group () == group)
+                            present_lvm_cache (origin, group, anchor, true, status);
+                    } catch (Error error) {
+                        show_check_message ("Cache separation unavailable", operation_error (error));
+                    }
+                });
+            } else present_lvm_cache (origin, group, anchor, false, null);
+        }
+
+        private void present_lvm_cache (StorageLogicalVolume origin, StorageVolumeGroup group, StorageBlock anchor,
+            bool attached, LvmCacheStatus? status) {
+            string identity = backend.lvm_membership_identity (anchor);
             string group_uuid = group.uuid;
             string origin_uuid = origin.uuid;
             var choices = attached ? new StorageLogicalVolume[0] : backend.lvm_cache_candidates (origin);
@@ -2039,6 +2067,16 @@ namespace MajorisDisks {
                 labels.append ("%s · %s".printf (candidate.name, format_size (candidate.size)));
             }
             var dialog = new LvmCacheDialog (origin.name, attached, labels);
+            if (status != null) {
+                dialog.body = describe_lvm_cache (status) + "\n\n" + dialog.body;
+                bool allowed = status.separation_block_reason == "" &&
+                    origin.allocation (backend.snapshot) != LvmAllocation.INCOMPLETE;
+                dialog.set_response_enabled ("split", allowed);
+                dialog.set_response_enabled ("detach", allowed);
+                if (!allowed)
+                    dialog.body += "\n\n" + (status.separation_block_reason != "" ?
+                        status.separation_block_reason : "The origin has incomplete physical allocation.");
+            }
             dialog.response.connect ((response) => {
                 if (response != "attach" && response != "split" && response != "detach") return;
                 if (!attached && dialog.selection >= uuids.length) return;
@@ -2056,6 +2094,19 @@ namespace MajorisDisks {
             dialog.present (this);
         }
 
+        private string describe_lvm_cache (LvmCacheStatus status) {
+            string detail = "%s · %s".printf (status.name, status.layout);
+            if (status.pool_name != "")
+                detail += (status.layout == "cache" ? "\nReported cache resource: " : "\nReported backing volume: ") + status.pool_name;
+            detail += "\nCache mode: " + (status.mode != "" ? status.mode : "Unavailable");
+            detail += status.usage_known ? "\n%s dirty blocks of %s".printf (
+                status.dirty_blocks.to_string (), status.total_blocks.to_string ()) :
+                "\nDirty-block count unavailable";
+            detail += "\nHealth: " + (status.healthy () ? "No reported metadata errors" :
+                (status.health != "" ? status.health : "Unverified"));
+            return detail;
+        }
+
         private void inspect_lvm_cache () {
             var lv = advanced_device as StorageLogicalVolume;
             var group = selected_lvm_group ();
@@ -2063,12 +2114,8 @@ namespace MajorisDisks {
             backend.inspect_lvm_cache.begin (group.path, group.uuid, lv.name, lv.uuid, (obj, result) => {
                 try {
                     var status = backend.inspect_lvm_cache.end (result);
-                    string detail = "%s · %s".printf (status.name, status.layout);
-                    if (status.pool_name != "") detail += "\nCache pool: " + status.pool_name;
-                    if (status.mode != "") detail += "\nCache mode: " + status.mode;
-                    detail += status.usage_known ? "\n%llu dirty blocks of %llu".printf (status.dirty_blocks, status.total_blocks) :
-                        "\nDirty-block count unavailable";
-                    if (status.health != "") detail += "\nHealth: " + status.health;
+                    string detail = describe_lvm_cache (status);
+                    if (status.separation_block_reason != "") detail += "\n\n" + status.separation_block_reason;
                     show_check_message ("LVM Cache Status", detail);
                 } catch (Error error) {
                     show_check_message ("Could not inspect LVM cache", operation_error (error));
@@ -2094,7 +2141,7 @@ namespace MajorisDisks {
         private void present_lvm_layout (StorageVolumeGroup group, string[] supported) {
             var anchor = backend.lvm_anchor (group);
             if (anchor == null) return;
-            string identity = backend.storage_membership_identity (anchor, false);
+            string identity = backend.lvm_membership_identity (anchor);
             string uuid = group.uuid;
             var dialog = new LvmLayoutDialog (backend, group, supported);
             dialog.response.connect ((response) => {
@@ -3212,7 +3259,7 @@ namespace MajorisDisks {
             var names = new Gtk.StringList (null);
             string[] values = { "linear", "raid0", "raid1", "raid5", "raid6", "raid10" };
             string[] labels = { "Linear", "Striped (RAID 0)", "RAID 1", "RAID 5", "RAID 6", "RAID 10" };
-            int[] minimum = { 1, 2, 2, 3, 4, 4 };
+            int[] minimum = { 1, 2, 2, 3, 5, 4 };
             string[] distinct = {};
             foreach (var pv in candidates) {
                 string domain = backend.lvm_pv_domain (pv);
@@ -3222,7 +3269,7 @@ namespace MajorisDisks {
             for (int i = 0; i < values.length; i++) {
                 if (distinct.length < minimum[i] || !(values[i] in supported)) continue;
                 layouts += values[i];
-                names.append (labels[i]);
+                names.append (i == 0 ? labels[i] : "%s · at least %d physical volumes".printf (labels[i], minimum[i]));
             }
             layout_entry.model = names;
             foreach (var pv in candidates) {
@@ -3261,8 +3308,11 @@ namespace MajorisDisks {
                 if (free[i] < per_pv || domains[i] in selected_domains) capacity_ok = false;
                 selected_domains += domains[i];
             }
-            allocation.subtitle = capacity_ok ? "%s required on each selected physical volume".printf (format_size (per_pv)) :
+            allocation.subtitle = capacity_ok ?
+                "%s requested. Estimated requirement per selected physical volume: %s.".printf (format_size (bytes), format_size (per_pv)) :
                 "Choose a compatible physical-volume count and extent count. Each extent is %s.".printf (format_size (extent));
+            if (capacity_ok && layout != "linear" && layout != "raid0")
+                allocation.subtitle += " Includes one metadata extent per physical volume.";
             set_response_enabled ("create", capacity_ok && UDisksService.valid_lvm_name (volume_name));
         }
     }
@@ -3297,7 +3347,7 @@ namespace MajorisDisks {
             heading = repair ? "Repair LVM RAID 1" : "Remove Missing Physical-Volume Records";
             body = details + (repair ?
                 "\n\nLVM will attempt to rebuild the damaged component on the selected physical volume." :
-                "\n\nReconnect the original devices and reassess first. Removing their records permanently changes the volume-group metadata and can complicate later recovery. Majoris requires all remaining allocations to be accounted for before removal.");
+                "\n\nReconnect the original devices and reassess first. This removes missing-device records from the volume-group metadata. It cannot restore missing data and can complicate later recovery. Every retained volume must have a verified complete allocation.");
             replacement.visible = repair;
             replacement.model = choices;
             set_response_label ("apply", repair ? "Repair" : "Remove Records");
@@ -3315,7 +3365,7 @@ namespace MajorisDisks {
             if (group) {
                 heading = "Rename Volume Group";
                 entry.title = "Volume group name";
-                body = "Renaming %s changes its logical-volume device paths. Deactivate its volumes first. Review references in boot, mount, encryption and application configuration.".printf (device);
+                body = "Renaming %s changes its logical-volume device paths. Deactivate its volumes first. Administrator authorization is required to check protected boot, mount and encryption configuration. Review any external references separately.".printf (device);
             }
             entry.text = original;
             set_response_enabled ("apply", false);

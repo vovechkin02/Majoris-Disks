@@ -12,18 +12,49 @@ namespace MajorisDisks {
         public uint64 dirty_blocks;
         public uint64 total_blocks;
         public bool usage_known;
+        public string separation_block_reason = "";
+
+        public bool no_health_flags () {
+            return attributes.length == 10 && attributes[8] == '-' && health == "";
+        }
+
+        public bool healthy () {
+            return no_health_flags () &&
+                (metadata_check == "" || metadata_check == "0" || metadata_check == "no");
+        }
+
+        public bool active_dm_cache () {
+            return layout == "cache" && healthy () && attributes[4] == 'a' &&
+                (mode == "writethrough" || mode == "writeback" || mode == "passthrough");
+        }
 
         public bool clean () {
-            return layout == "cache" && attributes.length == 10 && attributes[4] == 'a' &&
-                attributes[8] == '-' && health == "" &&
-                (metadata_check == "" || metadata_check == "0" || metadata_check == "no") &&
-                usage_known && dirty_blocks == 0 &&
-                (mode == "writethrough" || mode == "writeback" || mode == "passthrough");
+            return active_dm_cache () && usage_known && dirty_blocks == 0;
+        }
+
+        public string separation_block (LvmCacheStatus? pool) {
+            if (layout != "cache" || pool == null || pool.layout != "cache-pool" || pool.uuid != pool_uuid)
+                return "The cache layout or pool identity is unsupported or unverified.";
+            // LVM reports the live metadata-check state on the active origin.
+            // The hidden pool row has no independent device-mapper mapping.
+            if (!active_dm_cache () || !pool.no_health_flags ())
+                return "The active cache mode or metadata health could not be verified.";
+            if (!usage_known) return "The dirty-block count is unavailable.";
+            if (dirty_blocks != 0) return "The cache has pending writes.";
+            return "";
         }
 
         private static string? string_field (Json.Object row, string key) {
             var value = row.get_member (key);
             return value != null && value.get_value_type () == typeof (string) ? value.get_string () : null;
+        }
+
+        private static bool parse_count (string value, out uint64 count) {
+            count = 0;
+            if (value == "") return false;
+            for (int i = 0; i < value.length; i++)
+                if (!value[i].isdigit ()) return false;
+            return uint64.try_parse (value, out count);
         }
 
         private static unowned Json.Object? object_node (Json.Node? node) {
@@ -44,6 +75,7 @@ namespace MajorisDisks {
             if (rows == null || rows.get_length () > 16384)
                 throw new IOError.INVALID_DATA ("LVM returned an invalid cache report.");
             var names = new HashTable<string, string> (str_hash, str_equal);
+            var ids = new HashTable<string, string> (str_hash, str_equal);
             var volumes = new LvmCacheStatus[rows.get_length ()];
             for (uint i = 0; i < rows.get_length (); i++) {
                 unowned var row = object_node (rows.get_element (i));
@@ -61,12 +93,13 @@ namespace MajorisDisks {
                 volume.metadata_check = string_field (row, "lv_check_needed") ?? "unknown";
                 string dirty = string_field (row, "cache_dirty_blocks") ?? "";
                 string total = string_field (row, "cache_total_blocks") ?? "";
-                volume.usage_known = dirty != "" && total != "" &&
-                    uint64.try_parse (dirty, out volume.dirty_blocks) && uint64.try_parse (total, out volume.total_blocks) &&
+                volume.usage_known = parse_count (dirty, out volume.dirty_blocks) &&
+                    parse_count (total, out volume.total_blocks) &&
                     volume.total_blocks != 0 && volume.dirty_blocks <= volume.total_blocks;
-                if (volume.name == "" || volume.uuid == "" || names.contains (volume.name))
+                if (volume.name == "" || volume.uuid == "" || names.contains (volume.name) || ids.contains (volume.uuid))
                     throw new IOError.INVALID_DATA ("LVM returned ambiguous logical-volume identities.");
                 names.insert (volume.name, volume.uuid);
+                ids.insert (volume.uuid, volume.name);
                 volumes[i] = volume;
             }
             return volumes;
@@ -75,6 +108,12 @@ namespace MajorisDisks {
         internal static LvmCacheStatus? find (LvmCacheStatus[] report, string name) {
             foreach (var volume in report)
                 if (volume.name == name) return volume;
+            return null;
+        }
+
+        internal static LvmCacheStatus? find_uuid (LvmCacheStatus[] report, string uuid) {
+            foreach (var volume in report)
+                if (volume.uuid == uuid) return volume;
             return null;
         }
     }
@@ -102,7 +141,8 @@ namespace MajorisDisks {
                 stripes = count - 1;
                 break;
             case "raid6":
-                if (count < 4) return 0;
+                // LVM RAID6 requires at least three data stripes plus two parity devices.
+                if (count < 5) return 0;
                 stripes = count - 2;
                 break;
             case "raid10":

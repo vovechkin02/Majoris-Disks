@@ -18,7 +18,12 @@ Use only disposable loop images, removable media with backups, or a virtual mach
 
 ## Advanced LVM2
 
-Use a dedicated disposable Debian 13 VM with `udisks2`, `udisks2-lvm2`, `lvm2` and `e2fsprogs`. Check that the UDisks manager exposes `org.freedesktop.UDisks2.Manager.LVM2`. Build as a normal user and install in the VM so the cache status inspector is at its configured path. Run the three opt-in tests as root in that VM.
+Use a dedicated disposable Debian 13 VM with `udisks2`, `udisks2-lvm2`, `lvm2`, `e2fsprogs`, `util-linux` and a working kernel device mapper and loop driver. If UDisks has yet to load its installed LVM2 module, enable it inside that VM and verify the interface.
+
+    sudo busctl --system call org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager org.freedesktop.UDisks2.Manager EnableModule sb lvm2 true
+    busctl --system introspect org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager org.freedesktop.UDisks2.Manager.LVM2
+
+Build as a normal user and install in the VM so the cache and protected-configuration inspectors resolve at their configured paths. Run the three opt-in tests as root in that VM. Save the test log, including per-scenario method names, final state and marker checksums. A prerequisite skip has exit status 77. A failed setup, backend call, data comparison, result check or cleanup is a failure.
 
     sudo env MAJORIS_DISKS_RUN_LVM_TESTS=1 meson test -C build --no-rebuild --print-errorlogs lvm-recovery-integration lvm-cache-integration lvm-layout-integration
 
@@ -29,4 +34,14 @@ Use a dedicated disposable Debian 13 VM with `udisks2`, `udisks2-lvm2`, `lvm2` a
 - Attach an empty cache candidate, write through the cached origin, then split it. Verify the pool remains. Repeat and remove the cache pool, then verify the origin and the writes. Try a candidate with a filesystem, a mount, or raw data.
 - For explicit placement, compare the selected PVs with the backend's data and metadata components. Try duplicate devices and a layout with insufficient space on a single PV even when the VG has sufficient aggregate free space.
 
+### Desktop authorization
+
+1. Sign in as a regular GNOME user with the system Polkit agent running. Launch Majoris normally. Test an inactive fixture VG with no persistent references while `/etc/crypttab` is root-owned and mode `0600`. Approve protected-reference inspection and any subsequent UDisks authorization. Verify the returned VG path, unchanged VG/PV/LV UUIDs and the new name in Advanced Storage.
+2. In the same disposable VM, have an administrator back up crypttab with its original ownership and mode. Add a temporary `noauto,nofail` entry with a unique mapping name and the fixture LV's `/dev/mapper/` path as its source. Verify the inspector identifies crypttab as a conflict and the VG retains its original name. Restore the backup and verify its mode. Repeat with a fixture reference in fstab.
+3. Repeat the rename, cache, layout and eligible repair flows with approval, denial and cancellation at each authorization prompt. After cached authorization expires or after a fresh login, verify that protected inspection prompts again. Check that denial and cancellation preserve the VG/LV identities and that no successful job or toast appears.
+4. With the dialog open, change the fixture identity, occupy a selected PV, or start another job against the same VG from a separate session. Confirm the operation stops if its preconditions have changed. For an authorized request that reaches UDisks, restart UDisks or interrupt verification using only disposable storage. Compare the job state, fresh D-Bus properties and readback with the original. Check that Majoris reports an unverified or still-running outcome when appropriate and makes no automatic retry.
+5. On a disposable writeback cache, observe both positive dirty-block counts and a verified zero count. When the report is unavailable or metadata health is uncertain, verify that separation stays disabled. During an empty-candidate scan, cancel from the job list and verify the origin and candidate retain their original layouts and identities.
+
 Record each scenario as passed, failed, skipped or not executed. Leave the fixture intact if a device identity becomes uncertain.
+
+The Debian 13.7 QEMU run passed all three opt-in Meson suites. A separate root-run fixture verified a real crypttab conflict and a successful rename with crypttab still at mode `0600`. The GNOME authorization procedure and the live interruption scenarios above remain open. [Execution register](../docs/feature-parity-completion.md#advanced-lvm2-administration)

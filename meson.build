@@ -19,9 +19,10 @@ subdir('src')
 layout_test = executable('storage-model-test', 'tests/storage-model-test.vala', 'tests/mock-open-device.c',
   storage_model_sources, include_directories: [include_directories('tests'), xz_include], dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
 crypttab_inspector_test = executable('crypttab-inspector-test', 'tests/crypttab-inspector-test.c',
-  dependencies: dependency('glib-2.0'))
+  dependencies: dependency('gio-2.0'))
 test('crypttab-inspector', crypttab_inspector_test)
 sh = find_program('sh')
+test('lvm-fixture', sh, args: [meson.current_source_dir() / 'tests/lvm-fixture-test.sh'])
 native_xz_test = executable('native-xz-test', 'tests/xz-stream-test.c', 'src/xz-stream.c',
   include_directories: xz_include, dependencies: [dependency('gio-2.0'), xz_dep])
 test('native-xz', native_xz_test)

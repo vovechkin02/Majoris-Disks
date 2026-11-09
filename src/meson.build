@@ -43,7 +43,7 @@ configure_file(input: 'crypttab-inspector-config.h.in', output: 'crypttab-inspec
 configure_file(input: '../data/com.majoris.disks.Crypttab.policy.in', output: 'com.majoris.disks.Crypttab.policy',
   configuration: crypttab_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
 crypttab_inspector = executable('majoris-disks-crypttab-inspector', 'crypttab-inspector.c',
-  dependencies: dependency('glib-2.0'), install: true, install_dir: get_option('libexecdir'))
+  dependencies: dependency('gio-2.0'), install: true, install_dir: get_option('libexecdir'))
 
 lvm_cache_config = configuration_data()
 lvm_cache_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))

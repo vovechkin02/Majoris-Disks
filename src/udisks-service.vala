@@ -1919,7 +1919,7 @@ namespace MajorisDisks {
             }
         }
 
-        internal string storage_membership_identity (StorageBlock member, bool raid) {
+        internal string storage_membership_identity (StorageBlock member, bool raid, bool include_dependents = true) {
             StorageDevice? group = raid ? (StorageDevice?) member.raid_membership : member.volume_group;
             if (group == null) return "";
             var proxy = manager?.get_interface (group.path, PREFIX + (raid ? "MDRaid" : "VolumeGroup")) as DBusProxy;
@@ -1928,7 +1928,7 @@ namespace MajorisDisks {
             var records = new GenericArray<string> ();
             foreach (var candidate in snapshot.blocks.get_values ()) {
                 if ((raid && candidate.raid_membership == group) || (!raid && candidate.volume_group == group))
-                    records.add (modification_identity (candidate));
+                    records.add (modification_identity (candidate, include_dependents));
             }
             records.sort ((a, b) => strcmp (a, b));
             var result = new StringBuilder (uuid);
@@ -2572,13 +2572,17 @@ namespace MajorisDisks {
             return members;
         }
 
+        internal string lvm_membership_identity (StorageBlock anchor) {
+            return storage_membership_identity (anchor, false, false);
+        }
+
         private DBusProxy require_lvm_context (StorageBlock anchor, string identity, string uuid,
             bool recovery, out StorageVolumeGroup group) throws Error {
             require_volume (anchor, "PhysicalVolume");
             var current = anchor.volume_group;
             var proxy = current != null ? manager?.get_interface (current.path, PREFIX + "VolumeGroup") as DBusProxy : null;
             if (current == null || proxy == null || uuid == "" || current.uuid != uuid ||
-                identity == "" || storage_membership_identity (anchor, false) != identity)
+                identity == "" || lvm_membership_identity (anchor) != identity)
                 throw new IOError.NOT_FOUND ("The volume group or its physical members changed.");
             if (!current.missing_pvs_known || (!recovery && current.missing_pv_uuids.length != 0))
                 throw new IOError.BUSY ("Physical-volume membership is incomplete or unknown.");
@@ -2588,14 +2592,18 @@ namespace MajorisDisks {
             return proxy;
         }
 
-        private void fail_lvm_operation (StorageOperationResult result, string operation, bool dispatched, Error error) {
+        private void fail_lvm_operation (StorageJob job, StorageOperationResult result, string operation,
+            bool dispatched, Error error) {
             string remote = DBusError.get_remote_error (error) ?? "";
             bool rejected = remote.has_prefix ("org.freedesktop.UDisks2.Error.NotAuthorized") ||
                 remote == "org.freedesktop.UDisks2.Error.NotSupported" ||
                 remote == "org.freedesktop.DBus.Error.UnknownMethod" ||
                 remote == "org.freedesktop.DBus.Error.InvalidArgs";
             if (dispatched && !rejected) {
-                result.fail (operation + " requires attention", error);
+                string state = job.backend_completed && !job.backend_successful ? " failed in UDisks" :
+                    job.backend_path != "" && !job.backend_completed ? " is still being tracked by UDisks" :
+                    " has an unverified outcome";
+                result.fail (operation + state, error);
                 result.status = StorageOperationStatus.NEEDS_ATTENTION;
             } else {
                 result.fail (operation + (rejected ? " was rejected" : " was not started"), error);
@@ -2614,15 +2622,17 @@ namespace MajorisDisks {
                 if (safety.system_critical || safety.unknown_dependencies || (active_target == null && safety.active_dependents) ||
                     safety.mounted || !member.available || member.read_only ||
                     member.mount_configurations.length != 0 || member.encryption_configurations.length != 0)
-                    throw new IOError.BUSY ("Deactivate the logical volumes and close their dependencies. Protected or unresolved storage cannot be modified.");
+                    throw new IOError.BUSY ("Cannot modify physical volume %s. %s".printf (member.preferred,
+                        safety.reasons.length > 0 ? string.joinv (". ", safety.reasons) :
+                        "The device is unavailable or has persistent configuration."));
             }
             foreach (var item in snapshot.advanced.get_values ()) {
                 var lv = item as StorageLogicalVolume;
                 if (lv == null || lv.group_path != group.path) continue;
-                if ((lv != active_target && lv != active_candidate && (lv.active || lv.block_path != "/")) ||
-                    lv.child_configuration == null ||
-                    lv.child_configuration.n_children () != 0)
-                    throw new IOError.BUSY ("An active logical volume or persistent configuration prevents this operation.");
+                if (lv != active_target && lv != active_candidate && (lv.active || lv.block_path != "/"))
+                    throw new IOError.BUSY ("Deactivate logical volume %s before continuing.".printf (lv.name));
+                if (lv.child_configuration == null || lv.child_configuration.n_children () != 0)
+                    throw new IOError.BUSY ("Persistent configuration for logical volume %s is present or unverified.".printf (lv.name));
             }
         }
 
@@ -2709,6 +2719,8 @@ namespace MajorisDisks {
             var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_SILENCE);
             string? output;
             yield process.communicate_utf8_async (null, token, out output, null);
+            if (process.get_if_exited () && (process.get_exit_status () == 126 || process.get_exit_status () == 127))
+                throw new IOError.PERMISSION_DENIED ("Authorization to inspect the LVM cache was denied or cancelled.");
             if (!process.get_successful () || output == null)
                 throw new IOError.FAILED ("The cache inspector could not read a verified LVM report.");
             synchronize ();
@@ -2726,6 +2738,7 @@ namespace MajorisDisks {
             var status = LvmCacheStatus.find (report, name);
             if (status == null || status.uuid != uuid || lvm_volume_by_uuid (group, uuid)?.name != name)
                 throw new IOError.NOT_FOUND ("The cache identity could not be verified.");
+            status.separation_block_reason = status.separation_block (LvmCacheStatus.find (report, status.pool_name));
             return status;
         }
 
@@ -2777,18 +2790,28 @@ namespace MajorisDisks {
                 } else {
                     cache_name = original.pool_name;
                     var pool = LvmCacheStatus.find (before, cache_name);
-                    if (!original.clean () || pool == null || pool.uuid != original.pool_uuid || pool.layout != "cache-pool" ||
-                        pool.health != "" || pool.attributes.length != 10 || pool.attributes[8] != '-' ||
-                        origin.allocation (snapshot) == LvmAllocation.INCOMPLETE)
-                        throw new IOError.NOT_SUPPORTED ("The cache pool is damaged, has pending writes, or its state cannot be verified.");
-                    pool_uuid = pool.uuid;
+                    string reason = original.separation_block (pool);
+                    if (reason != "") throw new IOError.NOT_SUPPORTED (reason);
+                    if (origin.allocation (snapshot) == LvmAllocation.INCOMPLETE)
+                        throw new IOError.NOT_SUPPORTED ("The origin has incomplete physical allocation.");
+                    pool_uuid = original.pool_uuid;
                     parameters = new Variant ("(@a{sv})", options);
                 }
                 require_lvm_idle (group, members, origin, candidate);
                 yield KernelStorageSafety.require_idle (origin_block, token);
                 if (candidate_block != null) {
                     yield KernelStorageSafety.require_idle (candidate_block, token);
-                    yield require_zero_cache_candidate (candidate_block, job, token);
+                    ulong cancelled = token.cancelled.connect (() => job.cancellable.cancel ());
+                    job.cancelable = true;
+                    jobs.progress (job, "Checking that the cache candidate is empty", 0, true);
+                    try {
+                        token.set_error_if_cancelled ();
+                        yield require_zero_cache_candidate (candidate_block, job, job.cancellable);
+                        job.cancellable.set_error_if_cancelled ();
+                    } finally {
+                        SignalHandler.disconnect (token, cancelled);
+                        job.cancelable = false;
+                    }
                 }
                 if (!attach) {
                     var refreshed = yield read_lvm_cache_report (group, token);
@@ -2796,8 +2819,7 @@ namespace MajorisDisks {
                     var pool = LvmCacheStatus.find (refreshed, cache_name);
                     if (observed == null || observed.uuid != origin_uuid || observed.pool_name != cache_name ||
                         observed.pool_uuid != pool_uuid ||
-                        !observed.clean () || pool == null || pool.uuid != pool_uuid || pool.layout != "cache-pool" ||
-                        pool.health != "" || pool.attributes.length != 10 || pool.attributes[8] != '-')
+                        observed.separation_block (pool) != "")
                         throw new IOError.BUSY ("The cache relationship or pending-write state changed.");
                 }
                 synchronize ();
@@ -2826,37 +2848,43 @@ namespace MajorisDisks {
                 var reply = yield call_tracked_method (job, proxy, method, parameters, token);
                 if (!reply.is_of_type (new VariantType ("()")))
                     throw new IOError.INVALID_DATA ("UDisks returned an invalid cache reply.");
+                string pending = "The volume group or origin layout has not been confirmed.";
                 for (int i = 0; i < 100; i++) {
                     if (i % 10 == 0) yield poll_volume_group (vg, token);
                     yield settle_delay (token);
                     synchronize ();
                     var current = lvm_volume_by_uuid (group, origin_uuid);
-                    if (group.uuid != group_uuid || current == null || current.name != origin_name ||
+                    pending = "The volume group or origin layout has not been confirmed.";
+                    if (group.uuid != group_uuid || lvm_membership_identity (anchor) != identity ||
+                        current == null || current.name != origin_name ||
                         current.lvm_layout != (attach ? "cache" : "linear") ||
                         current.allocation (snapshot) == LvmAllocation.INCOMPLETE ||
                         volume_group_has_backend_job (group, members)) continue;
                     var mapping = snapshot.blocks.lookup (current.block_path);
+                    pending = "The origin mapping, size or content signature has not been confirmed.";
                     if (mapping == null || mapping.logical_volume != current || mapping.size != size ||
                         mapping.uuid != content_uuid || mapping.type_id != content_type) continue;
                     var report = yield read_lvm_cache_report (group, token);
                     var observed = LvmCacheStatus.find (report, origin_name);
-                    var pool = LvmCacheStatus.find (report, cache_name);
+                    var pool = LvmCacheStatus.find_uuid (report, attach ? candidate_uuid : pool_uuid);
+                    pending = "The cache pool relationship or health has not been confirmed.";
                     if (observed == null || observed.uuid != origin_uuid || observed.layout != current.lvm_layout) continue;
                     if (attach) {
-                        if (observed.pool_name != cache_name || pool == null || pool.uuid != observed.pool_uuid ||
-                            pool.layout != "cache-pool") continue;
+                        if (pool == null || pool.uuid != observed.pool_uuid || pool.name != observed.pool_name ||
+                            pool.layout != "cache-pool" || !pool.no_health_flags () || !observed.active_dm_cache () ||
+                            !observed.usage_known) continue;
                     } else {
                         if (observed.pool_name != "" ||
-                            (detach ? pool != null : pool == null || pool.uuid != pool_uuid || pool.layout != "cache-pool")) continue;
+                            (detach ? pool != null : pool == null || pool.layout != "cache-pool")) continue;
                     }
                     require_lvm_job_succeeded (job);
                     result.successful = true;
                     result.summary = attach ? "LVM cache relationship verified" : "LVM cache separated and origin mapping verified";
                     return;
                 }
-                throw new IOError.TIMED_OUT ("The backend did not publish enough information to verify the cache operation. Reassess the volume before further changes.");
+                throw new IOError.TIMED_OUT (pending + " Reassess the volume before further changes.");
             } catch (Error error) {
-                fail_lvm_operation (result, "Cache operation", dispatched, error);
+                fail_lvm_operation (job, result, "Cache operation", dispatched, error);
                 throw error;
             } finally {
                 jobs.finish (job, result);
@@ -2991,7 +3019,8 @@ namespace MajorisDisks {
                 bool redundant = layout != "linear" && layout != "raid0";
                 double last_progress = -1;
                 int64 deadline = get_monotonic_time () + (redundant ? 180 : 10) * TimeSpan.SECOND;
-                for (int i = 0; get_monotonic_time () < deadline; i++) {
+                int64 max_deadline = get_monotonic_time () + 30 * TimeSpan.MINUTE;
+                for (int i = 0; get_monotonic_time () < int64.min (deadline, max_deadline); i++) {
                     if (i % 10 == 0) yield poll_volume_group (proxy, token);
                     yield settle_delay (token);
                     synchronize ();
@@ -3001,13 +3030,17 @@ namespace MajorisDisks {
                     if (created_uuid != "" && created_uuid != created.uuid)
                         throw new IOError.NOT_FOUND ("The created logical volume changed identity.");
                     created_uuid = created.uuid;
-                    if (redundant && created.sync_ratio > last_progress && created.sync_ratio <= 1) {
-                        last_progress = created.sync_ratio;
-                        deadline = get_monotonic_time () + 180 * TimeSpan.SECOND;
+                    if (redundant) {
+                        bool known = created.sync_ratio >= 0 && created.sync_ratio <= 1;
+                        if (known && created.sync_ratio > last_progress) {
+                            last_progress = created.sync_ratio;
+                            deadline = get_monotonic_time () + 180 * TimeSpan.SECOND;
+                        }
                         jobs.progress (job, "Waiting for initial synchronization", created.sync_ratio,
-                            created.sync_ratio >= 0 && created.sync_ratio <= 1);
+                            known);
                     }
-                    if (created.size != size || created.lvm_layout != layout ||
+                    if (lvm_membership_identity (anchor) != identity || !group.missing_pvs_known ||
+                        group.missing_pv_uuids.length != 0 || created.size != size || created.lvm_layout != layout ||
                         created.allocation (snapshot) != LvmAllocation.COMPLETE ||
                         created.structure?.verifies_placement (paths) != true ||
                         (redundant && created.sync_ratio != 1) || volume_group_has_backend_job (group, members)) continue;
@@ -3018,7 +3051,7 @@ namespace MajorisDisks {
                 }
                 throw new IOError.TIMED_OUT ("The backend did not confirm the requested layout, placement and synchronization.");
             } catch (Error error) {
-                fail_lvm_operation (result, "Layout creation", dispatched, error);
+                fail_lvm_operation (job, result, "Layout creation", dispatched, error);
                 throw error;
             } finally {
                 jobs.finish (job, result);
@@ -3146,7 +3179,8 @@ namespace MajorisDisks {
                     throw new IOError.INVALID_DATA ("UDisks returned an invalid recovery reply.");
                 double last_progress = -1;
                 int64 deadline = get_monotonic_time () + (repairing ? 180 : 10) * TimeSpan.SECOND;
-                for (int i = 0; get_monotonic_time () < deadline; i++) {
+                int64 max_deadline = get_monotonic_time () + 30 * TimeSpan.MINUTE;
+                for (int i = 0; get_monotonic_time () < int64.min (deadline, max_deadline); i++) {
                     if (i % 10 == 0) yield poll_volume_group (vg, token);
                     yield settle_delay (token);
                     synchronize ();
@@ -3156,12 +3190,14 @@ namespace MajorisDisks {
                         var repaired = lvm_volume_by_uuid (group, repair_uuid);
                         if (repaired == null) continue;
                         double progress = repaired.sync_ratio;
-                        if (progress > last_progress && progress <= 1) {
+                        bool known = progress >= 0 && progress <= 1;
+                        if (known && progress > last_progress) {
                             last_progress = progress;
                             deadline = get_monotonic_time () + 180 * TimeSpan.SECOND;
-                            jobs.progress (job, "Waiting for RAID reconstruction", progress, progress >= 0);
                         }
-                        if (repaired.size != size || repaired.lvm_layout != "raid1" || progress != 1 ||
+                        jobs.progress (job, "Waiting for RAID reconstruction", progress, known);
+                        if (lvm_membership_identity (anchor) != identity ||
+                            repaired.size != size || repaired.lvm_layout != "raid1" || progress != 1 ||
                             repaired.allocation (snapshot) != LvmAllocation.COMPLETE ||
                             repaired.structure?.verifies_placement ({ survivor, replacement_path }) != true) continue;
                     } else {
@@ -3181,7 +3217,7 @@ namespace MajorisDisks {
                 }
                 throw new IOError.TIMED_OUT ("UDisks has yet to confirm the requested recovery outcome. Reassess the group before making further changes.");
             } catch (Error error) {
-                fail_lvm_operation (result, "Recovery", dispatched, error);
+                fail_lvm_operation (job, result, "Recovery", dispatched, error);
                 throw error;
             } finally {
                 jobs.finish (job, result);
@@ -3203,18 +3239,35 @@ namespace MajorisDisks {
             foreach (var item in snapshot.advanced.get_values ())
                 if (item is StorageVolumeGroup && item.name == name)
                     throw new IOError.EXISTS ("A volume group already has this name.");
-            string mapper = group.name.replace ("-", "--") + "-";
-            foreach (string path in new string[] { "/proc/cmdline", "/etc/fstab", "/etc/crypttab" }) {
-                string contents;
-                try {
-                    FileUtils.get_contents (path, out contents);
-                } catch (FileError error) {
-                    if (path != "/proc/cmdline" && error is FileError.NOENT) continue;
-                    throw new IOError.PERMISSION_DENIED ("Cannot inspect persistent storage references in " + path + ".");
-                }
-                if (contents.contains ("/dev/" + group.name + "/") || contents.contains ("/dev/mapper/" + mapper) ||
-                    contents.contains ("rd.lvm.lv=" + group.name + "/") || contents.contains ("rd.lvm.vg=" + group.name))
-                    throw new IOError.BUSY ("A persistent reference to this volume group was found in " + path + ".");
+        }
+
+        private async void require_no_vg_references (StorageVolumeGroup group, Cancellable token) throws Error {
+            string[] args = { "--vg-references", group.path, group.name, group.uuid };
+            var process = start_crypttab_inspector (args);
+            string? output;
+            yield process.communicate_utf8_async (null, token, out output, null);
+            if (!process.get_if_exited ())
+                throw new IOError.FAILED ("Persistent-reference inspection did not complete.");
+            switch (process.get_exit_status ()) {
+            case 0: break;
+            case 126: case 127:
+                throw new IOError.PERMISSION_DENIED ("Authorization to check persistent volume-group references was denied or cancelled.");
+            case 14:
+                throw new IOError.NOT_FOUND ("The volume group or persistent configuration changed during inspection.");
+            default:
+                throw new IOError.FAILED ("Boot or storage configuration could not be safely inspected.");
+            }
+            string report = output?.strip () ?? "";
+            if (!Regex.match_simple ("^vg-references:[0-7]$", report))
+                throw new IOError.INVALID_DATA ("The persistent-reference inspector returned an invalid result.");
+            int flags = report[report.length - 1] - '0';
+            if (flags != 0) {
+                string[] sources = {};
+                if ((flags & 1) != 0) sources += "/proc/cmdline";
+                if ((flags & 2) != 0) sources += "/etc/fstab";
+                if ((flags & 4) != 0) sources += "/etc/crypttab";
+                throw new IOError.BUSY ("Persistent references to this volume group were found in " +
+                    string.joinv (", ", sources) + ".");
             }
         }
 
@@ -3231,10 +3284,19 @@ namespace MajorisDisks {
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Checking persistent references and inactive storage");
                 yield require_lvm_method (proxy, "Rename", token);
+                require_lvm_rename_name (group, name);
                 require_lvm_idle (group, members);
                 foreach (var member in members) yield KernelStorageSafety.require_idle (member, token);
+                string old_name = group.name;
+                yield require_no_vg_references (group, token);
                 synchronize ();
-                if (require_lvm_context (anchor, identity, uuid, false, out group) != proxy)
+                if (require_lvm_context (anchor, identity, uuid, false, out group) != proxy || group.name != old_name)
+                    throw new IOError.NOT_FOUND ("The volume-group object changed.");
+                require_lvm_idle (group, members);
+                require_lvm_rename_name (group, name);
+                foreach (var member in members) yield KernelStorageSafety.require_idle (member, token);
+                synchronize ();
+                if (require_lvm_context (anchor, identity, uuid, false, out group) != proxy || group.name != old_name)
                     throw new IOError.NOT_FOUND ("The volume-group object changed.");
                 require_lvm_idle (group, members);
                 require_lvm_rename_name (group, name);
@@ -3258,13 +3320,19 @@ namespace MajorisDisks {
                     synchronize ();
                     var changed = snapshot.advanced.lookup (path) as StorageVolumeGroup;
                     if (changed != null && changed.uuid == uuid && changed.name == name &&
-                        anchor.volume_group == changed && storage_membership_identity (anchor, false) == identity) {
+                        anchor.volume_group == changed && lvm_membership_identity (anchor) == identity) {
                         int found = 0;
+                        int total = 0;
                         foreach (var item in snapshot.advanced.get_values ()) {
                             var lv = item as StorageLogicalVolume;
-                            if (lv != null && lv.group_path == path && lv.uuid in volumes) found++;
+                            if (lv != null && lv.group_path == path) {
+                                total++;
+                                if (lv.uuid in volumes) found++;
+                            }
                         }
-                        if (found == volumes.length && !volume_group_has_backend_job (changed, members)) {
+                        if (total == volumes.length && found == volumes.length &&
+                            changed.missing_pvs_known && changed.missing_pv_uuids.length == 0 &&
+                            !volume_group_has_backend_job (changed, members)) {
                             require_lvm_job_succeeded (job);
                             outcome.successful = true;
                             outcome.summary = "Volume group renamed and membership verified";
@@ -3275,7 +3343,7 @@ namespace MajorisDisks {
                 }
                 throw new IOError.TIMED_OUT ("UDisks did not confirm the renamed volume group and its members.");
             } catch (Error error) {
-                fail_lvm_operation (outcome, "Volume-group rename", dispatched, error);
+                fail_lvm_operation (job, outcome, "Volume-group rename", dispatched, error);
                 throw error;
             } finally {
                 jobs.finish (job, outcome);
@@ -4393,9 +4461,10 @@ namespace MajorisDisks {
             } finally { locks.release_path (path); }
         }
 
-        public string modification_identity (StorageBlock block) {
+        public string modification_identity (StorageBlock block, bool include_dependents = true) {
             var records = new GenericArray<string> ();
-            foreach (var node in snapshot.dependencies.descendants (block)) {
+            StorageDevice[] nodes = include_dependents ? snapshot.dependencies.descendants (block) : new StorageDevice[] { block };
+            foreach (var node in nodes) {
                 var child = node as StorageBlock;
                 if (child == null) continue;
                 var partition = child.partition;
@@ -4407,6 +4476,8 @@ namespace MajorisDisks {
                     child.uuid, partition?.uuid ?? "", partition?.table_path ?? "",
                     child.table?.scheme ?? "", child.number, child.size, partition_offset,
                     child.logical_sector_size, partition_number).print (false));
+                if (!include_dependents && child.loop != null)
+                    records.add (new Variant.string (child.loop.backing_file).print (true));
             }
             records.sort ((left, right) => strcmp (left, right));
             var identity = new StringBuilder ();
@@ -7091,18 +7162,22 @@ namespace MajorisDisks {
         [CCode (cname = "MAJORIS_CRYPTTAB_INSPECTOR", cheader_filename = "crypttab-inspector-config.h")]
         private extern const string CRYPTTAB_INSPECTOR;
 
-        private async string inspect_crypttab (string name, string old_name, string device,
-            string options, string old_path, string new_path, string? expected = null) throws Error {
-            string[] argv = { CRYPTTAB_INSPECTOR, name, old_name, device, options, old_path, new_path };
+        private Subprocess start_crypttab_inspector (string[] args) throws Error {
+            string[] argv = { CRYPTTAB_INSPECTOR };
             if (Posix.geteuid () != 0) {
                 if (!FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE))
-                    throw new IOError.NOT_SUPPORTED ("Install pkexec to authorize inspection of protected unlocking configuration.");
-                argv = { "/usr/bin/pkexec", "--disable-internal-agent", CRYPTTAB_INSPECTOR,
-                    name, old_name, device, options, old_path, new_path };
+                    throw new IOError.NOT_SUPPORTED ("Install pkexec to authorize inspection of protected storage configuration.");
+                argv = { "/usr/bin/pkexec", "--disable-internal-agent", CRYPTTAB_INSPECTOR };
             }
             if (!FileUtils.test (CRYPTTAB_INSPECTOR, FileTest.IS_EXECUTABLE))
                 throw new IOError.NOT_SUPPORTED ("The protected crypttab inspector is unavailable.");
-            var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_SILENCE);
+            foreach (string arg in args) argv += arg;
+            return new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_SILENCE);
+        }
+
+        private async string inspect_crypttab (string name, string old_name, string device,
+            string options, string old_path, string new_path, string? expected = null) throws Error {
+            var process = start_crypttab_inspector ({ name, old_name, device, options, old_path, new_path });
             string? output;
             yield process.communicate_utf8_async (null, backend_lifetime, out output, null);
             if (!process.get_if_exited ())

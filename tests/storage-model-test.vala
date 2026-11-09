@@ -1438,7 +1438,8 @@ private void test_lvm_layout_capacity () {
     assert (LvmLayout.required_per_pv ("raid0", 2, 64, 4) == 32);
     assert (LvmLayout.required_per_pv ("raid1", 2, 64, 4) == 68);
     assert (LvmLayout.required_per_pv ("raid5", 3, 64, 4) == 36);
-    assert (LvmLayout.required_per_pv ("raid6", 4, 64, 4) == 36);
+    assert (LvmLayout.required_per_pv ("raid6", 5, 72, 4) == 28);
+    assert (LvmLayout.required_per_pv ("raid6", 4, 64, 4) == 0);
     assert (LvmLayout.required_per_pv ("raid10", 4, 64, 4) == 36);
     assert (LvmLayout.required_per_pv ("raid10", 5, 64, 4) == 0);
     assert (LvmLayout.required_per_pv ("raid6", 3, 64, 4) == 0);
@@ -1452,21 +1453,30 @@ private void test_lvm_cache_report () {
         {"report":[{"lv":[{"vg_uuid":"vg","lv_uuid":"origin","lv_name":"origin","segtype":"cache",
         "pool_lv":"[pool]","pool_lv_uuid":"pool","cache_mode":"writeback","cache_dirty_blocks":"0","cache_total_blocks":"200",
         "lv_attr":"Cwi-a-C---","lv_health_status":"","lv_check_needed":""},
-        {"vg_uuid":"vg","lv_uuid":"pool","lv_name":"[pool]","segtype":"cache-pool"}]}]}
+        {"vg_uuid":"vg","lv_uuid":"pool","lv_name":"[pool]","segtype":"cache-pool",
+        "lv_attr":"Cwi---C---","lv_health_status":"","lv_check_needed":"unknown"}]}]}
         """;
     try {
         var entries = LvmCacheStatus.parse_report (report, "vg");
         var origin = LvmCacheStatus.find (entries, "origin");
         assert (origin != null && origin.clean ());
-        assert (LvmCacheStatus.find (entries, origin.pool_name)?.layout == "cache-pool");
+        var pool = LvmCacheStatus.find (entries, origin.pool_name);
+        assert (origin.separation_block (pool) == "");
+        assert (origin.separation_block (null) != "");
         entries = LvmCacheStatus.parse_report (report.replace ("\"cache_dirty_blocks\":\"0\"", "\"cache_dirty_blocks\":\"2\""), "vg");
         assert (!entries[0].clean ());
+        assert (entries[0].separation_block (entries[1]) == "The cache has pending writes.");
         entries = LvmCacheStatus.parse_report (report.replace ("\"cache_dirty_blocks\":\"0\"", "\"cache_dirty_blocks\":false"), "vg");
+        assert (!entries[0].clean ());
+        assert (entries[0].separation_block (entries[1]) == "The dirty-block count is unavailable.");
+        entries = LvmCacheStatus.parse_report (report.replace ("\"cache_total_blocks\":\"200\"", "\"cache_total_blocks\":\"-1\""), "vg");
         assert (!entries[0].clean ());
         entries = LvmCacheStatus.parse_report (report.replace ("\"lv_health_status\":\"\"", "\"lv_health_status\":\"partial\""), "vg");
         assert (!entries[0].clean ());
         entries = LvmCacheStatus.parse_report (report.replace ("\"lv_check_needed\":\"\"", "\"lv_check_needed\":\"check needed\""), "vg");
         assert (!entries[0].clean ());
+        entries = LvmCacheStatus.parse_report (report.replace ("\"segtype\":\"cache\"", "\"segtype\":\"writecache\""), "vg");
+        assert (!entries[0].clean () && entries[0].separation_block (entries[1]) != "");
     } catch (Error error) { assert_not_reached (); }
     try {
         LvmCacheStatus.parse_report (report, "wrong-vg");

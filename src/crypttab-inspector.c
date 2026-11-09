@@ -1,6 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
-#include <glib.h>
+#include <gio/gio.h>
 #include <stdint.h>
 #include <linux/openat2.h>
 #include <stdio.h>
@@ -291,19 +291,142 @@ done:
     return result;
 }
 
+static int
+scan_vg_references(FILE *file, const char *name, const char *mapper)
+{
+    g_autofree char *device = g_strdup_printf("/dev/%s/", name);
+    g_autofree char *mapped = g_strdup_printf("/dev/mapper/%s-", mapper);
+    g_autofree char *by_id = g_strdup_printf("/dev/disk/by-id/dm-name-%s-", mapper);
+    g_autofree char *boot_lv = g_strdup_printf("rd.lvm.lv=%s/", name);
+    g_autofree char *boot_vg = g_strdup_printf("rd.lvm.vg=%s", name);
+    g_autofree char *line = NULL;
+    size_t capacity = 0, total = 0;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, file)) >= 0) {
+        total += length;
+        if (total > MAX_CONFIG_SIZE || memchr(line, '\0', length))
+            return INSPECTION_FAILED;
+        g_strstrip(line);
+        if (!*line || *line == '#')
+            continue;
+        g_autofree char *decoded = decode_field(line);
+        if (!decoded)
+            return INSPECTION_FAILED;
+        if (strstr(decoded, device) || strstr(decoded, mapped) ||
+            strstr(decoded, by_id) || strstr(decoded, boot_lv))
+            return CONFLICT;
+        for (const char *p = decoded; (p = strstr(p, boot_vg)); p++) {
+            const char *end = p + strlen(boot_vg);
+            if ((p == decoded || g_ascii_isspace(p[-1]) || p[-1] == '"') &&
+                (!*end || g_ascii_isspace(*end) || *end == '"'))
+                return CONFLICT;
+        }
+    }
+    return ferror(file) ? INSPECTION_FAILED : 0;
+}
+
+static gboolean
+same_file(const struct stat *original, const struct stat *current)
+{
+    return original->st_dev == current->st_dev && original->st_ino == current->st_ino &&
+        original->st_ctim.tv_sec == current->st_ctim.tv_sec &&
+        original->st_ctim.tv_nsec == current->st_ctim.tv_nsec;
+}
+
+static int
+inspect_vg_file(int root, const char *path, gboolean optional, const char *name, const char *mapper)
+{
+    int fd = open_safe(root, path, O_PATH);
+    if (fd < 0)
+        return optional && errno == ENOENT ? 0 : INSPECTION_FAILED;
+    struct stat original, current;
+    if (fstat(fd, &original) < 0 || !S_ISREG(original.st_mode) ||
+        original.st_uid != 0 || (original.st_mode & 0022) || original.st_size > MAX_CONFIG_SIZE) {
+        close(fd);
+        return UNSAFE;
+    }
+    g_autofree char *descriptor = g_strdup_printf("/proc/self/fd/%d", fd);
+    int reader = open(descriptor, O_RDONLY | O_CLOEXEC);
+    close(fd);
+    if (reader < 0)
+        return INSPECTION_FAILED;
+    FILE *file = fdopen(reader, "r");
+    if (!file) {
+        close(reader);
+        return INSPECTION_FAILED;
+    }
+    int result = scan_vg_references(file, name, mapper);
+    fclose(file);
+    if (!result && (fstatat(root, path, &current, AT_SYMLINK_NOFOLLOW) < 0 ||
+                    !same_file(&original, &current)))
+        return STALE;
+    return result;
+}
+
+static gboolean
+verify_vg(GDBusConnection *bus, const char *path, const char *name, const char *uuid)
+{
+    g_autoptr(GVariant) reply = g_dbus_connection_call_sync(bus, "org.freedesktop.UDisks2", path,
+        "org.freedesktop.DBus.Properties", "GetAll", g_variant_new("(s)", "org.freedesktop.UDisks2.VolumeGroup"),
+        G_VARIANT_TYPE("(a{sv})"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 5000, NULL, NULL);
+    if (!reply)
+        return FALSE;
+    g_autoptr(GVariant) properties = g_variant_get_child_value(reply, 0);
+    const char *observed_name, *observed_uuid;
+    return g_variant_lookup(properties, "Name", "&s", &observed_name) &&
+        g_variant_lookup(properties, "UUID", "&s", &observed_uuid) &&
+        !strcmp(name, observed_name) && !strcmp(uuid, observed_uuid);
+}
+
+static int
+inspect_vg(int root, const char *path, const char *name, const char *uuid)
+{
+    static const char *files[] = {"proc/cmdline", "etc/fstab", "etc/crypttab"};
+    if (!g_str_has_prefix(path, "/org/freedesktop/UDisks2/lvm/") || !g_variant_is_object_path(path) ||
+        !valid_name(name) || name[0] == '-' || !valid_name(uuid))
+        return INSPECTION_FAILED;
+    int etc = open_safe(root, "etc", O_PATH | O_DIRECTORY);
+    if (etc < 0)
+        return INSPECTION_FAILED;
+    gboolean safe = protected_directory(etc);
+    close(etc);
+    if (!safe)
+        return UNSAFE;
+    g_autoptr(GDBusConnection) bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, NULL);
+    if (!bus || !verify_vg(bus, path, name, uuid))
+        return STALE;
+    g_auto(GStrv) parts = g_strsplit(name, "-", -1);
+    g_autofree char *mapper = g_strjoinv("--", parts);
+    unsigned findings = 0;
+    for (guint i = 0; i < G_N_ELEMENTS(files); i++) {
+        int result = inspect_vg_file(root, files[i], i != 0, name, mapper);
+        if (result == CONFLICT)
+            findings |= 1u << i;
+        else if (result)
+            return result;
+    }
+    if (!verify_vg(bus, path, name, uuid))
+        return STALE;
+    printf("vg-references:%u\n", findings);
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
-    if (geteuid() != 0 || argc != 7)
+    if (geteuid() != 0 || (argc != 7 && argc != 5))
         return INSPECTION_FAILED;
     for (int i = 1; i < argc; i++)
         if (strlen(argv[i]) > 4096)
             return INSPECTION_FAILED;
-    if ((*argv[1] && !valid_name(argv[1])) || (*argv[2] && !valid_name(argv[2])) ||
-        (!*argv[1] && !*argv[2]) || !*argv[3] || (!*argv[2] && *argv[5]))
-        return INSPECTION_FAILED;
-    if (!managed(argv[5]) || !managed(argv[6]))
-        return EXTERNAL;
+    gboolean vg_mode = argc == 5 && !strcmp(argv[1], "--vg-references");
+    if (!vg_mode) {
+        if (argc != 7 || (*argv[1] && !valid_name(argv[1])) || (*argv[2] && !valid_name(argv[2])) ||
+            (!*argv[1] && !*argv[2]) || !*argv[3] || (!*argv[2] && *argv[5]))
+            return INSPECTION_FAILED;
+        if (!managed(argv[5]) || !managed(argv[6]))
+            return EXTERNAL;
+    }
     // An authorized desktop caller must inspect the system configuration,
     // not a tree substituted in its own private namespace.
     if (g_getenv("PKEXEC_UID")) {
@@ -315,7 +438,8 @@ main(int argc, char **argv)
     int root = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (root < 0)
         return INSPECTION_FAILED;
-    int result = inspect(root, argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
+    int result = vg_mode ? inspect_vg(root, argv[2], argv[3], argv[4]) :
+        inspect(root, argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
     close(root);
     return result;
 }
