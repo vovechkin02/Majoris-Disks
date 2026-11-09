@@ -1486,17 +1486,20 @@ private void test_lvm_cache_report () {
 
 private static void test_btrfs_filesystem_info () {
     try {
-        var data = Variant.parse (new VariantType ("(tta(sttt)a(ttttssbb)tttbstb)"),
+        var data = Variant.parse (new VariantType ("(tta(sttt)a(ttttssbb)tttbstba(tsat))"),
             "(1000, 2, [('Data (RAID 1)', 600, 100, 17), ('Data (single)', 200, 30, 1)], " +
             "[(1, 42, 1000, 700, 'present-uuid', 'Present', true, true), " +
             "(2, 0, 1000, 600, 'missing-uuid', 'Missing', true, false)], " +
-            "130, 500, 10, true, 'none', 600, true)");
+            "130, 500, 10, true, 'none', 600, true, [(1, '/dev/fixture', [1, 2, 0, 0, 0]), (2, '', [])])");
         var info = new BtrfsFilesystemInfo ("fs-uuid", "Example", data);
         assert (info.uuid == "fs-uuid" && info.label == "Example");
         assert (info.member_count == 2 && info.members.length == 2);
         assert (info.members[0].number == 42 && info.members[0].has_errors);
+        assert (info.members[0].filesystem_uuid == info.uuid && info.members[0].device_path == "/dev/fixture");
+        assert (info.members[0].error_counters.length == 5 && info.members[0].error_counters[1] == 2);
         assert (info.members[1].id == 2 && info.members[1].number == 0 && info.members[1].state == "Missing");
         assert (info.members[1].allocation_known && info.members[1].uuid == "missing-uuid");
+        assert (info.members[1].device_path == "" && info.members[1].error_counters.length == 0);
         assert (info.profiles.length == 2 && info.profiles[0].flags == 17 && info.profiles[1].flags == 1);
         assert (info.read_only && info.estimated_available == 500 && info.global_reserve == 10);
         assert (info.overhead_known && info.replication_overhead == 600);
@@ -1506,9 +1509,62 @@ private static void test_btrfs_filesystem_info () {
     }
 }
 
+private static void test_btrfs_replacement_model () {
+    try {
+        string uuid = Uuid.string_random ();
+        var data = Variant.parse (new VariantType ("(tta(sttt)a(ttttssbb)tttbstb)"),
+            "(1000, 2, [('Data', 600, 100, 17), ('Metadata', 200, 30, 20), ('System', 200, 30, 18)], " +
+            "[(1, 42, 1000, 700, '%s', 'Present', true, false), (2, 0, 1000, 600, '%s', 'Missing', true, false)], ".printf (
+                Uuid.string_random (), Uuid.string_random ()) + "160, 500, 10, false, 'none', 600, true)");
+        var info = new BtrfsFilesystemInfo (uuid, "Example", data);
+        var survivor = info.members[0];
+        var source = info.members[1];
+        assert (info.replacement_restriction (source) == "");
+        source.filesystem_uuid = Uuid.string_random ();
+        assert (info.replacement_restriction (source) != "");
+        source.filesystem_uuid = uuid;
+        foreach (uint64 flags in new uint64[] { 1, 9, 1029, 2049, 8193 }) {
+            info.profiles[0].flags = flags;
+            assert (info.replacement_restriction (source) != "");
+        }
+        info.profiles[0].flags = 17;
+        survivor.has_errors = true;
+        assert (info.replacement_restriction (source) != "");
+        survivor.has_errors = false;
+        source.allocation_known = false;
+        assert (info.replacement_restriction (source) != "");
+        source.allocation_known = true;
+        source.state = "Replacement target";
+        assert (info.replacement_restriction (source) != "");
+        source.state = "Present";
+        source.number = 43;
+        source.has_errors = true;
+        assert (info.replacement_restriction (source) == "");
+        assert (info.replacement_restriction (source, true) == "");
+        info.exclusive_operation = "balance";
+        assert (info.replacement_restriction (source) != "");
+        info.exclusive_operation = "none";
+        info.member_count = 0;
+        assert (info.replacement_restriction (source) != "");
+        assert (new BtrfsReplacementStatus (uuid, "1 850 12 0 2 3 0").active);
+        assert (new BtrfsReplacementStatus (uuid, "4 850 12 0 2 3 0").active);
+        assert (!new BtrfsReplacementStatus (uuid, "2 1000 12 24 0 0 0").active);
+        assert (!new BtrfsReplacementStatus (uuid, "3 0 12 24 0 0 0").active);
+        assert (new BtrfsReplacementStatus (uuid, "999 0 12 24 0 0 0").state_label () == "Unknown replacement state");
+        try {
+            new BtrfsReplacementStatus (uuid, "2 1001 12 24 0 0 0");
+            assert_not_reached ();
+        } catch (IOError.INVALID_DATA error) {}
+    } catch (Error error) {
+        Test.message ("%s", error.message);
+        Test.fail ();
+    }
+}
+
 public static int main (string[] args) {
     Test.init (ref args);
     Test.add_func ("/storage/btrfs-filesystem-info", test_btrfs_filesystem_info);
+    Test.add_func ("/storage/btrfs-replacement", test_btrfs_replacement_model);
     if (Environment.get_variable ("MAJORIS_CAPACITY_LOOP") != null)
         Test.add_func ("/operations/capacity-udisks-fixture", test_capacity_udisks_fixture);
     if (Environment.get_variable ("MAJORIS_CAPACITY_FIXTURE") != null)

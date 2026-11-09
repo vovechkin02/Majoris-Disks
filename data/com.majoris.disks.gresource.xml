@@ -26,6 +26,7 @@
     <file>ui/create-storage-group-dialog.ui</file>
     <file>ui/btrfs-subvolumes-dialog.ui</file>
     <file>ui/btrfs-balance-dialog.ui</file>
+    <file>ui/btrfs-device-replace-dialog.ui</file>
     <file>ui/ownership-dialog.ui</file>
     <file>ui/edit-partition-dialog.ui</file>
     <file>ui/operation-result-dialog.ui</file>

@@ -30,7 +30,7 @@ nbd_helper_test = executable('nbd-helper-test', 'tests/nbd-helper-test.c', 'src/
   include_directories: xz_include, dependencies: dependency('gio-2.0'))
 test('nbd-helper', nbd_helper_test)
 btrfs_default_test = executable('btrfs-default-test', 'tests/btrfs-default-test.c', 'src/btrfs-inspect.c',
-  include_directories: xz_include, dependencies: dependency('glib-2.0'))
+  include_directories: xz_include, dependencies: [dependency('gio-2.0'), blkid_c])
 test('btrfs-default-helper', btrfs_default_test)
 test('disposable-btrfs-mount-integration', sh,
   args: [meson.current_source_dir() / 'tests/disposable-btrfs-mount-integration.sh', btrfs_default_test], depends: btrfs_default_helper,
@@ -38,6 +38,11 @@ test('disposable-btrfs-mount-integration', sh,
 test('btrfs-discovery-integration', sh,
   args: [meson.current_source_dir() / 'tests/btrfs-discovery-integration.sh', btrfs_default_test],
   timeout: 120, is_parallel: false)
+foreach scenario : ['healthy', 'larger', 'prefer-survivor', 'failing', 'missing', 'nonredundant', 'small', 'unsafe', 'cancel']
+  test('btrfs-device-replace-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/btrfs-device-replace-integration.sh', btrfs_default_helper, scenario],
+    depends: btrfs_status_helper, timeout: 240, is_parallel: false)
+endforeach
 if mount_dep.found()
   test('mount-restoration-integration', sh,
     args: [meson.current_source_dir() / 'tests/mount-restoration-integration.sh', mount_restoration_helper],
@@ -61,7 +66,8 @@ xvfb = find_program('xvfb-run', required: false)
 if xvfb.found()
   ui_test = executable('ui-template-test', 'tests/ui-template-test.vala',
     storage_model_sources + luks_ui_sources + files('src/udisks-service.vala', 'src/window.vala',
-      'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala', 'src/health-preferences.vala', 'src/benchmark-dialog.vala'),
+      'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala', 'src/health-preferences.vala',
+      'src/benchmark-dialog.vala', 'src/btrfs-device-replace-dialog.vala'),
     resources, include_directories: xz_include, dependencies: deps)
   test('ui-templates', xvfb, args: ['-a', ui_test])
 endif

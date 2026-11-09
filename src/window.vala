@@ -11,6 +11,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow advanced_manage;
         [GtkChild] private unowned Adw.ActionRow advanced_maintenance;
         [GtkChild] private unowned Adw.ActionRow advanced_recovery;
+        [GtkChild] private unowned Adw.ActionRow advanced_btrfs_replace;
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_rename;
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_refresh;
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_cleanup;
@@ -36,6 +37,10 @@ namespace MajorisDisks {
         private string? requested_drive;
         private bool updating;
         private bool close_confirmed;
+        private uint replacement_monitor;
+        private bool checking_replacements;
+        private HashTable<string, BtrfsReplacementStatus> replacement_statuses =
+            new HashTable<string, BtrfsReplacementStatus> (str_hash, str_equal);
         private HashTable<string, StorageBlock> pending = new HashTable<string, StorageBlock> (str_hash, str_equal);
 
         static construct {
@@ -89,6 +94,10 @@ namespace MajorisDisks {
                 if (context == null) return;
                 if (advanced_device is StorageRaid) confirm_degraded_raid (context);
                 else manage_btrfs_balance (context);
+            });
+            advanced_btrfs_replace.activated.connect (() => {
+                var context = advanced_context;
+                if (context != null) new BtrfsDeviceReplaceDialog (backend, context).present (this);
             });
             advanced_lvm_rename.activated.connect (() => {
                 var group = advanced_device as StorageVolumeGroup;
@@ -144,6 +153,19 @@ namespace MajorisDisks {
                 create_vg.set_enabled (backend.can_create_storage_group (false));
                 create_raid.set_enabled (backend.can_create_storage_group (true));
                 update_devices ();
+                monitor_btrfs_replacements.begin ();
+            });
+            map.connect (() => {
+                monitor_btrfs_replacements.begin ();
+                if (replacement_monitor == 0)
+                    replacement_monitor = Timeout.add_seconds (5, () => {
+                        monitor_btrfs_replacements.begin ();
+                        return Source.CONTINUE;
+                    });
+            });
+            unmap.connect (() => {
+                if (replacement_monitor != 0) Source.remove (replacement_monitor);
+                replacement_monitor = 0;
             });
             drive_view.backend = backend;
             drive_view.action_requested.connect ((block, method) => {
@@ -436,6 +458,31 @@ namespace MajorisDisks {
                     show_check_message ("Could not confirm the RAID consistency check", operation_error (error));
                 }
             });
+        }
+
+        private async void monitor_btrfs_replacements () {
+            if (checking_replacements || !get_mapped () || !backend.has_btrfs_replacement_helper ()) return;
+            checking_replacements = true;
+            var mounted = new HashTable<string, bool> (str_hash, str_equal);
+            foreach (var block in backend.snapshot.blocks.get_values ())
+                if (block.type_id == "btrfs" && block.filesystem?.mounted == true && Uuid.string_is_valid (block.uuid))
+                    mounted.add (block.uuid);
+            var observed = new HashTable<string, BtrfsReplacementStatus> (str_hash, str_equal);
+            foreach (var uuid in mounted.get_keys ()) {
+                try {
+                    observed.insert (uuid, yield backend.btrfs_replacement_status (uuid));
+                } catch (Error error) {}
+            }
+            replacement_statuses = observed;
+            update_replacement_row ();
+            checking_replacements = false;
+        }
+
+        private void update_replacement_row () {
+            var current = advanced_context != null ? replacement_statuses.lookup (advanced_context.uuid) : null;
+            advanced_btrfs_replace.subtitle = current == null ? "View kernel replacement status and review eligible devices" :
+                current.active ? "%s · %.1f%%".printf (current.state_label (), current.progress_1000 / 10.0) :
+                current.state_label ();
         }
 
         private void manage_btrfs_balance (StorageBlock block) {
@@ -1807,6 +1854,7 @@ namespace MajorisDisks {
             advanced_context = null;
             advanced_summary.title = item.name != "" ? item.name : "Storage Object";
             advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible = false;
+            advanced_btrfs_replace.visible = false;
             advanced_lvm_rename.visible = advanced_lvm_refresh.visible = advanced_lvm_cleanup.visible =
                 advanced_lvm_repair.visible = advanced_lvm_cache.visible = advanced_lvm_uncache.visible = false;
             advanced_lvm_layout.visible = false;
@@ -1914,6 +1962,9 @@ namespace MajorisDisks {
                 advanced_manage.title = "Manage Subvolumes";
                 advanced_maintenance.title = "View Allocation";
                 advanced_recovery.title = "Balance and Scrub";
+                advanced_btrfs_replace.visible = backend.has_btrfs_subvolumes (filesystem) &&
+                    backend.has_btrfs_replacement_helper ();
+                update_replacement_row ();
                 advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible =
                     backend.has_btrfs_subvolumes (filesystem);
             }

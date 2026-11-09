@@ -39,6 +39,7 @@
 <child><object class="AdwActionRow" id="advanced_manage"><property name="activatable">True</property></object></child>
 <child><object class="AdwActionRow" id="advanced_maintenance"><property name="activatable">True</property></object></child>
 <child><object class="AdwActionRow" id="advanced_recovery"><property name="activatable">True</property></object></child>
+<child><object class="AdwActionRow" id="advanced_btrfs_replace"><property name="title">Replace Btrfs Device…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
 <child><object class="AdwActionRow" id="advanced_lvm_rename"><property name="title">Rename Volume Group…</property><property name="activatable">True</property><property name="visible">False</property></object></child>
 <child><object class="AdwActionRow" id="advanced_lvm_refresh"><property name="title">Refresh and Reassess</property><property name="activatable">True</property><property name="visible">False</property></object></child>
 <child><object class="AdwActionRow" id="advanced_lvm_repair"><property name="title">Repair LVM RAID 1…</property><property name="activatable">True</property><property name="visible">False</property></object></child>

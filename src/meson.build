@@ -5,7 +5,7 @@ storage_model_sources = files('device.vala', 'layout.vala', 'hierarchy.vala', 's
   'storage-operation.vala', 'health-monitor.vala', 'disk-benchmark.vala', 'disk-image-copy.vala', 'xz-stream.c', 'nbd-identity.c', 'btrfs-inspect.c', 'virtual-disk.vala', 'virtual-disk-attachment.vala', 'blkid.vapi', 'filesystem-resize.vala', 'kernel-storage-safety.vala', 'mount-restoration.vala', 'restoration-credential.vala')
 luks_ui_sources = files('luks-credential-dialog.vala')
 sources = storage_model_sources + luks_ui_sources + files('main.vala', 'health-preferences.vala', 'benchmark-dialog.vala', 'udisks-service.vala', 'window.vala',
-  'drive-view.vala', 'filesystem-usage.vala', 'partition-map.vala')
+  'drive-view.vala', 'filesystem-usage.vala', 'partition-map.vala', 'btrfs-device-replace-dialog.vala')
 
 executable('majoris-disks', sources, resources,
   include_directories: xz_include, dependencies: deps, install: true)
@@ -24,7 +24,10 @@ configure_file(input: 'btrfs-default-config.h.in', output: 'btrfs-default-config
 configure_file(input: '../data/com.majoris.disks.Btrfs.policy.in', output: 'com.majoris.disks.Btrfs.policy',
   configuration: btrfs_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
 btrfs_default_helper = executable('majoris-disks-btrfs-default', ['btrfs-default-helper.c', 'btrfs-inspect.c'],
-  dependencies: dependency('glib-2.0'), install: true, install_dir: get_option('libexecdir'))
+  dependencies: [dependency('gio-2.0'), blkid_c], install: true, install_dir: get_option('libexecdir'))
+btrfs_status_helper = executable('majoris-disks-btrfs-status', ['btrfs-default-helper.c', 'btrfs-inspect.c'],
+  c_args: '-DMAJORIS_BTRFS_STATUS_ONLY',
+  dependencies: [dependency('gio-2.0'), blkid_c], install: true, install_dir: get_option('libexecdir'))
 
 luks_config = configuration_data()
 luks_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))

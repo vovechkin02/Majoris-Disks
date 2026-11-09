@@ -2,9 +2,15 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
+  <action id="com.majoris.disks.btrfs-replacement-status">
+    <description>Inspect Btrfs device replacement and target eligibility</description>
+    <message>Check Btrfs device replacement status or target eligibility</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/majoris-disks-btrfs-status</annotate>
+  </action>
   <action id="com.majoris.disks.btrfs-default">
-    <description>Verify Btrfs storage and manage the default subvolume</description>
-    <message>Authentication is required to verify Btrfs mount or member safety, or manage the default subvolume</message>
+    <description>Verify and manage Btrfs storage</description>
+    <message>Authentication is required to verify or modify Btrfs storage</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>auth_admin</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/majoris-disks-btrfs-default</annotate>
   </action>

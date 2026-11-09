@@ -6,6 +6,61 @@
 #include <errno.h>
 #include "btrfs-inspect.h"
 
+static guint64 fixture_count;
+static guint count_requests;
+
+static int
+fixture_space_info (int fd, struct btrfs_ioctl_space_args *spaces)
+{
+    (void) fd;
+    if (spaces->space_slots == 0) {
+        spaces->total_spaces = count_requests++ == 0 ? fixture_count : fixture_count + 1;
+    } else {
+        guint64 actual = fixture_count + 1;
+        spaces->total_spaces = MIN (actual, spaces->space_slots);
+        if (spaces->total_spaces == actual)
+            spaces->spaces[actual - 1].flags = BTRFS_SPACE_INFO_GLOBAL_RSV;
+    }
+    return 0;
+}
+
+static gpointer
+fail_allocation (gsize size)
+{
+    g_assert_cmpuint (size, >, 0);
+    return NULL;
+}
+
+static void
+test_space_info (void)
+{
+    const guint64 counts[] = { 1, 64, 90 };
+    for (guint i = 0; i < G_N_ELEMENTS (counts); i++) {
+        fixture_count = counts[i] - 1;
+        count_requests = 1;
+        g_autofree struct btrfs_ioctl_space_args *spaces =
+            majoris_btrfs_read_spaces (-1, fixture_space_info, g_try_malloc0);
+        g_assert_nonnull (spaces);
+        g_assert_cmpuint (spaces->total_spaces, ==, counts[i]);
+        fixture_count++;
+        count_requests = 0;
+        g_clear_pointer (&spaces, g_free);
+        spaces = majoris_btrfs_read_spaces (-1, fixture_space_info, g_try_malloc0);
+        g_assert_nonnull (spaces);
+        g_assert_cmpuint (spaces->total_spaces, ==, counts[i] + 1);
+        g_assert_cmpuint (count_requests, ==, 2);
+    }
+    const guint64 invalid_counts[] = { 0, 4097, G_MAXUINT64 };
+    for (guint i = 0; i < G_N_ELEMENTS (invalid_counts); i++) {
+        fixture_count = invalid_counts[i];
+        count_requests = 0;
+        g_assert_null (majoris_btrfs_read_spaces (-1, fixture_space_info, g_try_malloc0));
+    }
+    fixture_count = 1;
+    count_requests = 0;
+    g_assert_null (majoris_btrfs_read_spaces (-1, fixture_space_info, fail_allocation));
+}
+
 static void
 test_mount_identity (void)
 {
@@ -87,5 +142,6 @@ main (int argc, char **argv)
     }
     g_test_init (&argc, &argv, NULL);
     g_test_add_func ("/btrfs-default/mount-identity", test_mount_identity);
+    g_test_add_func ("/btrfs-default/space-info", test_space_info);
     return g_test_run ();
 }

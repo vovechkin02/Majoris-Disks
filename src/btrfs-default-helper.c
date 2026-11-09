@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <dlfcn.h>
+#include <blkid/blkid.h>
+#include <gio/gio.h>
 #include "btrfs-inspect.h"
 #include <fcntl.h>
 #include <glib.h>
 #include <linux/btrfs.h>
 #include <linux/btrfs_tree.h>
+#include <linux/fs.h>
 #include <errno.h>
 #include <linux/openat2.h>
 #include <sys/file.h>
@@ -124,6 +127,428 @@ fail (const char *message)
     return 1;
 }
 
+static gboolean
+replace_ioctl (int fd, struct btrfs_ioctl_dev_replace_args *request)
+{
+    int rc = ioctl (fd, BTRFS_IOC_DEV_REPLACE, request);
+    if (rc < 0) {
+        if (request->cmd == BTRFS_IOCTL_DEV_REPLACE_CMD_START && errno == ECANCELED &&
+            request->result == (guint64) -ECANCELED)
+            return TRUE; /* The caller still checks the resulting kernel state. */
+        g_printerr ("Btrfs replacement ioctl failed: %s\n", g_strerror (errno));
+        return FALSE;
+    }
+    if (rc == BTRFS_ERROR_DEV_EXCL_RUN_IN_PROGRESS) {
+        fail ("Another exclusive Btrfs operation is already running.");
+        return FALSE;
+    }
+    guint64 result = rc > 0 ? (guint64) rc : (guint64) request->result;
+    switch (result) {
+    case BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR:
+        return TRUE;
+    case BTRFS_IOCTL_DEV_REPLACE_RESULT_NOT_STARTED:
+        fail ("The kernel reports that replacement is not active.");
+        break;
+    case BTRFS_IOCTL_DEV_REPLACE_RESULT_ALREADY_STARTED:
+        fail ("A Btrfs replacement has already started.");
+        break;
+    case BTRFS_IOCTL_DEV_REPLACE_RESULT_SCRUB_INPROGRESS:
+        fail ("A Btrfs scrub is in progress.");
+        break;
+    default:
+        g_printerr ("Unknown kernel replacement result: %" G_GUINT64_FORMAT "\n", result);
+        break;
+    }
+    return FALSE;
+}
+
+static gboolean
+read_replace_status (int fd, struct btrfs_ioctl_dev_replace_args *status)
+{
+    *status = (struct btrfs_ioctl_dev_replace_args) { .cmd = BTRFS_IOCTL_DEV_REPLACE_CMD_STATUS };
+    if (!replace_ioctl (fd, status))
+        return FALSE;
+    if (status->status.progress_1000 > 1000) {
+        fail ("The kernel returned invalid Btrfs replacement progress.");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void
+print_replace_status (const struct btrfs_ioctl_dev_replace_args *status)
+{
+    const struct btrfs_ioctl_dev_replace_status_params *s = &status->status;
+    guint64 fields[] = { s->replace_state, s->progress_1000, s->time_started,
+        s->time_stopped, s->num_write_errors, s->num_uncorrectable_read_errors, status->result };
+    for (guint i = 0; i < G_N_ELEMENTS (fields); i++)
+        g_print ("%s%" G_GUINT64_FORMAT, i == 0 ? "" : " ", fields[i]);
+    g_print ("\n");
+}
+
+static int
+run_replace_status (int fd, const char *uuid, const char *expected_start)
+{
+    struct btrfs_ioctl_dev_replace_args status;
+    if (!read_replace_status (fd, &status))
+        return 1;
+    if (expected_start != NULL) {
+        guint64 started;
+        struct statvfs state;
+        if (!g_ascii_string_to_unsigned (expected_start, 10, 1, G_MAXUINT64, &started, NULL) ||
+            status.status.time_started != started ||
+            (status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED &&
+             status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED))
+            return fail ("The reviewed Btrfs replacement is no longer active.");
+        if (system_filesystem (uuid) || fstatvfs (fd, &state) != 0 || (state.f_flag & ST_RDONLY))
+            return fail ("The Btrfs filesystem is protected or read-only.");
+        struct btrfs_ioctl_dev_replace_args cancel = { .cmd = BTRFS_IOCTL_DEV_REPLACE_CMD_CANCEL };
+        if (!replace_ioctl (fd, &cancel))
+            return 1;
+        for (guint attempt = 0; attempt < 50; attempt++) {
+            if (!read_replace_status (fd, &status))
+                return 1;
+            if (status.status.time_started != started)
+                break;
+            if (status.status.replace_state == BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED) {
+                print_replace_status (&status);
+                return 0;
+            }
+            if (status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED &&
+                status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED)
+                break;
+            g_usleep (100000);
+        }
+        return fail ("The kernel did not confirm cancellation of the reviewed replacement.");
+    }
+    print_replace_status (&status);
+    return 0;
+}
+
+static gboolean
+empty_directory (const char *path)
+{
+    g_autoptr(GDir) directory = g_dir_open (path, 0, NULL);
+    return directory != NULL && g_dir_read_name (directory) == NULL;
+}
+
+static gboolean
+related_blocks (const char *target, guint64 number)
+{
+    g_autofree char *link = g_strdup_printf ("/sys/dev/block/%u:%u",
+        major ((dev_t) number), minor ((dev_t) number));
+    g_autofree char *source = realpath (link, NULL);
+    if (source == NULL)
+        return TRUE;
+    g_autofree char *prefix = g_strconcat (target, "/", NULL);
+    return g_str_equal (target, source) || g_str_has_prefix (source, prefix);
+}
+
+static gboolean
+target_udisks_identity (const char *object, const char *path, guint64 number, guint64 size)
+{
+    if (!g_variant_is_object_path (object) || !g_str_has_prefix (object, "/org/freedesktop/UDisks2/block_devices/"))
+        return FALSE;
+    g_autoptr(GDBusConnection) bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
+    if (bus == NULL)
+        return FALSE;
+    g_autoptr(GVariant) reply = g_dbus_connection_call_sync (bus, "org.freedesktop.UDisks2", object,
+        "org.freedesktop.DBus.Properties", "GetAll", g_variant_new ("(s)", "org.freedesktop.UDisks2.Block"),
+        G_VARIANT_TYPE ("(a{sv})"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 5000, NULL, NULL);
+    if (reply == NULL)
+        return FALSE;
+    g_autoptr(GVariant) props = g_variant_get_child_value (reply, 0);
+    g_autoptr(GVariant) configuration = g_variant_lookup_value (props, "Configuration", G_VARIANT_TYPE ("a(sa{sv})"));
+    const char *node, *usage, *type, *crypto, *raid, *raid_member;
+    guint64 current_number, current_size;
+    gboolean system, read_only, ignored;
+    return g_variant_lookup (props, "Device", "^&ay", &node) && g_str_equal (node, path) &&
+        g_variant_lookup (props, "DeviceNumber", "t", &current_number) && current_number == number &&
+        g_variant_lookup (props, "Size", "t", &current_size) && current_size == size &&
+        g_variant_lookup (props, "IdUsage", "&s", &usage) && usage[0] == 0 &&
+        g_variant_lookup (props, "IdType", "&s", &type) && type[0] == 0 &&
+        g_variant_lookup (props, "CryptoBackingDevice", "&o", &crypto) && g_str_equal (crypto, "/") &&
+        g_variant_lookup (props, "MDRaid", "&o", &raid) && g_str_equal (raid, "/") &&
+        g_variant_lookup (props, "MDRaidMember", "&o", &raid_member) && g_str_equal (raid_member, "/") &&
+        g_variant_lookup (props, "HintSystem", "b", &system) && !system &&
+        g_variant_lookup (props, "HintIgnore", "b", &ignored) && !ignored &&
+        g_variant_lookup (props, "ReadOnly", "b", &read_only) && !read_only &&
+        configuration != NULL && g_variant_n_children (configuration) == 0;
+}
+
+static gboolean
+target_block_identity (int fd, guint64 number, guint64 sequence, guint64 size, guint32 sectorsize)
+{
+    struct stat node;
+    guint64 actual_sequence, actual_size;
+    guint32 logical;
+    int read_only;
+    return fstat (fd, &node) == 0 && S_ISBLK (node.st_mode) && node.st_uid == 0 &&
+        (guint64) node.st_rdev == number &&
+        ioctl (fd, BLKGETDISKSEQ, &actual_sequence) == 0 && actual_sequence == sequence &&
+        ioctl (fd, BLKGETSIZE64, &actual_size) == 0 && actual_size == size &&
+        ioctl (fd, BLKSSZGET, &logical) == 0 && logical > 0 && sectorsize % logical == 0 &&
+        ioctl (fd, BLKROGET, &read_only) == 0 && !read_only;
+}
+
+static gboolean
+target_is_blank (int fd)
+{
+    blkid_probe probe = blkid_new_probe ();
+    if (probe == NULL)
+        return FALSE;
+    gboolean blank = blkid_probe_set_device (probe, fd, 0, 0) == 0 &&
+        blkid_probe_enable_superblocks (probe, 1) == 0 &&
+        blkid_probe_enable_partitions (probe, 1) == 0 &&
+        blkid_do_safeprobe (probe) == 1;
+    blkid_free_probe (probe);
+    return blank;
+}
+
+static gboolean
+whole_unused_target (const char *sys)
+{
+    g_autofree char *partition = g_build_filename (sys, "partition", NULL);
+    g_autofree char *holders = g_build_filename (sys, "holders", NULL);
+    g_autofree char *slaves = g_build_filename (sys, "slaves", NULL);
+    if ((g_str_has_prefix (sys, "/sys/devices/virtual/") &&
+         !g_str_has_prefix (sys, "/sys/devices/virtual/block/loop")) ||
+        g_file_test (partition, G_FILE_TEST_EXISTS) || !empty_directory (holders) || !empty_directory (slaves))
+        return FALSE;
+    g_autoptr(GDir) directory = g_dir_open (sys, 0, NULL);
+    if (directory == NULL)
+        return FALSE;
+    const char *entry;
+    while ((entry = g_dir_read_name (directory)) != NULL) {
+        g_autofree char *child = g_build_filename (sys, entry, "partition", NULL);
+        if (g_file_test (child, G_FILE_TEST_EXISTS))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+replacement_profiles (GVariant *report, gboolean require_raid1)
+{
+    g_autoptr(GVariant) profiles = g_variant_get_child_value (report, 2);
+    const guint64 types = BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM;
+    guint64 seen = 0;
+    GVariantIter iter;
+    const char *label;
+    guint64 total, used, flags;
+    g_variant_iter_init (&iter, profiles);
+    while (g_variant_iter_next (&iter, "(&sttt)", &label, &total, &used, &flags)) {
+        guint64 type = flags & types;
+        guint64 profile = flags & ~types;
+        if (total == 0 || used > total ||
+            (type != BTRFS_BLOCK_GROUP_DATA && type != BTRFS_BLOCK_GROUP_METADATA &&
+             type != BTRFS_BLOCK_GROUP_SYSTEM && type != (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA)))
+            return FALSE;
+        if (require_raid1 && profile != BTRFS_BLOCK_GROUP_RAID1)
+            return FALSE;
+        switch (profile) {
+        case 0:
+        case BTRFS_BLOCK_GROUP_DUP:
+        case BTRFS_BLOCK_GROUP_RAID0:
+        case BTRFS_BLOCK_GROUP_RAID1:
+        case BTRFS_BLOCK_GROUP_RAID10:
+        case BTRFS_BLOCK_GROUP_RAID1C3:
+        case BTRFS_BLOCK_GROUP_RAID1C4:
+            break;
+        default:
+            return FALSE;
+        }
+        seen |= type;
+    }
+    return seen == types;
+}
+
+static gboolean verify_maintenance_topology (int fd, const char *uuid, guint64 expected, gboolean reject_scrub);
+
+static gboolean
+read_member_errors (int fd, guint64 id, gboolean *errors)
+{
+    struct btrfs_ioctl_get_dev_stats stats = { .devid = id, .nr_items = BTRFS_DEV_STAT_VALUES_MAX };
+    if (ioctl (fd, BTRFS_IOC_GET_DEV_STATS, &stats) != 0 || stats.nr_items != BTRFS_DEV_STAT_VALUES_MAX)
+        return FALSE;
+    *errors = FALSE;
+    for (guint i = 0; i < BTRFS_DEV_STAT_VALUES_MAX; i++)
+        *errors |= stats.values[i] != 0;
+    return TRUE;
+}
+
+static gboolean
+same_profile_flags (GVariant *before, GVariant *after)
+{
+    g_autoptr(GVariant) old = g_variant_get_child_value (before, 2);
+    g_autoptr(GVariant) current = g_variant_get_child_value (after, 2);
+    gsize count = g_variant_n_children (old);
+    if (count != g_variant_n_children (current))
+        return FALSE;
+    for (gsize i = 0; i < count; i++) {
+        guint64 old_flags, current_flags;
+        g_autoptr(GVariant) old_row = g_variant_get_child_value (old, i);
+        g_autoptr(GVariant) current_row = g_variant_get_child_value (current, i);
+        g_variant_get_child (old_row, 3, "t", &old_flags);
+        g_variant_get_child (current_row, 3, "t", &current_flags);
+        if (old_flags != current_flags)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static int
+start_replacement (int fd, char **argv, gboolean review_only)
+{
+    const char *uuid = argv[3], *member_uuid = argv[7], *node = argv[10];
+    guint64 count, id, source, number, size, sequence, avoid;
+    if (!g_ascii_string_to_unsigned (argv[5], 10, 1, G_MAXUINT64, &count, NULL) ||
+        !g_ascii_string_to_unsigned (argv[6], 10, 1, G_MAXUINT64, &id, NULL) ||
+        !g_uuid_string_is_valid (member_uuid) ||
+        !g_ascii_string_to_unsigned (argv[8], 10, 0, G_MAXUINT64, &source, NULL) ||
+        !g_ascii_string_to_unsigned (argv[9], 10, 1, G_MAXUINT64, &number, NULL) ||
+        !g_str_has_prefix (node, "/dev/") || node[5] == 0 || strchr (node + 5, '/') != NULL ||
+        !g_ascii_string_to_unsigned (argv[11], 10, 1, G_MAXUINT64, &size, NULL) ||
+        !g_ascii_string_to_unsigned (argv[12], 10, 1, G_MAXUINT64, &sequence, NULL) ||
+        !g_ascii_string_to_unsigned (argv[14], 10, 0, 1, &avoid, NULL))
+        return fail ("Invalid Btrfs replacement identity.");
+
+    struct btrfs_ioctl_fs_info_args fs = { 0 };
+    struct btrfs_ioctl_dev_replace_args status;
+    struct statvfs state;
+    if (system_filesystem (uuid) || fstatvfs (fd, &state) != 0 || (state.f_flag & ST_RDONLY) ||
+        ioctl (fd, BTRFS_IOC_FS_INFO, &fs) != 0 || fs.num_devices != count ||
+        !read_replace_status (fd, &status) ||
+        (status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED &&
+         status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED &&
+         status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED))
+        return fail ("Btrfs is protected, read-only, changed, or already replacing a device.");
+
+    g_autoptr(GVariant) report = majoris_btrfs_allocation_fd (fd, uuid);
+    if (report == NULL)
+        return fail ("Could not verify Btrfs membership and allocation.");
+    const char *operation;
+    g_variant_get_child (report, 8, "&s", &operation);
+    if (!g_str_equal (operation, "none") || !replacement_profiles (report, source == 0 || avoid))
+        return fail ("An exclusive operation or unsupported allocation profile prevents replacement.");
+
+    g_autofree char *syslink = g_strdup_printf ("/sys/dev/block/%u:%u", major ((dev_t) number), minor ((dev_t) number));
+    g_autofree char *sys = realpath (syslink, NULL);
+    if (sys == NULL || !whole_unused_target (sys) || filesystem_member (uuid, number) ||
+        !target_udisks_identity (argv[13], node, number, size))
+        return fail ("The target is unavailable, in use, or has an unsupported device topology.");
+
+    g_autoptr(GVariant) members = g_variant_get_child_value (report, 3);
+    if (g_variant_n_children (members) != count || (source == 0 && count < 2))
+        return fail ("The Btrfs member set is incomplete.");
+    GVariantIter iter;
+    guint64 devid, devno, capacity, used;
+    const char *identity, *member_state;
+    gboolean known, errors, found = FALSE;
+    g_variant_iter_init (&iter, members);
+    while (g_variant_iter_next (&iter, "(tttt&s&sbb)", &devid, &devno, &capacity, &used,
+                               &identity, &member_state, &known, &errors)) {
+        if (!known || devid == 0 || (devno != 0 && related_blocks (sys, devno)))
+            return fail ("A member identity or physical relationship could not be verified.");
+        if (devid == id) {
+            if (found || devno != source || g_ascii_strcasecmp (identity, member_uuid) != 0 ||
+                !g_str_equal (member_state, source == 0 ? "Missing" : "Present"))
+                return fail ("The reviewed Btrfs source changed.");
+            if (capacity == 0 || size < capacity)
+                return fail ("The replacement target is smaller than the verified source capacity.");
+            found = TRUE;
+        } else {
+            if (devno == 0 || !g_str_equal (member_state, "Present") ||
+                ((source == 0 || avoid) && (!read_member_errors (fd, devid, &errors) || errors)))
+                return fail ("A surviving Btrfs member is unavailable, has unknown error counters, or reports errors.");
+        }
+        if (devno != 0) {
+            struct btrfs_ioctl_scrub_args scrub = { .devid = devid };
+            if (ioctl (fd, BTRFS_IOC_SCRUB_PROGRESS, &scrub) == 0 || errno != ENOTCONN)
+                return fail ("A Btrfs scrub is active or its state is unknown.");
+        }
+    }
+    if (!found)
+        return fail ("The reviewed Btrfs source device ID was not found.");
+
+    int dev_directory __attribute__((cleanup(close_fd))) = open_directory ("/dev");
+    struct stat dev_root;
+    if (dev_directory < 0 || fstat (dev_directory, &dev_root) != 0 ||
+        dev_root.st_uid != 0 || (dev_root.st_mode & (S_IWGRP | S_IWOTH)))
+        return fail ("The block device directory is not trusted.");
+    struct open_how how = { .flags = O_RDONLY | O_EXCL | O_CLOEXEC,
+        .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS };
+    int target __attribute__((cleanup(close_fd))) = syscall (SYS_openat2, dev_directory, node + 5, &how, sizeof how);
+    if (target < 0 || !target_block_identity (target, number, sequence, size, fs.sectorsize) ||
+        !target_is_blank (target))
+        return fail ("The replacement target changed, is busy, or contains a storage signature.");
+    if (review_only) {
+        print_replace_status (&status);
+        return 0;
+    }
+
+    struct btrfs_ioctl_dev_replace_args start = { .cmd = BTRFS_IOCTL_DEV_REPLACE_CMD_START };
+    start.start.srcdevid = id;
+    start.start.cont_reading_from_srcdev_mode = (source == 0 || avoid) ?
+        BTRFS_IOCTL_DEV_REPLACE_CONT_READING_FROM_SRCDEV_MODE_AVOID :
+        BTRFS_IOCTL_DEV_REPLACE_CONT_READING_FROM_SRCDEV_MODE_ALWAYS;
+    if (g_strlcpy ((char *) start.start.tgtdev_name, node, sizeof start.start.tgtdev_name) >= sizeof start.start.tgtdev_name)
+        return fail ("The replacement target pathname is too long.");
+
+    // Keep a nonexclusive reference across the ioctl. Btrfs must claim the
+    // canonical node itself and retains that pathname for member discovery.
+    how.flags &= ~O_EXCL;
+    int pinned __attribute__((cleanup(close_fd))) = syscall (SYS_openat2, dev_directory, node + 5, &how, sizeof how);
+    struct stat current_root;
+    if (pinned < 0 || !target_block_identity (pinned, number, sequence, size, fs.sectorsize) ||
+        !whole_unused_target (sys) || lstat ("/dev", &current_root) != 0 ||
+        current_root.st_dev != dev_root.st_dev || current_root.st_ino != dev_root.st_ino ||
+        !matches_mount (fd, argv[2], g_ascii_strtoull (argv[4], NULL, 10), uuid, NULL) ||
+        !matches_uuid (fd, uuid))
+        return fail ("The target or filesystem changed before replacement.");
+    close (target);
+    target = -1;
+    if (!replace_ioctl (fd, &start) || !read_replace_status (fd, &status))
+        return 1;
+    if (status.status.replace_state != BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED) {
+        print_replace_status (&status);
+        return 0;
+    }
+
+    g_autoptr(GVariant) after = majoris_btrfs_allocation_fd (fd, uuid);
+    if (after == NULL)
+        return fail ("Replacement finished, but filesystem identity and allocation could not be verified.");
+    if (!replacement_profiles (after, FALSE))
+        return fail ("Replacement finished, but allocation profile verification is incomplete.");
+    if (!same_profile_flags (report, after))
+        g_printerr ("Allocation profiles changed during replacement. Check Btrfs Allocation for current redundancy.\n");
+    if (!verify_maintenance_topology (fd, uuid, count, FALSE))
+        return fail ("Replacement finished, but the kernel member count or topology could not be verified.");
+    if (!target_block_identity (pinned, number, sequence, size, fs.sectorsize) ||
+        (source != 0 && filesystem_member (uuid, source)))
+        return fail ("Replacement finished, but the target identity or source retirement could not be verified.");
+    gboolean read_only;
+    g_variant_get_child (after, 7, "b", &read_only);
+    g_autoptr(GVariant) current_members = g_variant_get_child_value (after, 3);
+    found = FALSE;
+    g_variant_iter_init (&iter, current_members);
+    while (g_variant_iter_next (&iter, "(tttt&s&sbb)", &devid, &devno, &capacity, &used,
+                               &identity, &member_state, &known, &errors)) {
+        if (!known || !g_str_equal (member_state, "Present"))
+            return fail ("Replacement finished, but the filesystem still reports unavailable members.");
+        if (devid == id && devno == number && g_ascii_strcasecmp (identity, member_uuid) == 0)
+            found = TRUE;
+        if (!read_member_errors (fd, devid, &errors))
+            return fail ("Replacement finished, but member error counters could not be verified.");
+        if (errors)
+            g_printerr ("Btrfs member %" G_GUINT64_FORMAT " reports device errors.\n", devid);
+    }
+    if (!found || read_only)
+        return fail ("Replacement finished, but the target association or writable state could not be verified.");
+    print_replace_status (&status);
+    return 0;
+}
+
 static int
 check_removable_member (int mount, const char *filesystem, dev_t target, guint64 expected, gboolean allow_allocated)
 {
@@ -138,14 +563,14 @@ check_removable_member (int mount, const char *filesystem, dev_t target, guint64
     if (!g_file_get_contents (operation_file, &operation, NULL, NULL) || !g_str_equal (g_strstrip (operation), "none"))
         return fail ("Another exclusive Btrfs operation is active or its state is unknown.");
 
-    const guint slots = 64;
-    g_autofree struct btrfs_ioctl_space_args *spaces =
-        g_malloc0 (sizeof *spaces + slots * sizeof (struct btrfs_ioctl_space_info));
-    spaces->space_slots = slots;
-    if (ioctl (mount, BTRFS_IOC_SPACE_INFO, spaces) != 0 || spaces->total_spaces == 0 || spaces->total_spaces >= slots)
+    g_autofree struct btrfs_ioctl_space_args *spaces = majoris_btrfs_query_spaces (mount);
+    if (spaces == NULL)
         return fail ("Could not verify Btrfs allocation profiles.");
     for (guint64 i = 0; i < spaces->total_spaces; i++) {
-        guint64 profile = spaces->spaces[i].flags & BTRFS_BLOCK_GROUP_PROFILE_MASK;
+        guint64 flags = spaces->spaces[i].flags;
+        if (flags == BTRFS_SPACE_INFO_GLOBAL_RSV)
+            continue;
+        guint64 profile = flags & ~(BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
         if (profile != 0 && profile != BTRFS_BLOCK_GROUP_DUP)
             return fail ("Only single and DUP allocation profiles are supported for this member-removal workflow.");
     }
@@ -376,24 +801,40 @@ run_scrub (int fd, const char *uuid, const char *operation, guint64 expected)
 int
 main (int argc, char **argv)
 {
+    gboolean replace_check = argc == 15 && g_str_equal (argv[1], "replace-check");
+#ifdef MAJORIS_BTRFS_STATUS_ONLY
+    if (!replace_check && (argc != 5 || !g_str_equal (argv[1], "replace-status")))
+        return fail ("This helper accepts only read-only Btrfs replacement requests.");
+    alarm (10);
+#endif
     gboolean set = argc == 7 && g_str_equal (argv[1], "set-default");
     gboolean check = argc == 7 && g_str_equal (argv[1], "check-unmounted");
     gboolean allow_allocated = argc == 7 && g_str_equal (argv[1], "check-removable-member");
     gboolean check_member = allow_allocated || (argc == 7 && g_str_equal (argv[1], "check-empty-member"));
     gboolean balance = (argc == 6 || argc == 7) && g_str_has_prefix (argv[1], "balance-");
     gboolean scrub = argc == 6 && g_str_has_prefix (argv[1], "scrub-");
+    gboolean replace_status = argc == 5 && g_str_equal (argv[1], "replace-status");
+    gboolean replace_cancel = argc == 6 && g_str_equal (argv[1], "replace-cancel");
+    gboolean replace_start = argc == 15 && g_str_equal (argv[1], "replace-start");
     guint64 device, expected = 0, target = 0, current;
-    if (geteuid () != 0 || (!set && !check && !check_member && !balance && !scrub && (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
+    if (geteuid () != 0 || (!set && !check && !check_member && !balance && !scrub &&
+        !replace_status && !replace_cancel && !replace_start && !replace_check &&
+        (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
         !g_path_is_absolute (argv[2]) || !g_uuid_string_is_valid (argv[3]) ||
         !g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &device, NULL) ||
         (set && (!g_ascii_string_to_unsigned (argv[5], 10, 5, G_MAXUINT64, &expected, NULL) ||
                  !g_ascii_string_to_unsigned (argv[6], 10, 5, G_MAXUINT64, &target, NULL))))
-        return fail ("Invalid Btrfs default-subvolume request.");
+        return fail ("Invalid Btrfs helper request.");
 
     int mount __attribute__((cleanup(close_fd))) = open_directory (argv[2]);
     dev_t mount_source = 0;
     if (mount < 0 || !matches_mount (mount, argv[2], device, argv[3], &mount_source) || !matches_uuid (mount, argv[3]))
         return fail ("The Btrfs mount or its source identity changed.");
+
+    if (replace_status || replace_cancel)
+        return run_replace_status (mount, argv[3], replace_cancel ? argv[5] : NULL);
+    if (replace_start || replace_check)
+        return start_replacement (mount, argv, replace_check);
 
     if (scrub) {
         guint64 count;

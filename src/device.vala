@@ -1,4 +1,39 @@
 namespace MajorisDisks {
+    internal class BtrfsReplacementStatus : Object {
+        public string uuid;
+        public uint64 state;
+        public uint64 progress_1000;
+        public uint64 started;
+        public uint64 stopped;
+        public uint64 write_errors;
+        public uint64 read_errors;
+        public uint64 result;
+        public string warning = "";
+        public bool active { get { return state == 1 || state == 4; } }
+
+        public BtrfsReplacementStatus (string uuid, string output) throws Error {
+            this.uuid = uuid;
+            var fields = output.strip ().split (" ");
+            if (fields.length != 7 || !uint64.try_parse (fields[0], out state) ||
+                !uint64.try_parse (fields[1], out progress_1000) || progress_1000 > 1000 ||
+                !uint64.try_parse (fields[2], out started) || !uint64.try_parse (fields[3], out stopped) ||
+                !uint64.try_parse (fields[4], out write_errors) || !uint64.try_parse (fields[5], out read_errors) ||
+                !uint64.try_parse (fields[6], out result) || result != 0)
+                throw new IOError.INVALID_DATA ("The kernel replacement status could not be interpreted.");
+        }
+
+        public string state_label () {
+            switch (state) {
+            case 0: return "Never started";
+            case 1: return "Replacement running";
+            case 2: return "Replacement finished";
+            case 3: return "Replacement cancelled";
+            case 4: return "Replacement suspended";
+            default: return "Unknown replacement state";
+            }
+        }
+    }
+
     internal class BtrfsMemberInfo : Object {
         public uint64 id;
         public uint64 number;
@@ -6,6 +41,9 @@ namespace MajorisDisks {
         public uint64 allocated;
         public string uuid;
         public string state;
+        public string filesystem_uuid = "";
+        public string device_path = "";
+        public uint64[] error_counters = {};
         public bool allocation_known;
         public bool has_errors;
 
@@ -41,17 +79,75 @@ namespace MajorisDisks {
         public uint64 replication_overhead;
         public bool overhead_known;
 
+        public string replacement_restriction (BtrfsMemberInfo source, bool avoid = false) {
+            if (!Uuid.string_is_valid (uuid) || source.filesystem_uuid != uuid)
+                return "The filesystem identity is unknown.";
+            if (read_only || exclusive_operation != "none")
+                return "The filesystem is read-only or has an exclusive operation.";
+            if (member_count == 0 || members.length != member_count)
+                return "The filesystem member set could not be verified.";
+            if (source.id == 0 || !Uuid.string_is_valid (source.uuid) || !source.allocation_known || source.capacity == 0)
+                return "Additional verification required. The source identity or capacity is unavailable.";
+            bool missing = source.state == "Missing";
+            if ((missing && source.number != 0) || (!missing && (source.state != "Present" || source.number == 0)))
+                return "Additional verification required. The source state is uncertain.";
+            if ((missing || avoid) && member_count < 2)
+                return "Insufficient redundancy.";
+            foreach (var member in members) {
+                if (member == source) continue;
+                if (member.id == 0 || !member.allocation_known || member.number == 0 ||
+                    member.state != "Present" || ((missing || avoid) && member.has_errors))
+                    return "Additional verification required. A surviving member is unavailable or reports errors.";
+            }
+            uint64 types = 0;
+            foreach (var profile in profiles) {
+                uint64 type = profile.flags & 7;
+                uint64 layout = profile.flags & ~((uint64) 7);
+                if (!(type == 1 || type == 2 || type == 4 || type == 5) ||
+                    profile.allocated == 0 || profile.used > profile.allocated)
+                    return "The filesystem allocation state is unknown.";
+                // Linux UAPI block-group flags. Restrict parity and unknown profiles.
+                if (!(layout == 0 || layout == 8 || layout == 16 || layout == 32 ||
+                      layout == 64 || layout == 512 || layout == 1024))
+                    return "Replacement is unsupported for this allocation profile.";
+                if ((missing || avoid) && layout != 16)
+                    return "Insufficient verified RAID 1 redundancy for reconstruction.";
+                types |= type;
+            }
+            return types == 7 ? "" : "The filesystem allocation state is unknown.";
+        }
+
         public BtrfsFilesystemInfo (string uuid, string label, Variant report) {
             this.uuid = uuid;
             this.label = label;
-            Variant profile_rows, member_rows;
-            report.get ("(tt@a(sttt)@a(ttttssbb)tttbstb)", out capacity, out member_count,
-                out profile_rows, out member_rows, out used, out estimated_available, out global_reserve,
-                out read_only, out exclusive_operation, out replication_overhead, out overhead_known);
+            capacity = report.get_child_value (0).get_uint64 ();
+            member_count = report.get_child_value (1).get_uint64 ();
+            var profile_rows = report.get_child_value (2);
+            var member_rows = report.get_child_value (3);
+            used = report.get_child_value (4).get_uint64 ();
+            estimated_available = report.get_child_value (5).get_uint64 ();
+            global_reserve = report.get_child_value (6).get_uint64 ();
+            read_only = report.get_child_value (7).get_boolean ();
+            exclusive_operation = report.get_child_value (8).get_string ();
+            replication_overhead = report.get_child_value (9).get_uint64 ();
+            overhead_known = report.get_child_value (10).get_boolean ();
+            Variant? details = report.n_children () > 11 ? report.get_child_value (11) : null;
             for (size_t i = 0; i < profile_rows.n_children (); i++)
                 profiles += new BtrfsAllocationProfile (profile_rows.get_child_value (i));
-            for (size_t i = 0; i < member_rows.n_children (); i++)
-                members += new BtrfsMemberInfo (member_rows.get_child_value (i));
+            for (size_t i = 0; i < member_rows.n_children (); i++) {
+                var member = new BtrfsMemberInfo (member_rows.get_child_value (i));
+                member.filesystem_uuid = uuid;
+                if (details != null && i < details.n_children ()) {
+                    var detail = details.get_child_value (i);
+                    if (detail.get_child_value (0).get_uint64 () == member.id) {
+                        member.device_path = detail.get_child_value (1).get_string ();
+                        var counts = detail.get_child_value (2);
+                        for (size_t j = 0; j < counts.n_children (); j++)
+                            member.error_counters += counts.get_child_value (j).get_uint64 ();
+                    }
+                }
+                members += member;
+            }
         }
     }
 

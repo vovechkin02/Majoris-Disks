@@ -1,0 +1,63 @@
+<interface>
+  <template class="MajorisDisksBtrfsDeviceReplaceDialog" parent="AdwDialog">
+    <property name="title">Replace Btrfs Device</property>
+    <property name="content-width">600</property>
+    <property name="child">
+      <object class="AdwToolbarView">
+        <child type="top"><object class="AdwHeaderBar"/></child>
+        <property name="content">
+          <object class="GtkScrolledWindow">
+            <property name="propagate-natural-height">True</property>
+            <property name="child">
+              <object class="AdwPreferencesPage">
+                <child><object class="AdwPreferencesGroup" id="selection">
+                  <property name="title">Replacement Plan</property>
+                  <child><object class="AdwComboRow" id="source_row"><property name="title">Source member</property></object></child>
+                  <child><object class="AdwComboRow" id="target_row"><property name="title">Empty target device</property></object></child>
+                  <child><object class="AdwSwitchRow" id="avoid_row">
+                    <property name="title">Prefer surviving copies</property>
+                    <property name="subtitle">Read from verified RAID 1 copies where possible</property>
+                  </object></child>
+                  <child><object class="AdwActionRow" id="eligibility">
+                    <property name="title">Eligibility</property>
+                    <property name="use-markup">False</property>
+                    <property name="subtitle-lines">0</property>
+                    <child type="suffix"><object class="GtkButton" id="review_button">
+                      <property name="label">Review Replacement…</property>
+                      <property name="valign">center</property>
+                      <property name="sensitive">False</property>
+                    </object></child>
+                  </object></child>
+                </object></child>
+                <child><object class="AdwPreferencesGroup">
+                  <property name="title">Kernel Replacement Status</property>
+                  <child><object class="AdwActionRow" id="status_row">
+                    <property name="title">Checking replacement status</property>
+                    <property name="use-markup">False</property>
+                    <property name="subtitle-lines">0</property>
+                    <child type="suffix"><object class="GtkButton" id="cancel_button">
+                      <property name="label">Cancel Replacement…</property>
+                      <property name="valign">center</property>
+                      <property name="sensitive">False</property>
+                    </object></child>
+                  </object></child>
+                  <child><object class="GtkProgressBar" id="progress">
+                    <property name="show-text">True</property>
+                    <property name="visible">False</property>
+                    <accessibility><property name="label">Kernel replacement progress</property></accessibility>
+                  </object></child>
+                  <child><object class="AdwActionRow" id="outcome">
+                    <property name="title">Replacement Result</property>
+                    <property name="use-markup">False</property>
+                    <property name="subtitle-lines">0</property>
+                    <property name="visible">False</property>
+                  </object></child>
+                </object></child>
+              </object>
+            </property>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>

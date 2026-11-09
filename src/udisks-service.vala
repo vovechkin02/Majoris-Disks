@@ -78,6 +78,8 @@ namespace MajorisDisks {
         public const string PREFIX = "org.freedesktop.UDisks2.";
         [CCode (cname = "MAJORIS_BTRFS_DEFAULT_HELPER", cheader_filename = "btrfs-default-config.h")]
         private extern const string BTRFS_DEFAULT_HELPER;
+        [CCode (cname = "MAJORIS_BTRFS_STATUS_HELPER", cheader_filename = "btrfs-default-config.h")]
+        private extern const string BTRFS_STATUS_HELPER;
         private string btrfs_capability_owner = "";
         private bool btrfs_native_default;
         private DBusObjectManagerClient? manager;
@@ -1535,6 +1537,177 @@ namespace MajorisDisks {
             if (report == null)
                 throw new IOError.FAILED ("The kernel did not return verified Btrfs allocation data.");
             return new BtrfsFilesystemInfo (uuid, block.label, report);
+        }
+
+        internal bool has_btrfs_replacement_helper () {
+            return FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE) &&
+                FileUtils.test (BTRFS_DEFAULT_HELPER, FileTest.IS_EXECUTABLE) &&
+                FileUtils.test (BTRFS_STATUS_HELPER, FileTest.IS_EXECUTABLE);
+        }
+
+        internal uint64 btrfs_target_sequence (StorageBlock target) {
+            string number = KernelStorageSafety.device_number (target.number);
+            try {
+                string sequence, link = FileUtils.read_link ("/sys/dev/block/" + number);
+                if (link.contains ("/virtual/") && !link.contains ("/virtual/block/loop")) return 0;
+                FileUtils.get_contents ("/sys/dev/block/" + number + "/diskseq", out sequence);
+                uint64 value;
+                if (uint64.try_parse (sequence.strip (), out value)) return value;
+            } catch (Error error) {}
+            return 0;
+        }
+
+        internal bool can_target_btrfs_replacement (BtrfsFilesystemInfo report, BtrfsMemberInfo source, StorageBlock target) {
+            if (target.partition != null || target.size < source.capacity || !can_use_group_member (target) ||
+                btrfs_target_sequence (target) == 0)
+                return false;
+            foreach (var row in report.members) {
+                if (row.number == target.number) return false;
+                foreach (var member in snapshot.blocks.get_values ())
+                    if (row.number != 0 && member.number == row.number && member.drive_path != "/" &&
+                        member.drive_path == target.drive_path)
+                        return false;
+            }
+            return true;
+        }
+
+        private async BtrfsReplacementStatus invoke_btrfs_replace (StorageBlock block, string uuid,
+            string operation, string[] arguments, Cancellable? token) throws Error {
+            var proxy = require_volume (block, "Filesystem.BTRFS");
+            var mounts = block.filesystem?.mounts ?? new string[0];
+            if (proxy.get_cached_property ("uuid")?.get_string () != uuid || !Uuid.string_is_valid (uuid) ||
+                mounts.length != 1 || block.number == 0 || !has_btrfs_replacement_helper ())
+                throw new IOError.NOT_SUPPORTED ("A verified mount and the authorized Btrfs helper are required.");
+            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent",
+                operation == "replace-status" || operation == "replace-check" ? BTRFS_STATUS_HELPER : BTRFS_DEFAULT_HELPER,
+                operation, mounts[0], uuid, block.number.to_string () };
+            foreach (var argument in arguments) argv += argument;
+            var helper = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+            string? output, diagnostic;
+            yield helper.communicate_utf8_async (null, token, out output, out diagnostic);
+            if (!helper.get_successful ())
+                throw new IOError.FAILED (diagnostic != null && diagnostic.strip () != "" ? diagnostic.strip () :
+                    "The Btrfs helper did not confirm the request. Check the kernel replacement status.");
+            var status = new BtrfsReplacementStatus (uuid, output ?? "");
+            status.warning = diagnostic?.strip () ?? "";
+            return status;
+        }
+
+        private HashTable<string, StorageJob> replacement_jobs = new HashTable<string, StorageJob> (str_hash, str_equal);
+
+        private static string[] btrfs_replacement_arguments (BtrfsFilesystemInfo report, BtrfsMemberInfo source,
+            StorageBlock target, uint64 sequence, bool avoid) {
+            return { report.member_count.to_string (), source.id.to_string (), source.uuid, source.number.to_string (),
+                target.number.to_string (), target.device, target.size.to_string (), sequence.to_string (),
+                target.path, avoid ? "1" : "0" };
+        }
+
+        internal async uint64 check_btrfs_replacement_target (StorageBlock anchor, BtrfsFilesystemInfo report,
+            BtrfsMemberInfo source, StorageBlock target, bool avoid) throws Error {
+            var token = backend_lifetime;
+            string identity = modification_identity (target);
+            uint64 sequence = btrfs_target_sequence (target);
+            yield KernelStorageSafety.require_idle (target, token);
+            yield invoke_btrfs_replace (anchor, report.uuid, "replace-check",
+                btrfs_replacement_arguments (report, source, target, sequence, avoid), token);
+            synchronize ();
+            if (creation_identity_changed (target, identity) || sequence != btrfs_target_sequence (target))
+                throw new IOError.NOT_FOUND ("The target changed during verification.");
+            return sequence;
+        }
+
+        internal async BtrfsReplacementStatus btrfs_replacement_status (string uuid, uint64 cancel_started = 0) throws Error {
+            synchronize ();
+            foreach (var block in snapshot.blocks.get_values ()) {
+                if (block.uuid != uuid || block.type_id != "btrfs" || block.filesystem?.mounted != true)
+                    continue;
+                if (cancel_started != 0 && (block.read_only || block.system_hint))
+                    throw new IOError.PERMISSION_DENIED ("This filesystem is protected or read-only.");
+                var status = yield invoke_btrfs_replace (block, uuid,
+                    cancel_started == 0 ? "replace-status" : "replace-cancel",
+                    cancel_started == 0 ? new string[0] : new string[] { cancel_started.to_string () }, backend_lifetime);
+                var job = replacement_jobs.lookup (uuid);
+                if (job != null)
+                    jobs.progress (job, status.state_label (), status.progress_1000 / 1000.0, status.active);
+                return status;
+            }
+            throw new IOError.NOT_FOUND ("The mounted Btrfs filesystem is unavailable.");
+        }
+
+        internal async BtrfsReplacementStatus replace_btrfs_device (StorageBlock block, string block_identity,
+            BtrfsFilesystemInfo review, BtrfsMemberInfo source, StorageBlock target, string target_identity,
+            uint64 target_sequence, bool avoid) throws Error {
+            var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+            if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents ||
+                block.read_only || target_sequence == 0)
+                throw new IOError.PERMISSION_DENIED ("The filesystem is protected or the target identity is unavailable.");
+            var current = yield query_btrfs_allocation (block);
+            BtrfsMemberInfo? selected = null;
+            foreach (var member in current.members)
+                if (member.id == source.id && member.uuid == source.uuid && member.number == source.number &&
+                    member.capacity == source.capacity) selected = member;
+            if (current.uuid != review.uuid || current.member_count != review.member_count ||
+                selected == null || current.replacement_restriction (selected, avoid) != "" ||
+                !can_target_btrfs_replacement (current, selected, target))
+                throw new IOError.BUSY ("The reviewed filesystem or replacement eligibility changed.");
+            StorageBlock[] members = { target };
+            foreach (var row in current.members) {
+                if (row.number == 0 || row.number == block.number) continue;
+                StorageBlock? member = null;
+                foreach (var candidate in snapshot.blocks.get_values ())
+                    if (candidate.number == row.number && candidate.uuid == current.uuid && candidate.type_id == "btrfs")
+                        member = candidate;
+                if (member == null)
+                    throw new IOError.NOT_FOUND ("UDisks could not verify a Btrfs member.");
+                var member_safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                if (member_safety.system_critical || member_safety.unknown_dependencies || member_safety.active_dependents)
+                    throw new IOError.BUSY ("A Btrfs member is protected or has unresolved dependencies.");
+                members += member;
+            }
+            locks.acquire_members (block, members, snapshot.dependencies);
+            var job = jobs.begin ("Replace Btrfs Device", block, snapshot.dependencies);
+            replacement_jobs.insert (current.uuid, job);
+            var outcome = new StorageOperationResult ();
+            bool dispatched = false;
+            try {
+                yield KernelStorageSafety.require_idle (target, backend_lifetime);
+                synchronize ();
+                require_volume (target, "Block");
+                if (creation_identity_changed (block, block_identity) || creation_identity_changed (target, target_identity) ||
+                    !can_target_btrfs_replacement (current, selected, target) || btrfs_target_sequence (target) != target_sequence)
+                    throw new IOError.BUSY ("The filesystem or target changed after confirmation.");
+                jobs.phase (job, StorageJobState.RUNNING, "Waiting for authorization and kernel replacement");
+                dispatched = true;
+                var status = yield invoke_btrfs_replace (block, current.uuid, "replace-start",
+                    btrfs_replacement_arguments (current, source, target, target_sequence, avoid), null);
+                if (status.state == 2) {
+                    try {
+                        var target_proxy = require_volume (target, "Block");
+                        if (target_proxy.get_cached_property ("DeviceNumber")?.get_uint64 () == target.number)
+                            yield target_proxy.call ("Rescan", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
+                                DBusCallFlags.NONE, 5000, backend_lifetime);
+                    } catch (Error error) {}
+                }
+                yield refresh ();
+                var refreshed_target = snapshot.blocks.lookup (target.path);
+                if (status.state == 2 && (refreshed_target == null || refreshed_target.number != target.number ||
+                    refreshed_target.type_id != "btrfs" || refreshed_target.uuid != current.uuid))
+                    status.warning = (status.warning + "\nUDisks has yet to confirm the refreshed target membership.").strip ();
+                outcome.successful = status.state == 2 && status.write_errors == 0 && status.read_errors == 0 &&
+                    status.warning == "";
+                outcome.summary = outcome.successful ? "Btrfs replacement completed and membership verified" :
+                    status.state == 2 ? "Btrfs replacement finished and needs attention" : status.state_label ();
+                if (!outcome.successful) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                return status;
+            } catch (Error error) {
+                outcome.fail ("Could not confirm the Btrfs replacement outcome", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                replacement_jobs.remove (current.uuid);
+                jobs.finish (job, outcome);
+                locks.release (block);
+            }
         }
 
         internal async string btrfs_maintenance (StorageBlock block, string identity, string action, uint usage) throws Error {

@@ -57,3 +57,18 @@ Build as a normal user and install in the VM so the cache and protected-configur
 Record each scenario as passed, failed, skipped or not executed. Leave the fixture intact if a device identity becomes uncertain.
 
 The Debian 13.7 QEMU run passed all three opt-in Meson suites. A separate root-run fixture verified a real crypttab conflict and a successful rename with crypttab still at mode `0600`. The GNOME authorization procedure and the live interruption scenarios above remain open. [Execution register](../docs/feature-parity-completion.md#advanced-lvm2-administration)
+
+## Btrfs device replacement
+
+Build in a dedicated disposable Debian 13 guest with the Btrfs and loop drivers, btrfs-progs, UDisks and its Btrfs module. Use only new, isolated loop-backed fixtures.
+
+    sudo env MAJORIS_DISKS_RUN_BTRFS_REPLACE_TESTS=1 meson test -C build --no-rebuild --print-errorlogs 'btrfs-device-replace-*'
+
+The native fixture invokes the actual restricted helper as root. It verifies fixture ownership, filesystem UUID, source ID association and known payload checksums. The cancellation fixture reports when replacement finishes before cancellation can be confirmed.
+
+- Open **Advanced Storage**, select the mounted Btrfs filesystem, and open **Replace Btrfs Device…**. Verify the source ID and capacity, allocation and any missing or error indicators. Confirm the reviewed target matches the fixture and inspect the profile summary before authorization.
+- Exercise desktop Polkit approval and denial. Close and reopen the dialog during a long fixture replacement and restart Majoris. Verify the kernel state and progress are rediscovered and that no new replacement is started. Check that cancellation is available only for the active reviewed operation.
+- Verify the finished source ID is now associated with the target, the filesystem UUID is unchanged, and independently read the original fixture payload. For a larger target, compare the block-device capacity with Btrfs member capacity before attempting a separate resize.
+- Run the existing Btrfs discovery and mount regressions with MAJORIS_DISKS_RUN_BTRFS_MOUNT_TESTS=1.
+
+The Debian 13 guest uses a temporary udev rule scoped to its three disposable backing files because UDisks defaults loop devices to HintSystem. This leaves the installed helper's safety rules in force. The guest run covered healthy, larger-target, surviving-copy, injected failing member, missing RAID 1, nonredundant, undersized, unsafe-target and cancellation scenarios. The kernel allocated new SINGLE groups during degraded recovery. Check the warning and resulting profiles alongside the verified target association and payload checksum.

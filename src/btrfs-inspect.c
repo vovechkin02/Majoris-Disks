@@ -160,10 +160,69 @@ majoris_btrfs_mount_use (const char *filesystem, guint64 id, const char *path)
     return 0;
 }
 
+#define MAX_SPACE_RECORDS 4096
+#define SPACE_TYPE_MASK (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)
+
+static gsize
+space_buffer_size (guint64 count)
+{
+    if (count == 0 ||
+        count > (G_MAXSIZE - sizeof (struct btrfs_ioctl_space_args)) /
+            sizeof (struct btrfs_ioctl_space_info) ||
+        count > MAX_SPACE_RECORDS)
+        return 0;
+    return sizeof (struct btrfs_ioctl_space_args) + count * sizeof (struct btrfs_ioctl_space_info);
+}
+
+struct btrfs_ioctl_space_args *
+majoris_btrfs_read_spaces (int fd, int (*query) (int, struct btrfs_ioctl_space_args *),
+                          gpointer (*allocate) (gsize))
+{
+    struct btrfs_ioctl_space_args count = { 0 };
+    if (query (fd, &count) != 0 || count.space_slots != 0)
+        return NULL;
+    for (guint attempt = 0; attempt < 4; attempt++) {
+        guint64 slots = count.total_spaces;
+        gsize size = space_buffer_size (slots);
+        if (size == 0)
+            return NULL;
+        g_autofree struct btrfs_ioctl_space_args *spaces = allocate (size);
+        if (spaces == NULL)
+            return NULL;
+        spaces->space_slots = slots;
+        if (query (fd, spaces) != 0 || spaces->space_slots != slots ||
+            spaces->total_spaces == 0 || spaces->total_spaces > slots)
+            return NULL;
+
+        /* Linux caps the returned count at space_slots. It appends the global
+         * reserve last, so a full buffer without that record was truncated. */
+        if (spaces->spaces[spaces->total_spaces - 1].flags == BTRFS_SPACE_INFO_GLOBAL_RSV)
+            return g_steal_pointer (&spaces);
+        if (spaces->total_spaces != slots)
+            return NULL;
+        count = (struct btrfs_ioctl_space_args) { 0 };
+        if (query (fd, &count) != 0 || count.space_slots != 0 || count.total_spaces <= slots)
+            return NULL;
+    }
+    return NULL;
+}
+
+static int
+space_info_ioctl (int fd, struct btrfs_ioctl_space_args *spaces)
+{
+    return ioctl (fd, BTRFS_IOC_SPACE_INFO, spaces);
+}
+
+struct btrfs_ioctl_space_args *
+majoris_btrfs_query_spaces (int fd)
+{
+    return majoris_btrfs_read_spaces (fd, space_info_ioctl, g_try_malloc0);
+}
+
 static const char *
 allocation_profile (guint64 flags)
 {
-    switch (flags & BTRFS_BLOCK_GROUP_PROFILE_MASK) {
+    switch (flags & ~SPACE_TYPE_MASK) {
     case 0: return "single";
     case BTRFS_BLOCK_GROUP_DUP: return "DUP";
     case BTRFS_BLOCK_GROUP_RAID0: return "RAID 0";
@@ -196,7 +255,7 @@ static gboolean
 allocation_overhead (guint64 flags, guint64 bytes, guint64 *overhead)
 {
     guint64 copies;
-    switch (flags & BTRFS_BLOCK_GROUP_PROFILE_MASK) {
+    switch (flags & ~SPACE_TYPE_MASK) {
     case 0:
     case BTRFS_BLOCK_GROUP_RAID0: copies = 1; break;
     case BTRFS_BLOCK_GROUP_DUP:
@@ -241,29 +300,31 @@ majoris_btrfs_allocation (const char *path, const char *filesystem)
     int fd = syscall (SYS_openat2, AT_FDCWD, path, &how, sizeof how);
     if (fd < 0)
         return NULL;
+    GVariant *report = majoris_btrfs_allocation_fd (fd, filesystem);
+    close (fd);
+    return report;
+}
+
+GVariant *
+majoris_btrfs_allocation_fd (int fd, const char *filesystem)
+{
     struct btrfs_ioctl_fs_info_args fs = { 0 };
     struct statvfs vfs;
-    const guint slots = 64;
-    g_autofree struct btrfs_ioctl_space_args *spaces =
-        g_malloc0 (sizeof *spaces + slots * sizeof (struct btrfs_ioctl_space_info));
-    spaces->space_slots = slots;
+    g_autofree struct btrfs_ioctl_space_args *spaces = majoris_btrfs_query_spaces (fd);
     gboolean valid = ioctl (fd, BTRFS_IOC_FS_INFO, &fs) == 0 && fstatvfs (fd, &vfs) == 0 &&
         vfs.f_frsize > 0 && vfs.f_blocks <= G_MAXUINT64 / vfs.f_frsize &&
         vfs.f_bavail <= vfs.f_bfree && vfs.f_bfree <= vfs.f_blocks &&
-        ioctl (fd, BTRFS_IOC_SPACE_INFO, spaces) == 0 &&
-        spaces->total_spaces > 0 && spaces->total_spaces < slots;
+        spaces != NULL;
     g_autofree char *uuid = format_uuid (fs.fsid);
-    if (!valid || g_ascii_strcasecmp (uuid, filesystem) != 0) {
-        close (fd);
+    if (!valid || g_ascii_strcasecmp (uuid, filesystem) != 0)
         return NULL;
-    }
 
     GVariantBuilder allocations = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(sttt)"));
     guint64 reserve = 0, overhead = 0;
     gboolean overhead_known = TRUE;
     for (guint64 i = 0; i < spaces->total_spaces; i++) {
         struct btrfs_ioctl_space_info *row = &spaces->spaces[i];
-        const guint64 types = row->flags & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
+        const guint64 types = row->flags & SPACE_TYPE_MASK;
         const char *kind;
         switch (types) {
         case BTRFS_BLOCK_GROUP_DATA: kind = "Data"; break;
@@ -271,9 +332,13 @@ majoris_btrfs_allocation (const char *path, const char *filesystem)
         case BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA: kind = "Data and metadata"; break;
         case BTRFS_BLOCK_GROUP_SYSTEM: kind = "System"; break;
         default:
-            if (row->flags == BTRFS_SPACE_INFO_GLOBAL_RSV)
+            if (row->flags == BTRFS_SPACE_INFO_GLOBAL_RSV) {
                 reserve = row->total_bytes;
-            continue;
+                continue;
+            }
+            kind = "Unknown allocation";
+            overhead_known = FALSE;
+            break;
         }
         guint64 extra;
         if (!allocation_overhead (row->flags, row->total_bytes, &extra) ||
@@ -286,6 +351,7 @@ majoris_btrfs_allocation (const char *path, const char *filesystem)
     }
 
     GVariantBuilder members = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(ttttssbb)"));
+    GVariantBuilder details = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(tsat)"));
     g_autofree char *devinfo = g_strdup_printf ("/sys/fs/btrfs/%s/devinfo", uuid);
     g_autoptr(GDir) devices = g_dir_open (devinfo, 0, NULL);
     const char *entry;
@@ -308,22 +374,29 @@ majoris_btrfs_allocation (const char *path, const char *filesystem)
             writable ? "Present" : "Read-only";
         struct btrfs_ioctl_get_dev_stats stats = { .devid = id, .nr_items = BTRFS_DEV_STAT_VALUES_MAX };
         gboolean has_errors = FALSE;
-        if (present && ioctl (fd, BTRFS_IOC_GET_DEV_STATS, &stats) == 0)
-            for (guint i = 0; i < MIN (stats.nr_items, BTRFS_DEV_STAT_VALUES_MAX); i++)
+        GVariantBuilder counters = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("at"));
+        if (present && ioctl (fd, BTRFS_IOC_GET_DEV_STATS, &stats) == 0 &&
+            stats.nr_items == BTRFS_DEV_STAT_VALUES_MAX) {
+            for (guint i = 0; i < BTRFS_DEV_STAT_VALUES_MAX; i++) {
                 has_errors |= stats.values[i] != 0;
+                g_variant_builder_add (&counters, "t", (guint64) stats.values[i]);
+            }
+        }
         g_variant_builder_add (&members, "(ttttssbb)", id, number,
             known ? (guint64) device.total_bytes : 0, known ? (guint64) device.bytes_used : 0,
             member_uuid, state, known, has_errors);
+        const char *path = (const char *) device.path;
+        g_variant_builder_add (&details, "(ts@at)", id, present && g_utf8_validate (path, -1, NULL) ? path : "",
+            g_variant_builder_end (&counters));
     }
     g_autofree char *operation_path = g_build_filename ("/sys/fs/btrfs", uuid, "exclusive_operation", NULL);
     g_autofree char *operation = NULL;
     if (!g_file_get_contents (operation_path, &operation, NULL, NULL))
         operation = g_strdup ("unknown");
-    close (fd);
-    return g_variant_ref_sink (g_variant_new ("(tt@a(sttt)@a(ttttssbb)tttbstb)",
+    return g_variant_ref_sink (g_variant_new ("(tt@a(sttt)@a(ttttssbb)tttbstb@a(tsat))",
         (guint64) vfs.f_blocks * vfs.f_frsize, (guint64) fs.num_devices,
         g_variant_builder_end (&allocations), g_variant_builder_end (&members),
         (guint64) (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize,
         (guint64) vfs.f_bavail * vfs.f_frsize, reserve, (vfs.f_flag & ST_RDONLY) != 0,
-        g_strstrip (operation), overhead, overhead_known));
+        g_strstrip (operation), overhead, overhead_known, g_variant_builder_end (&details)));
 }
