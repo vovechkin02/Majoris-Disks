@@ -94,3 +94,42 @@ The script creates private image-backed loop devices and verifies the fixture UU
 - Exercise replacement with verified membership, recorded errors, and incomplete UDisks reconciliation. Only the fully verified outcome should receive the unqualified success message.
 
 The `restart` case restarts UDisks between review and dispatch inside the guest and checks that the reviewed plan is refused. The `faults` case takes the Meson-built `libbtrfs-balance-faults.so` as the fourth script argument. It injects failures into a direct instance of the installed native helper using the same disposable fixture checks. Run both cases only in the dedicated guest.
+## STOR-27 Btrfs quotas, qgroups and subvolume limits
+
+In a disposable Debian 13 QEMU guest, load the UDisks Btrfs module, install the
+Majoris helpers and Polkit policy from the build, install `libbtrfsutil1t64` for
+the default-subvolume regression, and run the opt-in fixtures.
+The native fixtures allocate their own loop devices and verify the backing
+image, mounted source and filesystem UUID. The service fixture uses the guest's
+mount namespace so UDisks can discover the mount.
+
+```sh
+sudo env MAJORIS_DISKS_RUN_BTRFS_QUOTA_TESTS=1 meson test -C build --no-rebuild --print-errorlogs \
+  btrfs-quota-traditional-integration btrfs-quota-simple-integration \
+  btrfs-quota-service-integration btrfs-quota-faults-integration \
+  btrfs-quota-observer-restart-integration
+```
+
+Use a writable, non-system disposable Btrfs filesystem for desktop testing.
+Open **Manage Btrfs Quotas** under the Btrfs filesystem, or **Quota Settings**
+from a selected subvolume. Review and enable traditional quotas. Watch the
+rescan job and confirm that a newly opened dialog reads current kernel status.
+Check that the source and snapshot show referenced and exclusive bytes, and
+that a shared snapshot is represented without double-counting it as physical
+allocation. Create a higher-level group, assign an eligible child and check
+both ends of the relationship. If the kernel marks accounting inconsistent,
+rescan before setting another limit.
+
+Use the limit editor to enter a whole number of bytes, KiB, MiB, GiB or TiB.
+Confirm the warning for a limit below current usage. Verify that existing files
+remain accessible and a subsequent over-limit write returns `EDQUOT`. Choose
+**Unlimited** and verify the selected limit clears. Exercise both limit types
+with traditional quotas.
+
+To switch modes, review the limits and relationships in the disable confirmation
+and authorize the disable. Then separately review and authorize enabling simple
+quotas. Verify the first-owner label and that exclusive limits, hierarchy changes
+and rescans are absent. Cancel authorization and verify the actual state remains
+visible. When creating a subvolume or snapshot, choose **Review Quota Settings
+After Creation** to open its stable level-0 ID. If quota configuration fails,
+the newly created object remains available.

@@ -18,6 +18,22 @@ ioctl (int fd, unsigned long request, ...)
     va_start (args, request);
     void *argument = va_arg (args, void *);
     va_end (args);
+    static gboolean quota_changed;
+    const char *quota_fault = getenv ("MAJORIS_TEST_BTRFS_QUOTA_FAULT");
+    if (quota_fault && request == BTRFS_IOC_TREE_SEARCH_V2) {
+        if (strcmp (quota_fault, "helper-exit") == 0) _exit (42);
+        if (strcmp (quota_fault, "status-timeout") == 0) sleep (30);
+        if (quota_changed || strcmp (quota_fault, "status-unavailable") == 0) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    if (quota_fault && request == BTRFS_IOC_QUOTA_RESCAN && strcmp (quota_fault, "rescan-failure") == 0) {
+        errno = EIO;
+        return -1;
+    }
+    if (quota_fault && request == BTRFS_IOC_QGROUP_LIMIT && strcmp (quota_fault, "false-limit-success") == 0)
+        return 0;
     const char *fault = getenv ("MAJORIS_TEST_BTRFS_BALANCE_FAULT");
     if (request == BTRFS_IOC_SCRUB_PROGRESS && fault && strcmp (fault, "active-scrub") == 0)
         return 0;
@@ -49,6 +65,9 @@ ioctl (int fd, unsigned long request, ...)
         return -1;
     }
     int rc = real_ioctl (fd, request, argument);
+    if (rc >= 0 && quota_fault && request == BTRFS_IOC_QGROUP_LIMIT &&
+        strcmp (quota_fault, "limit-readback-failure") == 0)
+        quota_changed = TRUE;
     if (rc == 0 && fault && request == BTRFS_IOC_GET_DEV_STATS && strcmp (fault, "device-errors") == 0) {
         struct btrfs_ioctl_get_dev_stats *stats = argument;
         stats->values[BTRFS_DEV_STAT_WRITE_ERRS] = 1;

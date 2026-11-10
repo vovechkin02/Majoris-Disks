@@ -12,6 +12,8 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow advanced_maintenance;
         [GtkChild] private unowned Adw.ActionRow advanced_recovery;
         [GtkChild] private unowned Adw.ActionRow advanced_btrfs_replace;
+        [GtkChild] private unowned Adw.ActionRow advanced_btrfs_quota;
+        private string quota_selection = "";
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_rename;
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_refresh;
         [GtkChild] private unowned Adw.ActionRow advanced_lvm_cleanup;
@@ -98,6 +100,10 @@ namespace MajorisDisks {
             advanced_btrfs_replace.activated.connect (() => {
                 var context = advanced_context;
                 if (context != null) new BtrfsDeviceReplaceDialog (backend, context).present (this);
+            });
+            advanced_btrfs_quota.activated.connect (() => {
+                var context = advanced_context;
+                if (context != null) new BtrfsQuotaDialog (backend, context).present (this);
             });
             advanced_lvm_rename.activated.connect (() => {
                 var group = advanced_device as StorageVolumeGroup;
@@ -590,11 +596,19 @@ namespace MajorisDisks {
 
         private void list_btrfs_subvolumes (StorageBlock block) {
             string identity = backend.modification_identity (block);
-            backend.list_btrfs_subvolumes.begin (block, (obj, result) => {
+            backend.list_btrfs_subvolumes.begin (block, true, (obj, result) => {
                 try {
                     var entries = backend.list_btrfs_subvolumes.end (result);
-                    var dialog = new BtrfsSubvolumesDialog (entries, !block.read_only && !block.system_hint);
+                    var dialog = new BtrfsSubvolumesDialog (entries, !block.read_only && !block.system_hint, block);
+                    backend.query_btrfs_quota.begin (block, identity, (object, inspected) => {
+                        try { dialog.set_quota (backend.query_btrfs_quota.end (inspected)); }
+                        catch (Error error) { dialog.set_quota (null); }
+                    });
                     dialog.response.connect ((response) => {
+                        if (response == "quota") {
+                            new BtrfsQuotaDialog (backend, block, dialog.selected_subvolume_id).present (this);
+                            return;
+                        }
                         if (pending.contains (block.path)) return;
                         if (response == "delete") {
                             var selected_subvolume = dialog.snapshot_source;
@@ -604,14 +618,19 @@ namespace MajorisDisks {
                         }
                         if (response == "create" || response == "snapshot") {
                             var source = response == "snapshot" ? dialog.snapshot_source : null;
+                            bool configure = dialog.review_new_quota;
                             if (response == "snapshot" && source == null) return;
                             pending.insert (block.path, block);
                             backend.change_btrfs_subvolume.begin (block, dialog.new_name, identity,
                                 source, dialog.read_only_snapshot, false, (object, created) => {
                                 pending.remove (block.path);
                                 try {
-                                    backend.change_btrfs_subvolume.end (created);
+                                    uint64 created_id = backend.change_btrfs_subvolume.end (created);
                                     notifications.add_toast (new Adw.Toast (source == null ? "Btrfs subvolume created" : "Btrfs snapshot created"));
+                                    if (configure)
+                                        new BtrfsQuotaDialog (backend, block, created_id).present (this);
+                                    else
+                                        refresh_btrfs_quota (block, identity);
                                 } catch (Error error) {
                                     show_check_message ("Could not confirm Btrfs creation", operation_error (error));
                                 }
@@ -634,6 +653,13 @@ namespace MajorisDisks {
                 } catch (Error error) {
                     show_check_message ("Could not list Btrfs subvolumes", operation_error (error));
                 }
+            });
+        }
+
+        private void refresh_btrfs_quota (StorageBlock block, string identity) {
+            backend.query_btrfs_quota.begin (block, identity, (object, result) => {
+                try { backend.query_btrfs_quota.end (result); }
+                catch (Error error) {}
             });
         }
 
@@ -1859,6 +1885,7 @@ namespace MajorisDisks {
             advanced_summary.title = item.name != "" ? item.name : "Storage Object";
             advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible = false;
             advanced_btrfs_replace.visible = false;
+            advanced_btrfs_quota.visible = false;
             advanced_lvm_rename.visible = advanced_lvm_refresh.visible = advanced_lvm_cleanup.visible =
                 advanced_lvm_repair.visible = advanced_lvm_cache.visible = advanced_lvm_uncache.visible = false;
             advanced_lvm_layout.visible = false;
@@ -1968,10 +1995,29 @@ namespace MajorisDisks {
                 advanced_recovery.title = "Balance and Scrub";
                 advanced_btrfs_replace.visible = backend.has_btrfs_subvolumes (filesystem) &&
                     backend.has_btrfs_replacement_helper ();
+                advanced_btrfs_quota.visible = backend.has_btrfs_subvolumes (filesystem);
+                if (advanced_btrfs_quota.visible) {
+                    string identity = backend.modification_identity (filesystem);
+                    if (quota_selection != identity) {
+                        quota_selection = identity;
+                        advanced_btrfs_quota.subtitle = "Reading quota accounting…";
+                        backend.query_btrfs_quota.begin (filesystem, identity, (object, inspected) => {
+                            try {
+                                var quota = backend.query_btrfs_quota.end (inspected);
+                                if (quota_selection == identity)
+                                    advanced_btrfs_quota.subtitle = quota.mode_label ();
+                            } catch (Error error) {
+                                if (quota_selection == identity)
+                                    advanced_btrfs_quota.subtitle = "Quota state unknown";
+                            }
+                        });
+                    }
+                }
                 update_replacement_row ();
                 advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible =
                     backend.has_btrfs_subvolumes (filesystem);
             }
+            if (!advanced_btrfs_quota.visible) quota_selection = "";
             update_advanced_jobs ();
             drive_view.clear ();
             states.visible_child = advanced_view;
@@ -2953,6 +2999,12 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ComboRow subvolumes;
         [GtkChild] private unowned Adw.EntryRow new_subvolume;
         [GtkChild] private unowned Adw.SwitchRow snapshot_read_only;
+        [GtkChild] private unowned Adw.SwitchRow configure_quota;
+        [GtkChild] private unowned Adw.ActionRow quota_summary;
+        [GtkChild] private unowned Adw.ActionRow subvolume_access;
+        private BtrfsQuotaStatus? quota;
+        private StorageBlock? quota_block;
+        private bool can_change_quota;
         private BtrfsSubvolume?[] sources = { null };
         public bool read_only_snapshot { get { return snapshot_read_only.active; } }
         public unowned BtrfsSubvolume? snapshot_source {
@@ -2961,8 +3013,13 @@ namespace MajorisDisks {
         public string new_name { owned get { return new_subvolume.text; } }
         private uint64[] ids = { 5 };
         public uint selected_id { get { return (uint) ids[subvolumes.selected]; } }
+        public uint64 selected_subvolume_id { get { return ids[subvolumes.selected]; } }
+        public bool review_new_quota { get { return configure_quota.visible && configure_quota.active; } }
 
-        public BtrfsSubvolumesDialog (BtrfsSubvolumeList info, bool can_change) {
+        public BtrfsSubvolumesDialog (BtrfsSubvolumeList info, bool can_change, StorageBlock? block = null) {
+            can_change_quota = can_change;
+            quota_block = block;
+            quota_summary.subtitle = "Reading quota state…";
             var labels = new Gtk.StringList (null);
             labels.append ("Top-level subvolume · ID 5");
             uint selected = 0;
@@ -2976,6 +3033,7 @@ namespace MajorisDisks {
             }
             subvolumes.model = labels;
             subvolumes.selected = selected;
+            update_access ();
             body = info.default_known
                 ? "Default subvolume ID %u. Changing the default affects future mounts without an explicit subvolume.".printf (info.default_id)
                 : info.default_unavailable != "" ? info.default_unavailable : "The default subvolume could not be read.";
@@ -2987,6 +3045,8 @@ namespace MajorisDisks {
             set_response_enabled ("delete", false);
             new_subvolume.changed.connect (() => update_create_responses (can_change));
             subvolumes.notify["selected"].connect (() => {
+                update_quota ();
+                update_access ();
                 update_create_responses (can_change);
                 var chosen = snapshot_source;
                 set_response_enabled ("delete", can_change && info.default_known && chosen != null &&
@@ -2996,6 +3056,37 @@ namespace MajorisDisks {
                 set_response_enabled ("apply", can_change && info.default_known && index < ids.length &&
                     ids[index] <= uint.MAX && ids[index] != info.default_id);
             });
+        }
+
+        private void update_access () {
+            subvolume_access.subtitle = quota_block == null ? "Unknown" :
+                UDisksService.btrfs_subvolume_access (quota_block, snapshot_source);
+        }
+
+        public void set_quota (BtrfsQuotaStatus? observed) {
+            quota = observed;
+            configure_quota.visible = can_change_quota && quota != null && quota.writable &&
+                quota.mode != BtrfsQuotaMode.DISABLED;
+            update_quota ();
+        }
+
+        private void update_quota () {
+            var group = quota?.find (selected_subvolume_id);
+            if (group == null) {
+                quota_summary.subtitle = quota == null ? "Quota state unknown" : quota.mode == BtrfsQuotaMode.DISABLED ?
+                    "Quotas disabled" : "No level-0 qgroup reported for this subvolume.";
+                return;
+            }
+            bool simple = quota.mode == BtrfsQuotaMode.SIMPLE;
+            string[] parents = {};
+            foreach (uint64 parent in group.parents) parents += BtrfsQgroup.format_id (parent);
+            quota_summary.subtitle = "%s · %s · %s %s B · limit %s".printf (
+                quota.mode_label (), group.name, simple ? "First-owner usage" : "Referenced",
+                group.referenced.to_string (), group.limit (false));
+            if (!simple) quota_summary.subtitle += "\nExclusive %s B · limit %s".printf (
+                group.exclusive.to_string (), group.limit (true));
+            if (parents.length != 0) quota_summary.subtitle += "\nParents · " + string.joinv (", ", parents);
+            if (quota.running || quota.inconsistent) quota_summary.subtitle += "\n" + quota.accounting_label ();
         }
 
         private void update_create_responses (bool can_change) {

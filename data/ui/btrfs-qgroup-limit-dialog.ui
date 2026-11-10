@@ -1,0 +1,24 @@
+<interface>
+  <template class="MajorisDisksBtrfsQgroupLimitDialog" parent="AdwAlertDialog">
+    <property name="heading">Edit Quota Limit</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child><object class="AdwSwitchRow" id="unlimited"><property name="title">Unlimited</property></object></child>
+        <child><object class="AdwEntryRow" id="amount"><property name="title">New Limit</property>
+          <property name="input-purpose">digits</property>
+        </object></child>
+        <child><object class="AdwComboRow" id="unit"><property name="title">Unit</property>
+          <property name="model"><object class="GtkStringList"><items>
+            <item>Bytes</item><item>KiB</item><item>MiB</item><item>GiB</item><item>TiB</item>
+          </items></object></property>
+        </object></child>
+        <child><object class="AdwActionRow" id="warning"><property name="title">Limit Eligibility</property></object></child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="apply" appearance="suggested">Review…</response>
+    </responses>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>

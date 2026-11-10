@@ -1291,7 +1291,7 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_DATA ("UDisks returned an invalid Btrfs default subvolume ID.");
             return reply.get_child_value (0).get_uint32 ();
         }
-        internal async BtrfsSubvolumeList list_btrfs_subvolumes (StorageBlock block) throws Error {
+        internal async BtrfsSubvolumeList list_btrfs_subvolumes (StorageBlock block, bool include_default = true) throws Error {
             var proxy = require_volume (block, "Filesystem.BTRFS");
             if (!has_btrfs_subvolumes (block))
                 throw new IOError.NOT_SUPPORTED ("Mount this Btrfs filesystem to list its subvolumes.");
@@ -1313,13 +1313,15 @@ namespace MajorisDisks {
                 entry.snapshot = snapshot_ids.contains (entry.id.to_string ());
                 result.entries[i] = entry;
             }
-            try {
-                bool native = yield has_native_btrfs_default (proxy, lifetime);
-                result.default_id = yield read_btrfs_default (block, proxy, native, lifetime);
-                result.default_known = true;
-            } catch (Error error) {
-                lifetime.set_error_if_cancelled ();
-                result.default_unavailable = error.message;
+            if (include_default) {
+                try {
+                    bool native = yield has_native_btrfs_default (proxy, lifetime);
+                    result.default_id = yield read_btrfs_default (block, proxy, native, lifetime);
+                    result.default_known = true;
+                } catch (Error error) {
+                    lifetime.set_error_if_cancelled ();
+                    result.default_unavailable = error.message;
+                }
             }
             synchronize ();
             if (require_volume (block, "Filesystem.BTRFS") != proxy || modification_identity (block) != identity)
@@ -1374,7 +1376,17 @@ namespace MajorisDisks {
         private extern static string? inspect_btrfs_subvolume (string path, uint64 id, string filesystem,
             string? origin, out bool read_only);
 
-        internal async void change_btrfs_subvolume (StorageBlock block, string name, string identity,
+        internal static string btrfs_subvolume_access (StorageBlock block, BtrfsSubvolume? entry) {
+            string[] mounts = block.filesystem?.mounts ?? new string[0];
+            bool read_only = false;
+            if (mounts.length != 1 || !Uuid.string_is_valid (block.uuid) ||
+                inspect_btrfs_subvolume (Path.build_filename (mounts[0], entry?.path ?? ""),
+                    entry?.id ?? 5, block.uuid, null, out read_only) == null)
+                return "Could not verify the selected subvolume’s read-only flag";
+            return read_only ? "Read-only subvolume" : "Writable subvolume";
+        }
+
+        internal async uint64 change_btrfs_subvolume (StorageBlock block, string name, string identity,
             BtrfsSubvolume? source = null, bool read_only = false, bool remove = false) throws Error {
             if (!valid_btrfs_leaf (name) || (remove && (source == null || name != source.path)) ||
                 (source != null && (source.parent_id != 5 || !valid_btrfs_leaf (source.path))))
@@ -1478,7 +1490,7 @@ namespace MajorisDisks {
                     }
                     outcome.successful = true;
                     outcome.summary = "Btrfs subvolume deleted";
-                    return;
+                    return 0;
                 }
                 for (size_t i = 0; i < rows.n_children (); i++) {
                     var row = rows.get_child_value (i);
@@ -1492,7 +1504,7 @@ namespace MajorisDisks {
                         }
                         outcome.successful = true;
                         outcome.summary = source == null ? "Btrfs subvolume created" : "Btrfs snapshot created";
-                        return;
+                        return row.get_child_value (0).get_uint64 ();
                     }
                 }
                 throw new IOError.FAILED ("UDisks did not confirm the new top-level subvolume.");
@@ -1734,6 +1746,180 @@ namespace MajorisDisks {
             plan.reduces_redundancy = fields[1] == "reduce";
             plan.workspace = workspace;
             return plan;
+        }
+
+        private HashTable<string, bool> quota_monitors = new HashTable<string, bool> (str_hash, str_equal);
+
+        internal async BtrfsQuotaStatus query_btrfs_quota (StorageBlock block, string identity) throws Error {
+            var observed = yield btrfs_quota_request (block, identity, "quota-status");
+            if (observed.running && quota_monitors.add (observed.uuid))
+                monitor_btrfs_quota.begin (block, identity, observed);
+            return observed;
+        }
+
+        private async void monitor_btrfs_quota (StorageBlock block, string identity, BtrfsQuotaStatus observed) {
+            string uuid = observed.uuid;
+            var job = jobs.begin ("Btrfs quota rescan", block, snapshot.dependencies);
+            var outcome = new StorageOperationResult ();
+            bool locked = false;
+            try {
+                while (observed.running) {
+                    if (!locked) {
+                        StorageBlock[] members = {};
+                        foreach (var member in snapshot.blocks.get_values ())
+                            if (member.type_id == "btrfs" && member.uuid == uuid && member.available)
+                                members += member;
+                        try {
+                            locks.acquire_members (block, members, snapshot.dependencies);
+                            locked = true;
+                        } catch (IOError.BUSY error) {
+                            // Keep observing a kernel rescan while another job owns the lock.
+                        }
+                    }
+                    jobs.phase (job, StorageJobState.RUNNING, observed.accounting_label ());
+                    Timeout.add_seconds (2, () => {
+                        monitor_btrfs_quota.callback ();
+                        return Source.REMOVE;
+                    });
+                    yield;
+                    observed = yield btrfs_quota_request (block, identity, "quota-status");
+                }
+                outcome.successful = observed.mode == BtrfsQuotaMode.QGROUP && !observed.inconsistent;
+                outcome.summary = outcome.successful ? "Quota rescan completed. Accounting is consistent." :
+                    "Quota rescan stopped without verified consistent accounting.";
+            } catch (Error error) {
+                outcome.fail ("Quota rescan state is unknown", error);
+                outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+            } finally {
+                if (locked) locks.release (block);
+                quota_monitors.remove (uuid);
+                jobs.finish (job, outcome);
+            }
+        }
+
+        internal async BtrfsQuotaStatus change_btrfs_quota (StorageBlock block, string identity,
+            BtrfsQuotaStatus reviewed, string action, string id = "", string value = "") throws Error {
+            if (!(action in new string[] { "quota-enable", "quota-enable-simple", "quota-disable",
+                "quota-rescan-start", "qgroup-create", "qgroup-delete", "qgroup-assign", "qgroup-unassign",
+                "qgroup-referenced-limit", "qgroup-exclusive-limit" }))
+                throw new IOError.INVALID_ARGUMENT ("Invalid quota action.");
+            var observed = yield btrfs_quota_request (block, identity, action, reviewed, id, value);
+            if (observed.running && quota_monitors.add (observed.uuid))
+                monitor_btrfs_quota.begin (block, identity, observed);
+            return observed;
+        }
+
+        private async BtrfsQuotaStatus btrfs_quota_request (StorageBlock block, string identity,
+            string action, BtrfsQuotaStatus? reviewed = null, string id = "", string value = "") throws Error {
+            bool write = reviewed != null;
+            synchronize ();
+            var proxy = require_volume (block, "Filesystem.BTRFS");
+            string uuid = proxy.get_cached_property ("uuid")?.get_string () ?? "";
+            uint64 count = proxy.get_cached_property ("num_devices")?.get_uint64 () ?? 0;
+            string[] mounts = block.filesystem?.mounts ?? new string[0];
+            if (creation_identity_changed (block, identity) || mounts.length != 1 ||
+                !Uuid.string_is_valid (uuid) || count == 0 || count > 64 || block.number == 0 ||
+                (write && reviewed.uuid != uuid))
+                throw new IOError.NOT_FOUND ("A stable Btrfs filesystem, mount and member set are required.");
+            string path = write ? BTRFS_DEFAULT_HELPER : BTRFS_STATUS_HELPER;
+            if (!FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE) ||
+                !FileUtils.test (path, FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("Install the authorized Btrfs quota helpers.");
+
+            StorageBlock[] members = {};
+            string[] member_identities = {};
+            foreach (var member in snapshot.blocks.get_values ()) {
+                if (member.type_id != "btrfs" || member.uuid != uuid || !member.available) continue;
+                if (write) {
+                    var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                    if (member.read_only || safety.system_critical || safety.unknown_dependencies || safety.active_dependents)
+                        throw new IOError.BUSY ("A Btrfs member is protected or has unresolved dependencies.");
+                }
+                members += member;
+                if (write) member_identities += modification_identity (member);
+            }
+            if (members.length != count)
+                throw new IOError.NOT_SUPPORTED ("The complete Btrfs member set is required.");
+
+            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", path, action,
+                mounts[0], uuid, block.number.to_string (), count.to_string () };
+            StorageJob? job = null;
+            var outcome = new StorageOperationResult ();
+            var lifetime = backend_lifetime;
+            if (write) {
+                argv += reviewed.token;
+                if (id != "") argv += id;
+                if (value != "") argv += value;
+                locks.acquire_members (block, members, snapshot.dependencies);
+                job = jobs.begin ("Btrfs quota configuration", block, snapshot.dependencies);
+            }
+            bool dispatched = false;
+            try {
+                if (write) {
+                    foreach (var member in members)
+                        yield KernelStorageSafety.require_no_holders (member, lifetime);
+                    jobs.phase (job, StorageJobState.RUNNING, "Authorizing and verifying the quota change");
+                }
+                lifetime.set_error_if_cancelled ();
+                synchronize ();
+                if (creation_identity_changed (block, identity) ||
+                    !(mounts[0] in (block.filesystem?.mounts ?? new string[0])))
+                    throw new IOError.NOT_FOUND ("The Btrfs filesystem or mount changed before authorization.");
+                for (int i = 0; i < member_identities.length; i++) {
+                    require_volume (members[i], "Block");
+                    if (modification_identity (members[i]) != member_identities[i])
+                        throw new IOError.NOT_FOUND ("A Btrfs member changed before authorization.");
+                }
+
+                var helper = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+                dispatched = true;
+                string? output, diagnostic;
+                yield helper.communicate_utf8_async (null, write ? null : lifetime, out output, out diagnostic);
+                if (!helper.get_successful ()) {
+                    int code = helper.get_if_exited () ? helper.get_exit_status () : -1;
+                    if (code == 126) {
+                        dispatched = false;
+                        throw new IOError.CANCELLED ("Btrfs authorization was cancelled.");
+                    }
+                    if (code == 127) {
+                        dispatched = false;
+                        throw new IOError.PERMISSION_DENIED ("Btrfs authorization was denied.");
+                    }
+                    if (code == 3) outcome.completed ("Quota request dispatched");
+                    if (code == 1) dispatched = false;
+                    string detail = diagnostic?.strip () ?? "";
+                    throw new IOError.FAILED (detail != "" ? detail : "Could not confirm Btrfs quota state.");
+                }
+                if (write) outcome.completed ("Kernel verified quota request");
+                synchronize ();
+                lifetime.set_error_if_cancelled ();
+                if (creation_identity_changed (block, identity) || require_volume (block, "Filesystem.BTRFS") != proxy ||
+                    proxy.get_cached_property ("uuid")?.get_string () != uuid ||
+                    proxy.get_cached_property ("num_devices")?.get_uint64 () != count)
+                    throw new IOError.NOT_FOUND ("The Btrfs filesystem changed during quota inspection.");
+                var observed = new BtrfsQuotaStatus (uuid, output ?? "");
+                outcome.successful = true;
+                outcome.summary = observed.mode_label () + " · " + observed.accounting_label ();
+                outcome.actual_state = outcome.summary;
+                return observed;
+            } catch (Error error) {
+                outcome.fail ("Could not confirm Btrfs quota operation", error);
+                if (dispatched && write) {
+                    if (!outcome.partial) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    try {
+                        var observed = yield query_btrfs_quota (block, identity);
+                        outcome.actual_state = observed.mode_label () + " · " + observed.accounting_label ();
+                    } catch (Error read_error) {
+                        outcome.actual_state = "Quota state unknown · " + read_error.message;
+                    }
+                }
+                throw error;
+            } finally {
+                if (job != null) {
+                    jobs.finish (job, outcome);
+                    locks.release (block);
+                }
+            }
         }
 
         internal async string btrfs_maintenance (StorageBlock block, string identity, string action, uint usage,

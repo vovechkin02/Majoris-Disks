@@ -35,7 +35,8 @@ majoris_btrfs_inspect_subvolume (const char *path, guint64 id, const char *files
     __u64 flags = 0;
     gboolean valid = fstat (fd, &statbuf) == 0 && statbuf.st_ino == 256 &&
         ioctl (fd, BTRFS_IOC_FS_INFO, &fs) == 0 &&
-        ioctl (fd, BTRFS_IOC_GET_SUBVOL_INFO, &subvol) == 0 && subvol.treeid == id &&
+        /* Linux 6.12 can return the positive root-backref lookup result after copying the data. */
+        ioctl (fd, BTRFS_IOC_GET_SUBVOL_INFO, &subvol) >= 0 && subvol.treeid == id &&
         ioctl (fd, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) == 0;
     close (fd);
     if (!valid)

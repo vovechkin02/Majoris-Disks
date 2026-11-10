@@ -133,6 +133,118 @@ test_mount_identity (void)
     g_assert_cmpint (g_rmdir (directory), ==, 0);
 }
 
+static void
+quota_record (guint8 **cursor, guint64 objectid, guint32 type, guint64 offset,
+              const guint64 *values, guint count)
+{
+    struct btrfs_ioctl_search_header header = {
+        .objectid = objectid, .type = type, .offset = offset, .len = count * sizeof (guint64)
+    };
+    memcpy (*cursor, &header, sizeof header);
+    *cursor += sizeof header;
+    for (guint i = 0; i < count; i++) {
+        guint64 value = GUINT64_TO_LE (values[i]);
+        memcpy (*cursor, &value, sizeof value);
+        *cursor += sizeof value;
+    }
+}
+
+enum { MOCK_OFF, MOCK_FULL, MOCK_SIMPLE, MOCK_RESCAN, MOCK_STALE, MOCK_BAD_FLAGS,
+       MOCK_TRUNCATED, MOCK_DUPLICATE, MOCK_MISSING_REVERSE };
+
+static int
+quota_mock (int fixture, unsigned long command, void *data)
+{
+    if (command == BTRFS_IOC_TREE_SEARCH && fixture == MOCK_STALE) {
+        ((struct btrfs_ioctl_search_args *) data)->key.nr_items = 0;
+        return 0;
+    }
+    if (command == BTRFS_IOC_QUOTA_RESCAN_STATUS) {
+        struct btrfs_ioctl_quota_rescan_args *scan = data;
+        scan->flags = fixture == MOCK_RESCAN;
+        scan->progress = 1234;
+        return 0;
+    }
+    g_assert_cmpuint (command, ==, BTRFS_IOC_TREE_SEARCH_V2);
+    struct btrfs_ioctl_search_args_v2 *search = data;
+    if (fixture == MOCK_OFF) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (search->key.min_type == BTRFS_QGROUP_RELATION_KEY) {
+        search->key.nr_items = 0;
+        return 0;
+    }
+    guint64 id = fixture == MOCK_STALE ? 256 : 5;
+    guint64 parent = (1ULL << 48) | 42;
+    guint64 flags = fixture == MOCK_SIMPLE ? 9 : fixture == MOCK_RESCAN ? 5 : fixture == MOCK_BAD_FLAGS ? 129 : 1;
+    const guint64 status[] = { 1, 42, flags, 0, 0 };
+    const guint64 info[] = { 42, 4096, 4096, 2048, 2048 };
+    const guint64 limit[] = { 3, 8192, 4096, 0, 0 };
+    guint8 *cursor = (guint8 *) search->buf;
+    if (search->key.min_type == 0) {
+        quota_record (&cursor, 0, BTRFS_QGROUP_STATUS_KEY, 0, status, fixture == MOCK_TRUNCATED ? 1 : 5);
+        search->key.nr_items = 1;
+        return 0;
+    }
+    g_assert_cmpuint (search->key.min_type, ==, BTRFS_QGROUP_STATUS_KEY);
+    g_assert_cmpuint (search->key.min_offset, ==, 1);
+    quota_record (&cursor, 0, BTRFS_QGROUP_INFO_KEY, id, info, 5);
+    quota_record (&cursor, 0, BTRFS_QGROUP_INFO_KEY, parent, info, 5);
+    quota_record (&cursor, 0, BTRFS_QGROUP_LIMIT_KEY, id, limit, 5);
+    quota_record (&cursor, 0, BTRFS_QGROUP_LIMIT_KEY, parent, limit, 5);
+    quota_record (&cursor, id, BTRFS_QGROUP_RELATION_KEY, parent, NULL, 0);
+    if (fixture != MOCK_MISSING_REVERSE)
+        quota_record (&cursor, fixture == MOCK_DUPLICATE ? id : parent,
+                      BTRFS_QGROUP_RELATION_KEY, fixture == MOCK_DUPLICATE ? parent : id, NULL, 0);
+    search->key.nr_items = fixture == MOCK_MISSING_REVERSE ? 5 : 6;
+    return 0;
+}
+
+static void
+test_quota_parser (void)
+{
+    guint64 id;
+    g_assert_true (majoris_btrfs_quota_id ("1/42", &id));
+    g_assert_cmpuint (id, ==, (1ULL << 48) | 42);
+    g_assert_false (majoris_btrfs_quota_id ("0/7", &id));
+    g_assert_false (majoris_btrfs_quota_id ("1/281474976710656", &id));
+    g_assert_false (majoris_btrfs_quota_id ("65536/1", &id));
+    g_assert_false (majoris_btrfs_quota_id ("0/256/1", &id));
+    for (int fixture = MOCK_OFF; fixture <= MOCK_MISSING_REVERSE; fixture++) {
+        g_autoptr(GError) error = NULL;
+        g_autoptr(GVariant) report = majoris_btrfs_quota_read_with_ioctl (fixture,
+            "00000000-0000-0000-0000-000000000000", quota_mock, &error);
+        if (fixture >= MOCK_BAD_FLAGS) {
+            g_assert_null (report);
+            g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
+            continue;
+        }
+        g_assert_no_error (error);
+        const char *mode;
+        guint64 flags, progress;
+        g_variant_get_child (report, 0, "&s", &mode);
+        g_variant_get_child (report, 1, "t", &flags);
+        g_variant_get_child (report, 2, "t", &progress);
+        g_assert_cmpstr (mode, ==, fixture == MOCK_OFF ? "disabled" : fixture == MOCK_SIMPLE ? "simple" : "qgroup");
+        g_assert_cmpuint (flags, ==, fixture == MOCK_OFF ? 0 : fixture == MOCK_RESCAN ? 7 : fixture == MOCK_SIMPLE ? 9 : 1);
+        g_assert_cmpuint (progress, ==, fixture == MOCK_RESCAN ? 1234 : 0);
+        g_autoptr(GVariant) rows = g_variant_get_child_value (report, 5);
+        g_assert_cmpuint (g_variant_n_children (rows), ==, fixture == MOCK_OFF ? 0 : 2);
+        if (fixture == MOCK_OFF) continue;
+        g_autoptr(GVariant) row = g_variant_get_child_value (rows, 0);
+        guint64 referenced, exclusive, max_referenced, max_exclusive;
+        gboolean stale;
+        g_variant_get (row, "(ttttttb)", &id, &referenced, &exclusive, &flags,
+            &max_referenced, &max_exclusive, &stale);
+        g_assert_cmpuint (referenced, ==, 4096);
+        g_assert_cmpuint (exclusive, ==, 2048);
+        g_assert_cmpuint (max_referenced, ==, 8192);
+        g_assert_cmpuint (max_exclusive, ==, 4096);
+        g_assert_cmpint (stale, ==, fixture == MOCK_STALE);
+    }
+}
+
 int
 main (int argc, char **argv)
 {
@@ -195,5 +307,6 @@ main (int argc, char **argv)
     g_test_add_func ("/btrfs-default/mount-identity", test_mount_identity);
     g_test_add_func ("/btrfs-default/space-info", test_space_info);
     g_test_add_func ("/btrfs-default/profile-conversion", test_conversion_plan);
+    g_test_add_func ("/btrfs-default/quota-parser", test_quota_parser);
     return g_test_run ();
 }

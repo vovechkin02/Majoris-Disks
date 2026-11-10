@@ -205,7 +205,7 @@ On Debian 13.5, `meson setup build/config-recovery`, `meson compile -C build/con
 | STOR-24 | Btrfs scrub start (read-only), status, cancel | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Reads all members; one process may run synchronously to completion | Linux Btrfs ioctls and btrfs-progs | Linux feature | Implemented restricted | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
 | STOR-25 | Btrfs scrub repair mode/resume/history | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Historical results not persisted in UI | Linux Btrfs ioctls and btrfs-progs | Linux feature | Missing | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
 | STOR-26 | Btrfs capacity profile-aware usable-space estimate | UDisksService, btrfs-inspect.c, Btrfs Allocation | Separates kernel logical capacity and available-space estimate from verified Btrfs member allocation | Linux Btrfs ioctls, sysfs and statvfs | Linux feature | Partially implemented | Native Btrfs discovery fixture and storage-model | Parity overhead and future chunk placement remain unknown. |
-| STOR-27 | Btrfs quotas/qgroups/subvolume limits | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Potential Linux equivalent of APFS quotas | Linux Btrfs ioctls and btrfs-progs | Linux analogue | Missing | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
+| STOR-27 | Btrfs quotas/qgroups/subvolume limits | UDisksService, Btrfs Quotas, Btrfs Subvolumes, native Btrfs helpers | Filesystem and subvolume quotas | Btrfs quota tree, quota control, rescan and qgroup ioctls | Linux analogue | Implemented and execution-tested for native quota management | Opt-in traditional and simple quota fixtures on Debian 13 QEMU | See the capability breakdown below. |
 | STOR-27a | Btrfs mounted member and profile discovery | UDisksService, btrfs-inspect.c, Btrfs Allocation | Reports kernel-confirmed missing IDs separately from verified device numbers and keeps every reported profile row | Btrfs FS_INFO, DEV_INFO and SPACE_INFO ioctls and sysfs | Linux feature | Partially implemented | Healthy and read-only degraded RAID 1 discovery executed through the native probe | Desktop rendering, active replacement source identity and other degraded topologies remain open. |
 | STOR-28 | Direct selectable VG/LV/RAID/Btrfs objects | DisksWindow, StorageSnapshot.advanced and StorageSnapshot.blocks, window.ui | Select VGs and LVs directly, open PV details from the member list and retain existing RAID and Btrfs navigation. | UDisks LVM2, MDRaid and Btrfs filesystem metadata | Linux feature | Implemented in source | ui-templates advanced-navigation fixture | GTK selection covers missing-PV UUIDs and inactive LV details. Live topology checks remain open. |
 
@@ -376,3 +376,75 @@ The Linux ioctl receives metadata and system filters separately. The helper foll
 - All nine existing replacement scenarios, Btrfs discovery and disposable Btrfs mount regression passed in the guest. The installed Polkit mutation action denied an unauthenticated caller.
 - The guest fixtures used loop-backed storage. Interactive desktop authentication, failing physical media during conversion, and every possible profile transition remain untested.
 - The native fault shim injected ENOSPC, kernel FORCE rejection, a false completion reply, allocation read failure, unknown profile flags, recorded member errors, active replacement and scrub, an unknown exclusive operation, and a helper timeout. The helper rejected unsafe requests or reported an incomplete result, and independent checks found the original profiles and payload intact.
+
+## STOR-27 Btrfs quota management
+
+The read-only helper obtains mode, committed usage, limits and parent/child
+edges from BTRFS_IOC_TREE_SEARCH_V2, supplements consistency with sysfs where
+available, and reads the running extent cursor with
+BTRFS_IOC_QUOTA_RESCAN_STATUS. An unreadable or malformed tree produces an
+unknown state and blocks changes. Usage is a kernel accounting sample and can
+lag recent writes until transaction commit.
+
+The mutation helper uses BTRFS_IOC_QUOTA_CTL, BTRFS_IOC_QUOTA_RESCAN,
+BTRFS_IOC_QGROUP_CREATE, BTRFS_IOC_QGROUP_ASSIGN and BTRFS_IOC_QGROUP_LIMIT.
+Each request uses the existing admin Polkit action, checks the filesystem UUID
+and member topology, and binds the reviewed configuration to the kernel's
+unique mount ID. The helper takes the filesystem lock, rejects protected or
+read-only filesystems and conflicting maintenance, and verifies the requested
+change on readback. UDisksService also locks the members and checks
+dependencies before dispatch. A failed readback produces a partial or
+uncertain outcome and triggers fresh inspection.
+
+| Capability | Classification | Scope |
+| --- | --- | --- |
+| Discover traditional and simple modes, qgroups, usage, limits and hierarchy | Implemented and execution-tested | Native tree parser, model tests and live fixtures |
+| Enable and disable either mode | Implemented and execution-tested | Live kernel mode verification. Switching uses two separately confirmed operations, with existing settings listed before disabling |
+| Start and verify rescans and handle inconsistency | Implemented and execution-tested | Live running and terminal kernel states, shared-extent assignment that makes accounting inconsistent, and limit rejection until repaired |
+| Rediscover and monitor active rescans | Implemented and execution-tested | Asynchronous storage job uses the kernel extent cursor without estimating a percentage. A fixture terminates a UDisksService observer during a live rescan and verifies consistent accounting from a new process |
+| Create and delete eligible groups, assign and unassign | Implemented and execution-tested | Strictly increasing parent levels prevent cycles. Active level-0 groups and groups with limits or relationships are protected from deletion |
+| Recognize and clean up isolated stale qgroups | Implemented but not execution-tested for deletion | Parser fixture covers stale identity. The live kernel removed the deleted snapshot's group automatically. Only isolated, empty, consistent traditional groups are eligible |
+| Set and clear referenced, exclusive and parent limits | Implemented and execution-tested | Live referenced, exclusive and aggregate enforcement verified with EDQUOT |
+| Simple-quota first-owner usage and level-0 limits | Implemented and execution-tested | Snapshot attribution and over-limit writes verified. Simple-mode exclusive limits, rescans, hierarchy mutations and stale-group deletion are intentionally restricted |
+| GtkBuilder quota and limit dialogs | Implemented but not execution-tested interactively | Template tests instantiate the dialogs. Desktop confirmation, authentication and selection flows remain manual tests |
+| Apply quota configuration during subvolume creation | Intentionally restricted to a two-step workflow | UDisks creates the object first. Majoris offers review of the verified level-0 group for limits or assignment. The two operations are independent |
+| Unknown or unsupported configurations | Intentionally restricted | Changes require a single verified mount, a non-reusable mount ID, a known quota mode and a complete set of up to 64 members. Inspection rejects trees beyond 65,536 raw records. Automatic quota enabling and lossless mode conversion are unsupported |
+
+GNOME Disks source was reviewed for storage preparation, capability-aware
+presentation and asynchronous jobs. No GNOME source was copied. Majoris
+retains its existing UDisks object manager, safety checks, job manager,
+GtkBuilder XML and theme.
+
+| Area | Added | Updated |
+| --- | --- | --- |
+| Native inspection and operations | `src/btrfs-quota.c`, `src/btrfs-quota.h` | `src/btrfs-default-helper.c`, `src/btrfs-inspect.c` |
+| Service, storage jobs and quota models | `src/btrfs-quota.vala` | `src/udisks-service.vala` |
+| Filesystem and subvolume UI | `src/btrfs-quota-dialog.vala`, `data/ui/btrfs-quota-dialog.ui`, `data/ui/btrfs-qgroup-limit-dialog.ui` | `src/window.vala`, `data/ui/window.ui`, `data/ui/btrfs-subvolumes-dialog.ui`, `data/com.majoris.disks.gresource.xml` |
+| Build and authorization | | `meson.build`, `src/meson.build`, `data/com.majoris.disks.Btrfs.policy.in` |
+| Test fixtures and coverage | `tests/btrfs-quota-integration.sh`, `tests/btrfs-quota-service-test.vala` | `tests/btrfs-default-test.c`, `tests/btrfs-balance-faults.c`, `tests/storage-model-test.vala`, `tests/ui-template-test.vala` |
+| Documentation | | `docs/feature-parity-completion.md`, `tests/MANUAL-TESTING.md` |
+
+### Quota execution results
+
+- Debian 13.5 configured and compiled the project. The default Meson run
+  passed nine tests, with 48 prerequisite or opt-in skips and zero failures.
+  Native parser, storage model and GtkBuilder template tests passed.
+- The Debian 13 QEMU guest ran Linux 6.12.115, btrfs-progs 6.14 and UDisks
+  2.10.1. The traditional, simple, UDisks lifecycle, fault injection and
+  observer restart scenarios passed on image-backed devices.
+- The UDisks fixture verified subvolume creation, post-creation limit
+  configuration, rejection of an invalid parent with the subvolume retained,
+  read-only snapshot creation and deletion, and changing and restoring the
+  default subvolume. The Linux 6.12 snapshot check now accepts the kernel's
+  positive success return while continuing to verify the returned identity.
+- Fault fixtures verified read-only helper mutation rejection, Polkit denial,
+  changed mount identity, read-only mount rejection, unavailable quota state,
+  helper exit, timeout, failed rescan, false limit success and failed readback
+  after a real limit change.
+- All nine device-replacement and all 16 profile-conversion scenarios passed
+  after loading the guest's UDisks Btrfs module. Btrfs discovery and the
+  disposable mount suite passed, including balance and read-only scrub.
+- Interactive desktop authorization and stale-qgroup deletion remain
+  unverified. The live kernel removed the deleted snapshot's group and
+  rejected the attempt to create a synthetic orphan level-0 group. The
+  parser's stale-group result is covered by a mock.

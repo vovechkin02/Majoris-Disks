@@ -1,0 +1,48 @@
+<interface>
+  <template class="MajorisDisksBtrfsQuotaDialog" parent="AdwDialog">
+    <property name="title">Btrfs Quotas</property>
+    <property name="content-width">640</property>
+    <property name="content-height">620</property>
+    <property name="child">
+      <object class="AdwToolbarView">
+        <child type="top"><object class="AdwHeaderBar"/></child>
+        <property name="content">
+          <object class="AdwPreferencesPage">
+            <child><object class="AdwPreferencesGroup">
+              <property name="title">Quota Accounting</property>
+              <child><object class="AdwActionRow" id="status_row">
+                <property name="title">Reading quota state…</property>
+                <child type="suffix"><object class="GtkButton" id="refresh_button">
+                  <property name="label">Refresh</property><property name="valign">center</property>
+                </object></child>
+              </object></child>
+              <child><object class="AdwActionRow" id="feedback">
+                <property name="title">Last Operation</property><property name="visible">false</property>
+              </object></child>
+              <child><object class="AdwComboRow" id="filesystem_action">
+                <property name="title">Filesystem Action</property>
+                <child type="suffix"><object class="GtkButton" id="review_filesystem">
+                  <property name="label">Review…</property><property name="valign">center</property>
+                </object></child>
+              </object></child>
+            </object></child>
+            <child><object class="AdwPreferencesGroup">
+              <property name="title">Quota Groups</property>
+              <child><object class="AdwComboRow" id="group_picker"><property name="title">Qgroup</property></object></child>
+              <child><object class="AdwActionRow" id="usage"><property name="title">Usage and Limits</property></object></child>
+              <child><object class="AdwActionRow" id="hierarchy"><property name="title">Hierarchy</property></object></child>
+              <child><object class="AdwComboRow" id="group_action"><property name="title">Qgroup Action</property>
+                <child type="suffix"><object class="GtkButton" id="review_group">
+                  <property name="label">Review…</property><property name="valign">center</property>
+                </object></child>
+              </object></child>
+              <child><object class="AdwEntryRow" id="target">
+                <property name="title">Qgroup ID (level/id)</property><property name="visible">false</property>
+              </object></child>
+            </object></child>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>

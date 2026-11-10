@@ -3,6 +3,7 @@
 #include <blkid/blkid.h>
 #include <gio/gio.h>
 #include "btrfs-inspect.h"
+#include "btrfs-quota.h"
 #include <fcntl.h>
 #include <glib.h>
 #include <linux/btrfs.h>
@@ -17,6 +18,10 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
+
+#ifndef STATX_MNT_ID_UNIQUE
+#define STATX_MNT_ID_UNIQUE 0x00004000U
+#endif
 
 typedef int (*GetDefault) (int, guint64 *);
 typedef int (*SetDefault) (int, guint64);
@@ -877,9 +882,141 @@ run_scrub (int fd, const char *uuid, const char *operation, guint64 expected)
     return 0;
 }
 
+static const char *const quota_actions[] = {
+    "quota-status", "quota-enable", "quota-enable-simple", "quota-disable", "quota-rescan-start",
+    "qgroup-create", "qgroup-delete", "qgroup-assign", "qgroup-unassign",
+    "qgroup-referenced-limit", "qgroup-exclusive-limit"
+};
+
+static GVariant *
+read_quota_for_mount (int fd, const char *uuid, guint64 device, GError **error)
+{
+    struct statx identity;
+    if (statx (fd, "", AT_EMPTY_PATH, STATX_MNT_ID_UNIQUE, &identity) != 0 ||
+        !(identity.stx_mask & STATX_MNT_ID_UNIQUE)) {
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not identify the Btrfs mount.");
+        return NULL;
+    }
+    g_autoptr(GVariant) report = majoris_btrfs_quota_read (fd, uuid, error);
+    if (!report) return NULL;
+    const char *configuration;
+    g_variant_get_child (report, 4, "&s", &configuration);
+    g_autofree char *bound = g_strdup_printf ("%s:%s:%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT,
+        uuid, configuration, device, (guint64) identity.stx_mnt_id);
+    g_autofree char *token = g_compute_checksum_for_string (G_CHECKSUM_SHA256, bound, -1);
+    struct statvfs state;
+    gboolean writable = !system_filesystem (uuid) && fstatvfs (fd, &state) == 0 && !(state.f_flag & ST_RDONLY);
+    g_auto(GVariantBuilder) result = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE (MAJORIS_QUOTA_REPORT));
+    for (guint i = 0; i < 7; i++) {
+        g_autoptr(GVariant) field = i == 4 ? g_variant_ref_sink (g_variant_new_string (token)) :
+            g_variant_get_child_value (report, i);
+        g_variant_builder_add_value (&result, field);
+    }
+    g_variant_builder_add (&result, "b", writable);
+    return g_variant_ref_sink (g_variant_builder_end (&result));
+}
+
+static gboolean
+quota_mutation_safe (int fd, const char *uuid, guint64 count)
+{
+    struct statvfs state;
+    g_autofree char *path = g_strdup_printf ("/sys/fs/btrfs/%s/exclusive_operation", uuid);
+    g_autofree char *exclusive = NULL;
+    return !system_filesystem (uuid) && fstatvfs (fd, &state) == 0 && !(state.f_flag & ST_RDONLY) &&
+        g_file_get_contents (path, &exclusive, NULL, NULL) && g_str_equal (g_strstrip (exclusive), "none") &&
+        verify_maintenance_topology (fd, uuid, count, TRUE);
+}
+
+static gboolean
+quota_mount_current (int fd, const char *path, guint64 device, const char *uuid)
+{
+    int current __attribute__((cleanup(close_fd))) = open_directory (path);
+    struct statx first, second;
+    return current >= 0 &&
+        statx (fd, "", AT_EMPTY_PATH, STATX_MNT_ID_UNIQUE, &first) == 0 &&
+        statx (current, "", AT_EMPTY_PATH, STATX_MNT_ID_UNIQUE, &second) == 0 &&
+        (first.stx_mask & STATX_MNT_ID_UNIQUE) && (second.stx_mask & STATX_MNT_ID_UNIQUE) &&
+        first.stx_mnt_id == second.stx_mnt_id &&
+        matches_mount (fd, path, device, uuid, NULL) && matches_uuid (fd, uuid);
+}
+
+static int
+run_quota (int fd, guint64 device, MajorisQuotaAction action, int argc, char **argv)
+{
+    alarm (action == QUOTA_READ ? 10 : 45);
+    guint64 count, id = 0, value = 0;
+    int arguments = action == QUOTA_READ ? 6 : action < QGROUP_CREATE ? 7 :
+        action <= QGROUP_DELETE ? 8 : 9;
+    if (argc != arguments || !g_ascii_string_to_unsigned (argv[5], 10, 1, 64, &count, NULL) ||
+        (action >= QGROUP_CREATE && !majoris_btrfs_quota_id (argv[7], &id)) ||
+        ((action == QGROUP_ASSIGN || action == QGROUP_UNASSIGN) &&
+            !majoris_btrfs_quota_id (argv[8], &value)))
+        return fail ("Invalid Btrfs quota request.");
+    if (action >= QGROUP_REFERENCED) {
+        if (g_str_equal (argv[8], "unlimited")) value = G_MAXUINT64;
+        else if (!g_ascii_string_to_unsigned (argv[8], 10, 0, G_MAXUINT64 - 1, &value, NULL))
+            return fail ("Invalid quota limit in bytes.");
+    }
+
+    g_autofree char *uuid = g_ascii_strdown (argv[3], -1);
+    int lock __attribute__((cleanup(close_fd))) = -1;
+    if (action != QUOTA_READ) {
+        g_autofree char *lock_name = g_strdup_printf ("/run/majoris-btrfs-%s.lock", uuid);
+        lock = open (lock_name, O_CREAT | O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (lock < 0 || flock (lock, LOCK_EX | LOCK_NB) != 0 ||
+            !quota_mutation_safe (fd, uuid, count))
+            return fail ("Btrfs is protected, read-only, or a conflicting operation is active or unknown.");
+    } else if (!verify_maintenance_topology (fd, uuid, count, FALSE)) {
+        return fail ("Could not verify the Btrfs member topology or maintenance state.");
+    }
+
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GVariant) before = read_quota_for_mount (fd, uuid, device, &error);
+    if (!before) return fail (error->message);
+    if (!quota_mount_current (fd, argv[2], device, uuid))
+        return fail ("The Btrfs mount or its source identity changed.");
+    if (action == QUOTA_READ) {
+        g_autofree char *report = g_variant_print (before, TRUE);
+        g_print ("%s\n", report);
+        return 0;
+    }
+
+    const char *token;
+    g_variant_get_child (before, 4, "&s", &token);
+    if (!g_str_equal (token, argv[6]))
+        return fail ("Quota configuration changed after review. Refresh it before trying again.");
+    if (!quota_mutation_safe (fd, uuid, count) || !quota_mount_current (fd, argv[2], device, uuid))
+        return fail ("The Btrfs mount or maintenance state changed before the quota operation.");
+    if (!majoris_btrfs_quota_apply (fd, action, before, id, value, &error)) {
+        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA)) return fail (error->message);
+        g_autoptr(GVariant) observed = read_quota_for_mount (fd, uuid, device, NULL);
+        const char *current_token = NULL;
+        if (observed) g_variant_get_child (observed, 4, "&s", &current_token);
+        if (g_strcmp0 (token, current_token) == 0 && quota_mount_current (fd, argv[2], device, uuid))
+            return fail (error->message);
+        g_printerr ("%s. The resulting quota state changed or could not be verified.\n", error->message);
+        return 3;
+    }
+
+    g_autoptr(GVariant) after = read_quota_for_mount (fd, uuid, device, &error);
+    if (!after || !quota_mount_current (fd, argv[2], device, uuid) ||
+        !majoris_btrfs_quota_verified (action, before, after, id, value)) {
+        g_printerr ("The kernel accepted the quota request, but Majoris could not verify the result. %s\n",
+                    error ? error->message : "Refresh quota state before taking further action.");
+        return 3;
+    }
+    g_autofree char *report = g_variant_print (after, TRUE);
+    g_print ("%s\n", report);
+    return 0;
+}
+
 int
 main (int argc, char **argv)
 {
+    int quota = -1;
+    if (argc >= 6 && argc <= 9)
+        for (guint i = 0; i < G_N_ELEMENTS (quota_actions); i++)
+            if (g_str_equal (argv[1], quota_actions[i])) quota = i;
     gboolean convert_check = argc == 8 && (g_str_equal (argv[1], "balance-convert-check") ||
         g_str_equal (argv[1], "balance-convert-resume-check"));
     gboolean convert_start = argc == 10 && (g_str_equal (argv[1], "balance-convert") ||
@@ -887,8 +1024,9 @@ main (int argc, char **argv)
     gboolean convert_status = argc == 6 && g_str_equal (argv[1], "balance-convert-status");
     gboolean replace_check = argc == 15 && g_str_equal (argv[1], "replace-check");
 #ifdef MAJORIS_BTRFS_STATUS_ONLY
-    if (!replace_check && !convert_check && !convert_status && (argc != 5 || !g_str_equal (argv[1], "replace-status")))
-        return fail ("This helper accepts only read-only Btrfs replacement requests.");
+    if (quota != QUOTA_READ && !replace_check && !convert_check && !convert_status &&
+        (argc != 5 || !g_str_equal (argv[1], "replace-status")))
+        return fail ("This helper accepts only read-only Btrfs inspection requests.");
     alarm (10);
 #endif
     gboolean set = argc == 7 && g_str_equal (argv[1], "set-default");
@@ -902,7 +1040,7 @@ main (int argc, char **argv)
     gboolean replace_start = argc == 15 && g_str_equal (argv[1], "replace-start");
     guint64 device, expected = 0, target = 0, current;
     if (geteuid () != 0 || (!set && !check && !check_member && !balance && !scrub &&
-        !convert_check && !convert_start && !replace_status && !replace_cancel && !replace_start && !replace_check &&
+        quota < 0 && !convert_check && !convert_start && !replace_status && !replace_cancel && !replace_start && !replace_check &&
         (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
         !g_path_is_absolute (argv[2]) || !g_uuid_string_is_valid (argv[3]) ||
         !g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &device, NULL) ||
@@ -914,6 +1052,9 @@ main (int argc, char **argv)
     dev_t mount_source = 0;
     if (mount < 0 || !matches_mount (mount, argv[2], device, argv[3], &mount_source) || !matches_uuid (mount, argv[3]))
         return fail ("The Btrfs mount or its source identity changed.");
+
+    if (quota >= 0)
+        return run_quota (mount, device, quota, argc, argv);
 
     if (replace_status || replace_cancel)
         return run_replace_status (mount, argv[3], replace_cancel ? argv[5] : NULL);

@@ -25,6 +25,8 @@
     <file>ui/lvm-create-dialog.ui</file>
     <file>ui/create-storage-group-dialog.ui</file>
     <file>ui/btrfs-subvolumes-dialog.ui</file>
+    <file>ui/btrfs-quota-dialog.ui</file>
+    <file>ui/btrfs-qgroup-limit-dialog.ui</file>
     <file>ui/btrfs-balance-dialog.ui</file>
     <file>ui/btrfs-profile-conversion-dialog.ui</file>
     <file>ui/btrfs-device-replace-dialog.ui</file>

@@ -1610,6 +1610,44 @@ private static void test_btrfs_replacement_model () {
     }
 }
 
+private void test_btrfs_quota_model () {
+    string uuid = "38bc7198-10d2-4570-8c4e-49bc0ff093eb";
+    string token = string.nfill (64, 'a');
+    string rows = "[(256,4096,2048,1,8192,0,false),(281474976710698,4096,2048,0,0,0,false)]";
+    try {
+        var report = new BtrfsQuotaStatus (uuid, "('qgroup',7,1024,true,'%s',%s,[(256,281474976710698)],true)".printf (token, rows));
+        assert (report.running && report.inconsistent && report.progress == 1024);
+        assert (report.find (256).name == "0/256");
+        assert (report.find (256).parents[0] == 281474976710698UL);
+        assert (report.find (281474976710698UL).children[0] == 256);
+        assert (report.find (256).limit (false) == "8192 B");
+        assert (report.find (256).limit (true) == "Unlimited");
+    } catch (Error error) { Test.message ("%s", error.message); assert_not_reached (); }
+    foreach (string edges in new string[] { "[(256,257)]", "[(281474976710698,256)]",
+        "[(256,281474976710698),(256,281474976710698)]" }) {
+        try {
+            new BtrfsQuotaStatus (uuid, "('qgroup',1,0,true,'%s',%s,%s,true)".printf (token, rows, edges));
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.INVALID_DATA); }
+    }
+    foreach (string mode in new string[] { "unknown", "disabled", "simple" }) {
+        try {
+            new BtrfsQuotaStatus (uuid, "('%s',1,0,true,'%s',[],[],true)".printf (mode, token));
+            assert_not_reached ();
+        } catch (Error error) { assert (error is IOError.INVALID_DATA); }
+    }
+    uint64 bytes;
+    assert (BtrfsQgroup.parse_id ("1/42", out bytes) && bytes == 281474976710698UL);
+    assert (!BtrfsQgroup.parse_id ("0/9", out bytes));
+    assert (!BtrfsQgroup.parse_id ("1/281474976710656", out bytes));
+    assert (BtrfsQuotaStatus.parse_limit ("4", 1048576, out bytes) && bytes == 4194304);
+    assert (!BtrfsQuotaStatus.parse_limit ("18446744073709551615", 1, out bytes));
+    assert (!BtrfsQuotaStatus.parse_limit ("18446744073709551616", 1, out bytes));
+    assert (!BtrfsQuotaStatus.parse_limit ("17592186044416", 1048576, out bytes));
+    assert (!BtrfsQuotaStatus.parse_limit ("-1", 1024, out bytes));
+    assert (!BtrfsQuotaStatus.parse_limit ("1.5", 1024, out bytes));
+}
+
 public static int main (string[] args) {
     Test.init (ref args);
     Test.add_func ("/storage/btrfs-filesystem-info", test_btrfs_filesystem_info);
@@ -1671,6 +1709,7 @@ public static int main (string[] args) {
     Test.add_func ("/features/mock-restore-rescan", test_mock_rescan);
     Test.add_func ("/features/restore-failure-classification", test_restore_failure_classification);
     Test.add_func ("/features/conversion-progress", test_conversion_progress);
+    Test.add_func ("/features/btrfs-quota-model", test_btrfs_quota_model);
     Test.add_func ("/features/xz-restore-preflight", test_xz_workflow);
     Test.add_func ("/features/raw-image-and-benchmark", test_image_workflows);
     Test.add_func ("/operations/mock-open-device", test_mock_open_device);
