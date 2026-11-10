@@ -2,6 +2,7 @@
   <gresource prefix="/com/majoris/disks">
     <file>com.majoris.disks.metainfo.xml</file>
     <file>ui/window.ui</file>
+    <file>ui/mdraid-management-view.ui</file>
     <file>ui/health-preferences.ui</file>
     <file>ui/benchmark-dialog.ui</file>
     <file>ui/disk-image-confirmation.ui</file>

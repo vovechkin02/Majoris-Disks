@@ -1,0 +1,1 @@
+#define MAJORIS_MDRAID_HELPER "@LIBEXECDIR@/majoris-disks-mdraid-helper"

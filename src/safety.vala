@@ -3,6 +3,12 @@ namespace MajorisDisks {
         public string level = "";
         public string state = "";
         public uint32 degraded;
+        public string uuid = "";
+        public bool running;
+        public uint expected_members;
+        public string bitmap_location = "";
+        public MdRaidTopology? topology;
+        public MdRaidKernelState? kernel;
         public StorageRaid (string path) { base (path); }
     }
 

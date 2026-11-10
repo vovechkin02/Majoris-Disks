@@ -16,6 +16,61 @@ Use only disposable loop images, removable media with backups, or a virtual mach
 12. Exercise the whole-disk overwrite switch only on a disposable loop image; verify progress appears as a job and the warning does not claim secure erasure.
 13. Edit common GPT and MBR partition types through their readable names, then select Other and verify a custom identifier is preserved.
 
+## Linux mdraid recovery and maintenance
+
+Use a disposable Debian 13 QEMU guest named `majoris-mdraid-test`. Install
+`mdadm`, `udisks2`, `util-linux`, `dmsetup` and the kernel RAID personalities.
+Build as a normal user. Run the opted-in tests as root inside the guest.
+
+```sh
+meson setup build
+meson compile -C build
+meson test -C build --print-errorlogs
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 \
+    meson test -C build --no-rebuild --print-errorlogs 'mdraid-*'
+```
+
+The fixture uses image-backed loops and a unique array UUID. Its udev rules
+identify only its loop images and array. It verifies ownership before cleanup
+and stops with the remaining paths if ownership cannot be established.
+Exit 77 is a prerequisite or opt-in skip.
+
+- **STOR-10 and STOR-12**. Start and stop a disposable array. Review a clean
+  degraded assembly and confirm the reported slot loss and array UUID. Test
+  stopped-array deletion separately. Verify that dirty or inconsistent parity
+  metadata, excessive losses and unknown RAID10 layouts prevent automatic
+  degraded assembly.
+- **STOR-11 and spare management**. Add an empty spare and verify its unassigned
+  slot. Remove it through RAID Management and verify the array UUID, remaining
+  slots and payload. Verify that an active or rebuilding member cannot be
+  removed through the inactive-member action.
+- **STOR-13 and STOR-14**. Replace one missing RAID1, RAID5 or RAID6 member. For
+  RAID6 with two missing members, verify the first replacement synchronizes
+  while the array remains degraded. Add the second and verify final redundancy.
+- **RAID10**. Use an even-sized near-two array. Compare its layout and slot
+  pairing with sysfs. Test loss of members in different pairs, then repeat
+  with both copies of the same pair unavailable. The latter cannot reconstruct.
+- **STOR-15**. Rate-limit a disposable rebuild, close Majoris, and restart it.
+  Verify that the kernel action and progress reappear. Restart UDisks during
+  the rebuild and verify the operation is observed without a second mutation.
+  If the original replacement cannot be verified, check that the result is
+  uncertain even when the kernel later reports an idle array.
+- **Fault and re-addition**. Install the Majoris helper and policy. Review an
+  eligible native two-member RAID1 and test authorization denial and approval.
+  Compare the array UUID, member UUID, event count and slot with mdadm. Fault
+  marking requires an idle, clean array with both copies present. Re-addition
+  requires a former member with an eligible role and event counter. Check
+  kernel promotion and payload after a successful re-addition.
+- **Bitmap**. Enable and disable the internal bitmap on an idle healthy native
+  redundant array. Compare the UDisks location and kernel policy. Repeat with
+  external bitmap, journal, PPL and active synchronization fixtures and verify
+  that changes are unavailable.
+- **Check and repair**. Compare kernel progress and mismatch sectors with
+  the management view. Cancel a Majoris-initiated check or repair and verify
+  that an automatic rebuild does not expose that cancellation path. Review
+  repair separately and verify that a missing terminal observation produces
+  an uncertain result.
+
 ## Btrfs allocation and degraded discovery
 
 Use a dedicated Debian 13 guest with the loop driver, `btrfs-progs` and `util-linux`. Build Majoris as a normal user, then run the opt-in tests inside the guest.

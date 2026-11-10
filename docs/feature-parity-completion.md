@@ -188,12 +188,17 @@ On Debian 13.5, `meson setup build/config-recovery`, `meson compile -C build/con
 | STOR-07 | COW snapshot saturation warnings | UDisksService, DriveView, StorageSnapshot | No robust ordinary-snapshot COW lifecycle | UDisks LVM2 and the Majoris storage hierarchy | Linux feature | Partial/missing | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
 | STOR-08 | Missing LVM PV assessment and record removal | UDisksService, StorageVolumeGroup, LvmStructure, DisksWindow | Report missing UUIDs and allocation gaps, reassess on demand and remove records only when all retained allocations can be verified. | UDisks LVM2 | Linux feature | Restricted implementation | storage-model, GTK navigation and mock Poll, opt-in recovery fixture | Model and mock coverage. Live removal and reconnect acceptance remain open. |
 | STOR-09 | LVM repair and advanced administration | UDisksService, LvmStructure, LvmLayout, DisksWindow | Repair eligible two-image RAID 1, rename inactive VGs, manage verified clean caches and create supported layouts with explicit placement. | UDisks LVM2, scoped LVM cache report | Linux feature | Restricted implementation | storage-model, GTK templates and capability mock, opt-in recovery/cache/layout fixtures | Live backend acceptance remains open. |
-| STOR-10 | Start/stop/delete mdraid array | UDisksService, StorageJobManager, DriveView | Complete and verify the named lifecycle using the existing safety and job framework. | UDisks MDRaid, mdraid and LVM2 | Linux feature | Implemented restricted | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
-| STOR-11 | Remove inactive spare/faulty member | UDisksService, StorageJobManager, DriveView | Complete and verify the named lifecycle using the existing safety and job framework. | UDisks MDRaid, mdraid and LVM2 | Linux feature | Implemented restricted | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
-| STOR-12 | Guided degraded RAID1 start | UDisksService, StorageJobManager, DriveView | Complete and verify the named lifecycle using the existing safety and job framework. | UDisks MDRaid, mdraid and LVM2 | Linux feature | Implemented for 2-device RAID1 | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
-| STOR-13 | Replace missing RAID1 member | UDisksService, StorageJobManager, DriveView | Complete and verify the named lifecycle using the existing safety and job framework. | UDisks MDRaid, mdraid and LVM2 | Linux feature | Implemented for 2-device RAID1 | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
-| STOR-14 | Parity RAID5/6 degraded replacement | UDisksService, StorageJobManager, DriveView | Linux-feature target | UDisks MDRaid, mdraid and LVM2 | Linux feature | Missing full workflow | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
-| STOR-15 | Rebuild progress and restart reconciliation | UDisksService, DriveView, StorageSnapshot | Source monitoring present; not runtime verified | UDisks LVM2 and the Majoris storage hierarchy | Linux feature | Partial | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
+| STOR-10 | Start/stop/delete mdraid array | UDisksService, StorageJobManager, DriveView | Existing lifecycle and protection checks | UDisks MDRaid | Linux feature | Implemented but not execution-tested in this pass | Manual lifecycle acceptance | Covers normal assembly, stop and deletion. |
+| STOR-11 | Remove inactive spare/faulty member | UDisksService, StorageJobManager, RAID Management | Verify the remaining kernel members and unchanged degraded count | UDisks RemoveDevice, md sysfs | Linux feature | Implemented and execution-tested for inactive spares | mdraid-member-integration | Faulty-member removal needs separate acceptance. |
+| STOR-12 | Guided degraded RAID1 start | UDisksService, StorageJobManager, RAID Management | Read and compare native superblocks before assembly | UDisks Start, native md metadata | Linux feature | Implemented and execution-tested | mdraid-recovery-start-raid1 | Clean, consistent native metadata required. |
+| STOR-13 | Replace missing RAID1 member | UDisksService, StorageJobManager, RAID Management | Verify reviewed geometry, target slot and final synchronization | UDisks AddDevice, md sysfs | Linux feature | Implemented and execution-tested | mdraid-recovery-raid1 | Loop-backed two-member RAID1 with payload checksums. |
+| STOR-14 | Parity RAID5/6 degraded replacement | UDisksService, StorageJobManager, RAID Management | Verify the surviving slots and clean parity metadata. Replace one missing slot per operation. | UDisks AddDevice, md sysfs | Linux feature | Implemented and execution-tested | mdraid-recovery-raid5, mdraid-recovery-raid6, mdraid-recovery-raid6-double | One missing RAID5 member and one or two missing RAID6 members. |
+| STOR-15 | Rebuild progress and restart reconciliation | UDisksService, StorageJobManager, RAID Management | Poll kernel progress and rediscover active jobs by array UUID and kernel identity | UDisks MDRaid, md sysfs | Linux feature | Implemented and execution-tested for active rebuilds | mdraid-recovery-restart-raid1 | A new client observes the kernel rebuild after client exit and a UDisks restart. The reviewed replacement plan is held in memory. |
+| STOR-16 | RAID10 degraded replacement | UDisksService, RAID Management | Check both slots of each mirror pair | UDisks AddDevice, md sysfs | Linux feature | Implemented and execution-tested | mdraid-recovery-raid10, mdraid-model | Even-sized near-two arrays with layout 258. Other layouts are intentionally restricted. |
+| STOR-17 | Add and remove spare | UDisksService, RAID Management | Verify an empty target, an unassigned spare role and final kernel membership | UDisks AddDevice and RemoveDevice | Linux feature | Implemented and execution-tested | mdraid-member-integration | Idle, synchronized redundant array for addition. |
+| STOR-18 | Internal write-intent bitmap | UDisksService, RAID Management | Compare daemon and kernel state and verify array health after the change | UDisks SetBitmapLocation, md sysfs | Linux feature | Implemented and execution-tested | mdraid-bitmap-integration | External bitmap, PPL and journal settings are inspection only. |
+| STOR-19 | Redundancy check and repair | UDisksService, StorageJobManager, RAID Management | Display mismatch sectors and confirm repair separately. Stop only a matching check or repair. | UDisks RequestSyncAction, md sysfs | Linux feature | Implemented and execution-tested | mdraid-maintenance-integration | Check cancellation, nonzero mismatches, repair and a clean follow-up check. Client results remain uncertain when terminal evidence is missing. |
+| STOR-20 | Member fault marking and re-addition | UDisksService, restricted helper, RAID Management | Revalidate UUID, slot, disk sequence and native superblock event counters after authorization | Restricted Polkit helper, kernel fault ioctl and fixed mdadm re-addition | Linux feature | Implemented and execution-tested through the helper | mdraid-member-integration, mdraid-member-readd-integration | Idle, clean, native two-member RAID1 only. Desktop authorization needs separate acceptance. |
 | STOR-16 | Concatenated JBOD disk set UI | UDisksService, StorageJobManager, DriveView | Linux analogue: MD linear or concatenated LVM | UDisks MDRaid, mdraid and LVM2 | Linux analogue | Missing explicit | storage-model plus opt-in LVM or mdraid fixture | Open. Acceptance case pending. |
 | STOR-17 | Btrfs subvolume list/create/delete | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Btrfs not equivalent to APFS volumes | Linux Btrfs ioctls and btrfs-progs | Linux feature | Implemented restricted | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
 | STOR-18 | Btrfs writable/read-only snapshots | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Complete and verify the named lifecycle using the existing safety and job framework. | Linux Btrfs ioctls and btrfs-progs | Linux feature | Implemented restricted | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
@@ -498,3 +503,92 @@ Meson, the GResource manifest and the existing Polkit policy register the new
 sources and restricted inspection. The test changes cover the native parser,
 template loading, the UDisks client, the disposable scrub and reboot fixtures,
 the shared fault shim and the existing disposable mount regression.
+
+## Advanced Linux mdraid
+
+`StorageRaid` now carries the UDisks UUID, running state, expected geometry
+and a typed member topology. The reader validates the full ActiveDevices
+signature, preserves kernel flags and read errors, rejects duplicate device
+paths and slots, and derives unavailable slots from synchronized occupancy.
+Stopped arrays list discovered members with unverified slots. Kernel readback
+uses device numbers, disk sequence and UUID to associate md sysfs with the
+UDisks array. Synchronization includes completed and total sectors, rate,
+estimated time, current action and mismatch sectors.
+
+The service uses UDisks `Start`, `AddDevice`, `RemoveDevice`,
+`SetBitmapLocation` and `RequestSyncAction`. It uses `Block.OpenDevice` for
+signature checks and direct reads of native superblocks. It compares surviving
+roles, UUIDs, geometry and event counters before reconstruction. Guided degraded
+assembly requires clean, matching native metadata and a verifiable slot plan.
+Parity assembly also requires the kernel dirty-degraded override to be disabled.
+RAID10 is limited to even-sized near-two arrays. Target checks include the
+kernel identity, component capacity, surviving physical devices, logical sector
+size, existing signatures and storage dependencies. After adding a target the
+service verifies its slot, synchronization and the degraded count. RAID6 with
+two losses reports a separate intermediate result after the first member.
+
+The Polkit helper is limited to fault marking and re-addition on idle native
+two-member RAID1. It validates array and member identity, disk sequence, slot
+and event state after authorization. Fault marking uses the kernel ioctl.
+Re-addition uses a fixed mdadm command and accepts only an eligible former role
+and compatible event state. The service never uses a previously saved job as
+authority to dispatch another mutation. On reconnect it rebinds active
+observations to the same array UUID and kernel identity. A local replacement
+plan remains in memory, so a later session can report current kernel health
+without certifying which historical replacement caused it.
+
+New files are `src/mdraid.vala`, `src/mdraid-superblock.[ch]`,
+`src/mdraid-helper.c`, `src/mdraid-helper-config.h.in`,
+`src/mdraid-management-view.vala`, `data/ui/mdraid-management-view.ui`,
+`data/com.majoris.disks.MDRaid.policy.in` and the `tests/mdraid-*` fixtures.
+Modified files include `src/udisks-service.vala`, `src/safety.vala`,
+`src/blkid.vapi`, `src/drive-view.vala`, `src/window.vala`,
+`data/ui/drive-view.ui`, `data/ui/window.ui`,
+`data/com.majoris.disks.gresource.xml`, both Meson build files,
+`tests/ui-template-test.vala` and `tests/MANUAL-TESTING.md`.
+GNOME Disks was reviewed for preparation (`gduutils.c`), object refresh and
+presentation (`gdu-manager.c`, `gdu-drive.c`, `gdu-block-row.c`) and job
+lifecycle (`gdu-job-manager.c`, `gdulocaljob.c`, `gdu-job-row.c`). Majoris
+uses its existing safety and job managers and incorporates no GNOME source or
+styling.
+
+The disposable Debian 13 guest used Linux 6.12.115, UDisks 2.10.1, mdadm 4.4
+and util-linux 2.41.5. Replacement fixtures verified the assigned slot,
+synchronization, degraded count and payload checksum on RAID1, RAID5, RAID6
+and near-two RAID10. The two-loss RAID6 fixture verified each replacement
+independently. Clean degraded RAID1 and RAID5 assembly and refusal of
+reconstruction on a dirty running RAID5 array passed. The tests also
+rejected a changed reconstruction review and a wrong member slot.
+
+The new-client and UDisks restart fixture verified continued reconstruction
+and final payload. The bitmap and member fixtures verified internal bitmap
+enablement and disablement, spare attachment and removal, fault marking and
+former-member re-addition. The re-add fixture verifies the slot and payload
+after synchronization. The extent of bitmap-assisted synchronization was
+not measured. The installed Polkit action denied the non-interactive SSH
+session. Interactive desktop approval and cancellation were not executed.
+
+The check and repair fixture cancelled an active check, detected a deliberate
+mismatch on an offline fixture member, requested repair and verified that a
+follow-up check found zero mismatch sectors. The payload SHA-256 remained
+unchanged. Majoris reported uncertainty when it observed the array return to
+idle without a terminal progress sample. The fixture verified the final state
+independently through sysfs. The Debian 13 Meson suite passed 10 tests with
+74 opt-in or prerequisite skips and no failures. All 13 new disposable
+mdraid cases passed separately.
+
+Representative live regressions passed for filesystem capacity, LUKS mapping
+resize, Btrfs discovery, device replacement, profile conversion, traditional
+quotas and scrub, and LVM missing-PV recovery, RAID1 repair, cleanup and rename.
+The LUKS and LVM reruns used their configured helper paths. The isolated LUKS
+rerun also cleared stale UDisks LVM objects from a reused fixture loop number.
+
+Remaining coverage includes RAID4 and alternate RAID10 live fixtures,
+excessive member loss on a live parity array, kernel refusal of a stopped
+dirty parity array, a guest reboot during recovery, and the full injection
+matrix for device reuse, disappearing members, backend timeouts and helper
+termination. Legacy and external metadata, unsupported RAID10 layouts and
+external bitmap changes are intentionally restricted.
+
+Interface references are the [UDisks MDRaid API](https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.MDRaid.html)
+and the [Linux md kernel documentation](https://docs.kernel.org/admin-guide/md.html).

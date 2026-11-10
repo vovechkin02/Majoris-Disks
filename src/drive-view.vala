@@ -433,7 +433,7 @@ namespace MajorisDisks {
             create_lvm.visible = block.available && !block.read_only && !block.system_hint &&
                 (block.volume_group?.extent_size ?? 0) > 0;
             raid_check.visible = backend?.can_check_raid (block) == true;
-            raid_add.visible = block.available && !block.system_hint && block.raid?.state == "idle" && block.raid?.degraded == 0;
+            raid_add.visible = backend?.can_add_raid_spare (block) == true;
             raid_replace.visible = backend?.can_replace_missing_raid_member (block) == true;
             raid_remove_spare.visible = backend?.can_remove_inactive_raid_member (block) == true;
             raid_delete.visible = backend?.can_delete_stopped_raid (block) == true;

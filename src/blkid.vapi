@@ -8,6 +8,10 @@ namespace MajorisDisks {
         public int set_device (int fd, int64 offset, int64 size);
         [CCode (cname = "blkid_probe_set_superblocks_flags")]
         public int set_superblocks_flags (int flags);
+        [CCode (cname = "blkid_probe_enable_partitions")]
+        public int enable_partitions (int enabled);
+        [CCode (cname = "blkid_probe_enable_superblocks")]
+        public int enable_superblocks (int enabled);
         [CCode (cname = "blkid_do_safeprobe")]
         public int safe_probe ();
         [CCode (cname = "blkid_probe_lookup_value")]

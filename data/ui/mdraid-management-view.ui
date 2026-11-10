@@ -1,0 +1,32 @@
+<interface>
+  <template class="MajorisDisksMdRaidManagementView" parent="AdwDialog">
+    <property name="title">RAID Management</property>
+    <property name="content-width">640</property>
+    <property name="content-height">640</property>
+    <property name="child">
+      <object class="AdwToolbarView">
+        <child type="top"><object class="AdwHeaderBar"/></child>
+        <property name="content">
+          <object class="AdwPreferencesPage">
+            <child><object class="AdwPreferencesGroup">
+              <property name="title">Overview</property>
+              <child><object class="AdwActionRow" id="health"><property name="title">Array identity and health</property><property name="use-markup">False</property></object></child>
+              <child><object class="AdwActionRow" id="geometry"><property name="title">Geometry and metadata</property><property name="use-markup">False</property></object></child>
+              <child><object class="AdwActionRow" id="synchronization"><property name="title">Synchronization</property><property name="use-markup">False</property></object></child>
+              <child><object class="AdwActionRow" id="bitmap"><property name="title">Write-intent bitmap</property><property name="use-markup">False</property></object></child>
+            </object></child>
+            <child><object class="AdwPreferencesGroup" id="members"><property name="title">Members and Slots</property></object></child>
+            <child><object class="AdwPreferencesGroup">
+              <property name="title">Operations</property>
+              <child><object class="AdwActionRow" id="replacement"><property name="title">Replace Missing Member</property><property name="activatable">True</property></object></child>
+              <child><object class="AdwActionRow" id="spare"><property name="title">Add Spare</property><property name="activatable">True</property></object></child>
+              <child><object class="AdwActionRow" id="check"><property name="title">Check Redundancy</property><property name="activatable">True</property></object></child>
+              <child><object class="AdwActionRow" id="repair"><property name="title">Review Redundancy Repair</property><property name="activatable">True</property></object></child>
+              <child><object class="AdwActionRow" id="bitmap_change"><property name="activatable">True</property></object></child>
+            </object></child>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>

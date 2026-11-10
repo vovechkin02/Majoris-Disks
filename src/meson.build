@@ -3,9 +3,10 @@ resources = gnome.compile_resources('majoris-disks-resources',
 
 storage_model_sources = files('device.vala', 'layout.vala', 'hierarchy.vala', 'safety.vala', 'lvm-structure.vala',
   'storage-operation.vala', 'health-monitor.vala', 'disk-benchmark.vala', 'disk-image-copy.vala', 'xz-stream.c', 'nbd-identity.c', 'btrfs-inspect.c', 'virtual-disk.vala', 'virtual-disk-attachment.vala', 'blkid.vapi', 'filesystem-resize.vala', 'kernel-storage-safety.vala', 'mount-restoration.vala', 'restoration-credential.vala')
-storage_model_sources += files('btrfs-quota.vala', 'btrfs-scrub.vala')
+storage_model_sources += files('btrfs-quota.vala', 'btrfs-scrub.vala', 'mdraid.vala', 'mdraid-superblock.c')
 luks_ui_sources = files('luks-credential-dialog.vala')
-sources = storage_model_sources + luks_ui_sources + files('main.vala', 'health-preferences.vala', 'benchmark-dialog.vala', 'udisks-service.vala', 'window.vala',
+mdraid_ui_sources = files('mdraid-management-view.vala')
+sources = storage_model_sources + luks_ui_sources + mdraid_ui_sources + files('main.vala', 'health-preferences.vala', 'benchmark-dialog.vala', 'udisks-service.vala', 'window.vala',
   'drive-view.vala', 'filesystem-usage.vala', 'partition-map.vala', 'btrfs-device-replace-dialog.vala',
   'btrfs-profile-conversion-dialog.vala', 'btrfs-quota-dialog.vala', 'btrfs-scrub-dialog.vala')
 
@@ -18,6 +19,14 @@ executable('majoris-disks-health-monitor', storage_model_sources +
   dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep], install: true)
 
 executable('majoris-disks-nbd-helper', ['nbd-helper.c', 'nbd-identity.c'],
+  dependencies: dependency('gio-2.0'), install: true, install_dir: get_option('libexecdir'))
+
+mdraid_config = configuration_data()
+mdraid_config.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
+configure_file(input: 'mdraid-helper-config.h.in', output: 'mdraid-helper-config.h', configuration: mdraid_config)
+configure_file(input: '../data/com.majoris.disks.MDRaid.policy.in', output: 'com.majoris.disks.MDRaid.policy',
+  configuration: mdraid_config, install_dir: get_option('datadir') / 'polkit-1' / 'actions')
+mdraid_helper = executable('majoris-disks-mdraid-helper', ['mdraid-helper.c', 'mdraid-superblock.c'],
   dependencies: dependency('gio-2.0'), install: true, install_dir: get_option('libexecdir'))
 
 btrfs_config = configuration_data()

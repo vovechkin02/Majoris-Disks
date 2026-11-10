@@ -11,6 +11,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ActionRow advanced_manage;
         [GtkChild] private unowned Adw.ActionRow advanced_maintenance;
         [GtkChild] private unowned Adw.ActionRow advanced_recovery;
+        [GtkChild] private unowned Adw.ActionRow advanced_mdraid;
         [GtkChild] private unowned Adw.ActionRow advanced_btrfs_replace;
         [GtkChild] private unowned Adw.ActionRow advanced_btrfs_quota;
         private string quota_selection = "";
@@ -96,6 +97,20 @@ namespace MajorisDisks {
                 if (context == null) return;
                 if (advanced_device is StorageRaid) confirm_degraded_raid (context);
                 else manage_btrfs_balance (context);
+            });
+            advanced_mdraid.activated.connect (() => {
+                var context = advanced_context;
+                var array = advanced_device as StorageRaid;
+                if (context == null || array == null) return;
+                var dialog = new MdRaidManagementView (backend, context, array);
+                dialog.replace_requested.connect (() => manage_raid_member (context, true, true));
+                dialog.spare_requested.connect (() => manage_raid_member (context, true));
+                dialog.remove_requested.connect ((member) => manage_raid_member (member, false));
+                dialog.member_state_requested.connect ((member, readd) => confirm_raid_member_state (context, member, readd));
+                dialog.check_requested.connect (() => start_raid_check (context));
+                dialog.repair_requested.connect (() => confirm_raid_repair (context));
+                dialog.bitmap_requested.connect ((enable) => confirm_raid_bitmap (context, enable));
+                dialog.present (this);
             });
             advanced_btrfs_replace.activated.connect (() => {
                 var context = advanced_context;
@@ -202,7 +217,7 @@ namespace MajorisDisks {
             drive_view.lvm_manage_requested.connect (manage_logical_volumes);
             drive_view.lvm_add_member_requested.connect (add_lvm_physical_volume);
             drive_view.lvm_create_requested.connect ((block) => create_logical_volume (block));
-            drive_view.raid_check_requested.connect (start_raid_check);
+            drive_view.raid_check_requested.connect ((block) => start_raid_check (block));
             drive_view.raid_member_requested.connect ((block, add) => manage_raid_member (block, add));
             drive_view.raid_replace_requested.connect ((block) => manage_raid_member (block, true, true));
             drive_view.raid_delete_requested.connect (confirm_raid_delete);
@@ -334,9 +349,15 @@ namespace MajorisDisks {
         }
         private void confirm_degraded_raid (StorageBlock member) {
             string identity = backend.storage_membership_identity (member, true);
+            var raid = member.raid_membership;
+            if (raid == null) return;
+            uint available = 0;
+            foreach (var candidate in backend.snapshot.blocks.get_values ())
+                if (candidate.raid_membership == raid) available++;
             var dialog = new HardwareActionConfirmationDialog () {
-                heading = "Start RAID 1 With One Member?",
-                body = "Only %s is available. The other member is missing. The array will have no redundancy, and failure of the remaining device can cause data loss.".printf (member.preferred)
+                heading = "Review Degraded RAID Start?",
+                body = "%s · %s\n%u member devices found for %u slots. Majoris will read their superblocks and proceed only if they establish a clean, recoverable layout. Additional device failures can cause data loss.".printf (
+                    raid.uuid, raid.level, available, raid.expected_members)
             };
             dialog.set_response_label ("continue", "Start Degraded");
             dialog.response.connect ((response) => {
@@ -346,7 +367,7 @@ namespace MajorisDisks {
                     pending.remove (member.path);
                     try {
                         backend.set_raid_running.end (result);
-                        notifications.add_toast (new Adw.Toast ("RAID 1 started with reduced redundancy"));
+                        notifications.add_toast (new Adw.Toast ("RAID array started with reduced redundancy"));
                     } catch (Error error) {
                         show_check_message ("Could not confirm degraded RAID start", operation_error (error));
                     }
@@ -409,14 +430,47 @@ namespace MajorisDisks {
         private void manage_raid_member (StorageBlock block, bool add, bool replacement = false) {
             string identity = backend.modification_identity (block);
             if (add) {
+                StorageBlock[] choices = {};
+                foreach (var candidate in backend.snapshot.blocks.get_values ())
+                    if (backend.can_select_raid_member (block, candidate, replacement)) choices += candidate;
                 var picker = new CreateStorageGroupDialog (backend, false, true,
-                    replacement ? "Replace Missing RAID 1 Member" : "Add RAID Member");
-                if (replacement) picker.body = "Select an unused device at least as large as the surviving member. Its contents may be overwritten during reconstruction.";
+                    replacement ? "Replace Missing RAID Member" : "Add RAID Spare", choices, false);
+                string review = replacement ? backend.raid_review_identity (block) : "";
+                if (choices.length == 0) picker.body = "No eligible unused device was found.";
+                else if (replacement) picker.body = "Select an unused device with sufficient capacity and the same logical sector size as the surviving members.";
                 picker.response.connect ((choice) => {
                     if (choice != "create") return;
                     string[] identities;
                     var members = picker.selected_members (out identities);
-                    if (members.length == 1) change_raid_member (block, members[0], true, identity, identities[0], replacement);
+                    if (members.length != 1) return;
+                    if (!backend.can_select_raid_member (block, members[0], replacement)) {
+                        show_check_message ("RAID member is no longer eligible", "The array or selected device changed while the picker was open.");
+                        return;
+                    }
+                    if (!replacement) {
+                        change_raid_member (block, members[0], true, identity, identities[0]);
+                        return;
+                    }
+                    var array = block.raid;
+                    if (array?.topology == null || review == "" || backend.raid_review_identity (block) != review) {
+                        show_check_message ("RAID reconstruction plan changed", "Review the current array and select the replacement again.");
+                        return;
+                    }
+                    string[] slots = {};
+                    foreach (int slot in array.topology.missing_slots) slots += slot.to_string ();
+                    string risk = array.level == "raid4" || array.level == "raid5" || array.level == "raid6" ?
+                        " A further read error or member failure can prevent reconstruction." : "";
+                    var confirm = new HardwareActionConfirmationDialog () {
+                        heading = "Reconstruct RAID Redundancy?",
+                        body = "%s · %s\nMissing slots: %s · Synchronized members: %u\n\nAdd %s (%s) to rebuild one missing slot. Reconstruction places substantial I/O load on the surviving devices.%s".printf (
+                            array.uuid, array.level, string.joinv (", ", slots), array.topology.synchronized_count,
+                            members[0].preferred, format_size (members[0].size), risk)
+                    };
+                    confirm.response.connect ((response) => {
+                        if (response == "continue")
+                            change_raid_member (block, members[0], true, identity, identities[0], true, review);
+                    });
+                    confirm.present (this);
                 });
                 picker.present (this);
             } else {
@@ -438,30 +492,89 @@ namespace MajorisDisks {
         }
 
         private void change_raid_member (StorageBlock anchor, StorageBlock member, bool add,
-            string anchor_identity, string member_identity, bool replacement = false) {
+            string anchor_identity, string member_identity, bool replacement = false, string review = "") {
             if (pending.contains (anchor.path)) return;
             pending.insert (anchor.path, anchor);
-            backend.change_raid_member.begin (anchor, member, add, anchor_identity, member_identity, replacement, (object, result) => {
+            backend.change_raid_member.begin (anchor, member, add, anchor_identity, member_identity, replacement, review, (object, result) => {
                 pending.remove (anchor.path);
                 try {
-                    backend.change_raid_member.end (result);
-                    notifications.add_toast (new Adw.Toast (replacement ? "Replacement attached. Check Jobs for reconstruction progress." :
-                        add ? "RAID member added" : "Inactive RAID member removed"));
+                    notifications.add_toast (new Adw.Toast (backend.change_raid_member.end (result)));
                 } catch (Error error) {
                     show_check_message ("Could not confirm the RAID member change", operation_error (error));
                 }
             });
         }
 
-        private void start_raid_check (StorageBlock block) {
+        private void confirm_raid_repair (StorageBlock block) {
+            string review = backend.raid_review_identity (block);
+            var dialog = new HardwareActionConfirmationDialog () {
+                heading = "Repair RAID Consistency?",
+                body = "Repair may overwrite redundancy information. The kernel cannot always determine which copy contains the correct user data."
+            };
+            dialog.response.connect ((response) => {
+                if (response == "continue") start_raid_check (block, true, review);
+            });
+            dialog.present (this);
+        }
+
+        private void confirm_raid_member_state (StorageBlock anchor, StorageBlock member, bool readd) {
+            string review = backend.raid_review_identity (anchor);
+            string member_identity = backend.modification_identity (member);
+            var dialog = new HardwareActionConfirmationDialog () {
+                heading = readd ? "Re-add Former RAID Member?" : "Mark RAID Member Faulty?",
+                body = readd ?
+                    "Re-add %s to %s only if its existing superblock and event counter permit reintegration. The kernel will determine what must be synchronized.".printf (
+                        member.preferred, anchor.raid?.uuid ?? "") :
+                    "Mark %s faulty in %s. The array will immediately lose redundancy, and failure of the remaining drive can cause data loss.".printf (
+                        member.preferred, anchor.raid?.uuid ?? "")
+            };
+            dialog.response.connect ((response) => {
+                if (response != "continue" || pending.contains (anchor.path)) return;
+                pending.insert (anchor.path, anchor);
+                backend.change_raid_member_state.begin (anchor, member, readd, review, member_identity, (object, result) => {
+                    pending.remove (anchor.path);
+                    try {
+                        notifications.add_toast (new Adw.Toast (backend.change_raid_member_state.end (result)));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm the RAID member transition", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
+        private void confirm_raid_bitmap (StorageBlock block, bool enable) {
+            string review = backend.raid_review_identity (block);
+            var dialog = new HardwareActionConfirmationDialog () {
+                heading = enable ? "Enable Internal RAID Bitmap?" : "Disable Internal RAID Bitmap?",
+                body = "A write-intent bitmap tracks regions that may need synchronization after an interruption."
+            };
+            dialog.response.connect ((response) => {
+                if (response != "continue" || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.set_raid_bitmap.begin (block, enable, review, (object, result) => {
+                    pending.remove (block.path);
+                    try {
+                        backend.set_raid_bitmap.end (result);
+                        notifications.add_toast (new Adw.Toast ("Internal RAID bitmap updated"));
+                    } catch (Error error) {
+                        show_check_message ("Could not confirm the RAID bitmap change", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
+        private void start_raid_check (StorageBlock block, bool repair = false, string review = "") {
             if (pending.contains (block.path)) return;
             pending.insert (block.path, block);
-            backend.start_raid_check.begin (block, (obj, result) => {
+            backend.start_raid_check.begin (block, repair, review, (obj, result) => {
                 pending.remove (block.path);
                 try {
                     notifications.add_toast (new Adw.Toast (backend.start_raid_check.end (result)));
                 } catch (Error error) {
-                    show_check_message ("Could not confirm the RAID consistency check", operation_error (error));
+                    show_check_message (repair ? "Could not confirm the RAID consistency repair" :
+                        "Could not confirm the RAID consistency check", operation_error (error));
                 }
             });
         }
@@ -1888,6 +2001,7 @@ namespace MajorisDisks {
             advanced_context = null;
             advanced_summary.title = item.name != "" ? item.name : "Storage Object";
             advanced_manage.visible = advanced_maintenance.visible = advanced_recovery.visible = false;
+            advanced_mdraid.visible = false;
             advanced_btrfs_replace.visible = false;
             advanced_btrfs_quota.visible = false;
             advanced_lvm_rename.visible = advanced_lvm_refresh.visible = advanced_lvm_cleanup.visible =
@@ -1981,6 +2095,7 @@ namespace MajorisDisks {
                 advanced_details.subtitle = "%s · %s · %u missing members".printf (array.level, array.state, array.degraded);
                 var context = advanced_context;
                 if (context != null) {
+                    advanced_mdraid.visible = true;
                     bool start = context.raid == null;
                     advanced_manage.title = start ? "Start RAID Array" : "Stop RAID Array";
                     advanced_manage.visible = backend.can_set_raid_running (context, start);
@@ -3124,7 +3239,7 @@ namespace MajorisDisks {
         } }
 
         public CreateStorageGroupDialog (UDisksService backend, bool raid, bool single_member = false, string member_heading = "Add RAID Member",
-            StorageBlock[]? member_choices = null) {
+            StorageBlock[]? member_choices = null, bool remove_member = true) {
             this.raid = raid;
             this.single_member = single_member;
             heading = raid ? "Create RAID Array" : "Create LVM Volume Group";
@@ -3135,8 +3250,9 @@ namespace MajorisDisks {
                 body = "Select one unused device. Adding it can overwrite its contents.";
                 name_entry.visible = false;
                 estimate.visible = false;
-                set_response_label ("create", member_choices == null ? "Add" : "Remove");
-                if (member_choices != null) erase.title = "Confirm removal of the selected device";
+                bool removing = member_choices != null && remove_member;
+                set_response_label ("create", removing ? "Remove" : "Add");
+                if (removing) erase.title = "Confirm removal of the selected device";
             }
             foreach (var block in backend.snapshot.blocks.get_values ()) {
                 if (member_choices == null ? !backend.can_use_group_member (block) : !(block in member_choices)) continue;

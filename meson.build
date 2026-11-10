@@ -101,6 +101,27 @@ if mount_dep.found()
     timeout: 180)
 endif
 test('storage-model', layout_test)
+mdraid_service_test = executable('mdraid-service-test', 'tests/mdraid-service-test.vala',
+  storage_model_sources, 'src/udisks-service.vala', include_directories: xz_include,
+  dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+test('mdraid-model', mdraid_service_test)
+foreach scenario : ['raid1', 'raid5', 'raid6', 'raid6-double', 'raid10', 'start-raid1', 'start-raid5', 'dirty-raid5', 'restart-raid1']
+  test('mdraid-recovery-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/mdraid-recovery-integration.sh', mdraid_service_test, scenario],
+    timeout: 300, is_parallel: false)
+endforeach
+test('mdraid-bitmap-integration', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-bitmap-integration.sh', mdraid_service_test],
+  timeout: 300, is_parallel: false)
+test('mdraid-member-integration', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-member-integration.sh', mdraid_service_test, mdraid_helper],
+  timeout: 300, is_parallel: false)
+test('mdraid-member-readd-integration', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-member-integration.sh', mdraid_service_test, mdraid_helper, 'readd'],
+  timeout: 300, is_parallel: false)
+test('mdraid-maintenance-integration', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-maintenance-integration.sh', mdraid_service_test],
+  timeout: 300, is_parallel: false)
 lvm_device_test = executable('lvm-device-test', 'tests/lvm-device-test.vala', storage_model_sources,
   'src/udisks-service.vala', include_directories: xz_include,
   dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
@@ -117,7 +138,7 @@ test('filesystem-capacity-udisks', sh,
 xvfb = find_program('xvfb-run', required: false)
 if xvfb.found()
   ui_test = executable('ui-template-test', 'tests/ui-template-test.vala',
-    storage_model_sources + luks_ui_sources + files('src/udisks-service.vala', 'src/window.vala',
+    storage_model_sources + luks_ui_sources + mdraid_ui_sources + files('src/udisks-service.vala', 'src/window.vala',
       'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala', 'src/health-preferences.vala',
       'src/benchmark-dialog.vala', 'src/btrfs-device-replace-dialog.vala', 'src/btrfs-profile-conversion-dialog.vala',
       'src/btrfs-quota-dialog.vala', 'src/btrfs-scrub-dialog.vala'),

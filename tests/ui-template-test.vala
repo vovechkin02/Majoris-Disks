@@ -250,6 +250,7 @@ public static int main (string[] args) {
         new BtrfsProfileConversionDialog (backend, block),
         new BtrfsQuotaDialog (backend, block),
         new BtrfsScrubDialog (backend, block),
+        new MdRaidManagementView (backend, block, new StorageRaid ("/test/raid")),
         new BtrfsQgroupLimitDialog (new BtrfsQuotaStatus (Uuid.string_random (),
             "('qgroup',1,0,true,'%s',[],[],true)".printf (string.nfill (64, 'a'))), new BtrfsQgroup (), false),
         new PartitionMap (), new PartitionSegment (), new DriveView (), window,
@@ -276,6 +277,7 @@ public static int main (string[] args) {
     };
     string[] resources = {
         "btrfs-device-replace-dialog.ui", "btrfs-profile-conversion-dialog.ui", "btrfs-quota-dialog.ui", "btrfs-scrub-dialog.ui",
+        "mdraid-management-view.ui",
         "btrfs-qgroup-limit-dialog.ui",
         "lvm-recovery-dialog.ui", "lvm-cache-dialog.ui", "lvm-layout-dialog.ui",
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
