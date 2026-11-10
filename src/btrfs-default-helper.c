@@ -653,25 +653,38 @@ verify_maintenance_topology (int fd, const char *uuid, guint64 expected, gboolea
     return count == expected;
 }
 
+#include "btrfs-conversion.h"
+
 static int
-balance_status (int fd)
+balance_status (int fd, gboolean detailed)
 {
     struct btrfs_ioctl_balance_args balance = { 0 };
     if (ioctl (fd, BTRFS_IOC_BALANCE_PROGRESS, &balance) != 0) {
         if (errno != ENOTCONN) return fail ("Could not query Btrfs balance status.");
-        g_print ("idle 0 0 0\n");
+        g_print ("%s\n", detailed ? "idle 0 0 0 - - 0" : "idle 0 0 0");
         return 0;
     }
     const char *state = balance.state & BTRFS_BALANCE_STATE_RUNNING ? "running" : "paused";
-    g_print ("%s %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT "\n", state,
+    g_print ("%s %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT, state,
         (guint64) balance.stat.completed, (guint64) balance.stat.considered, (guint64) balance.stat.expected);
+    if (detailed) {
+        const Profile *data = find_profile (NULL, balance.data.target);
+        const Profile *metadata = find_profile (NULL, balance.meta.target);
+        g_print (" %s %s %" G_GUINT64_FORMAT,
+            !(balance.data.flags & BTRFS_BALANCE_ARGS_CONVERT) ? "-" : data ? data->name : "unknown",
+            !(balance.meta.flags & BTRFS_BALANCE_ARGS_CONVERT) ? "-" : metadata ? metadata->name : "unknown",
+            (guint64) balance.state);
+    }
+    g_print ("\n");
     return 0;
 }
 
 static int
-run_balance (int fd, const char *uuid, const char *operation, guint64 usage)
+run_balance (int fd, const char *uuid, const char *operation, guint64 usage,
+             guint64 count, char **conversion_args)
 {
-    if (g_str_equal (operation, "balance-status")) return balance_status (fd);
+    if (g_str_equal (operation, "balance-status")) return balance_status (fd, FALSE);
+    if (g_str_equal (operation, "balance-convert-status")) return balance_status (fd, TRUE);
     struct statvfs state;
     if (system_filesystem (uuid) || fstatvfs (fd, &state) != 0 || (state.f_flag & ST_RDONLY))
         return fail ("The filesystem is protected or read-only.");
@@ -679,12 +692,57 @@ run_balance (int fd, const char *uuid, const char *operation, guint64 usage)
         int command = g_str_equal (operation, "balance-pause") ? BTRFS_BALANCE_CTL_PAUSE : BTRFS_BALANCE_CTL_CANCEL;
         if (ioctl (fd, BTRFS_IOC_BALANCE_CTL, (unsigned long) command) != 0)
             return fail ("The kernel did not accept the balance control request.");
-        return balance_status (fd);
+        return balance_status (fd, FALSE);
     }
 
     struct btrfs_ioctl_balance_args balance = { 0 };
-    if (g_str_equal (operation, "balance-resume")) {
-        balance.flags = BTRFS_BALANCE_RESUME;
+    Conversion plan = { 0 };
+    gboolean resume = g_str_equal (operation, "balance-resume") ||
+        g_str_equal (operation, "balance-convert-resume-check");
+    struct btrfs_ioctl_balance_args saved = { 0 };
+    if (resume && (ioctl (fd, BTRFS_IOC_BALANCE_PROGRESS, &saved) != 0 || saved.state != 0))
+        return fail ("There is no paused Btrfs balance to resume.");
+    if (conversion_args != NULL) {
+        const char *data = conversion_args[0], *metadata = conversion_args[1];
+        plan.data = find_profile (data, 0);
+        plan.metadata = find_profile (metadata, 0);
+        if ((!plan.data && !g_str_equal (data, "-")) || (!plan.metadata && !g_str_equal (metadata, "-")) ||
+            (!plan.data && !plan.metadata))
+            return fail ("Invalid or unsupported conversion target.");
+        g_autofree char *token = NULL;
+        if (plan.data) {
+            balance.flags |= BTRFS_BALANCE_DATA;
+            set_conversion_filter (&balance.data, plan.data);
+        }
+        if (plan.metadata) {
+            /* The ioctl takes a separate system filter. Use the metadata target
+             * in the same request, as btrfs-progs does for a metadata balance. */
+            balance.flags |= BTRFS_BALANCE_METADATA | BTRFS_BALANCE_SYSTEM;
+            set_conversion_filter (&balance.meta, plan.metadata);
+            balance.sys = balance.meta;
+        }
+        if (resume && ((saved.flags & ALLOCATION_TYPES) != balance.flags ||
+            memcmp (&saved.data, &balance.data, sizeof saved.data) != 0 ||
+            memcmp (&saved.meta, &balance.meta, sizeof saved.meta) != 0 ||
+            memcmp (&saved.sys, &balance.sys, sizeof saved.sys) != 0))
+            return fail ("The paused conversion targets or filters changed or are unsupported.");
+        const char *error = assess_conversion (fd, uuid, count, resume, &plan, &token);
+        if (error)
+            return fail (error);
+        if (resume && plan.force && !(saved.flags & BTRFS_BALANCE_FORCE))
+            return fail ("The saved conversion lacks the required kernel authorization.");
+        if (g_str_has_suffix (operation, "-check")) {
+            g_print ("%s %s %" G_GUINT64_FORMAT "\n", token, plan.risk ? "reduce" : "standard", plan.workspace);
+            return 0;
+        }
+        if (!g_str_equal (token, conversion_args[2]) ||
+            !g_str_equal (conversion_args[3], plan.risk ? "reduce" : "standard"))
+            return fail ("The conversion plan changed or the required risk was not confirmed. Reassess.");
+        if (plan.force)
+            balance.flags |= BTRFS_BALANCE_FORCE;
+    } else if (resume) {
+        if ((saved.data.flags | saved.meta.flags | saved.sys.flags) & BTRFS_BALANCE_ARGS_CONVERT)
+            return fail ("Review the saved targets in Profile Conversion before resuming.");
     } else if (g_str_equal (operation, "balance-data")) {
         balance.flags = BTRFS_BALANCE_DATA;
         balance.data.flags = BTRFS_BALANCE_ARGS_USAGE;
@@ -696,19 +754,40 @@ run_balance (int fd, const char *uuid, const char *operation, guint64 usage)
     } else {
         return fail ("Unsupported balance operation.");
     }
-    if (ioctl (fd, BTRFS_IOC_BALANCE_V2, &balance) != 0) {
+    if (plan.data || plan.metadata) {
+        if (!verify_maintenance_topology (fd, uuid, count, TRUE))
+            return fail ("The Btrfs topology or scrub state changed before dispatch.");
+        if (resume) {
+            struct btrfs_ioctl_balance_args current = { 0 };
+            if (ioctl (fd, BTRFS_IOC_BALANCE_PROGRESS, &current) != 0 ||
+                memcmp (&current, &saved, sizeof saved) != 0)
+                return fail ("The saved balance changed before dispatch. Review it again.");
+        }
+    }
+    if (resume)
+        balance.flags = BTRFS_BALANCE_RESUME;
+    int result = ioctl (fd, BTRFS_IOC_BALANCE_V2, &balance);
+    if (result > 0)
+        return fail ("The kernel refused the Btrfs balance. Review current topology and exclusive operation.");
+    if (result < 0) {
         if (errno == ECANCELED) {
             struct btrfs_ioctl_balance_args paused = { 0 };
-            if (ioctl (fd, BTRFS_IOC_BALANCE_PROGRESS, &paused) == 0) return balance_status (fd);
+            if (ioctl (fd, BTRFS_IOC_BALANCE_PROGRESS, &paused) == 0) return balance_status (fd, FALSE);
             if (errno == ENOTCONN) {
                 g_print ("interrupted 0 0 0\n");
                 return 0;
             }
         }
-        return fail ("The kernel did not complete the Btrfs balance.");
+        if (errno == ENOSPC)
+            return fail ("The kernel ran out of relocation space. Some chunks may already have moved. Reassess allocation.");
+        g_printerr ("The kernel did not complete the Btrfs balance (%s). Reassess current allocation.\n",
+            g_strerror (errno));
+        return 1;
     }
-    g_print ("completed %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT "\n",
-        (guint64) balance.stat.completed, (guint64) balance.stat.considered, (guint64) balance.stat.expected);
+    gboolean verified = (!plan.data && !plan.metadata) ||
+        (verify_maintenance_topology (fd, uuid, count, FALSE) && verify_conversion (fd, uuid, &plan));
+    g_print ("%s %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT "\n",
+        verified ? "completed" : "incomplete", (guint64) balance.stat.completed, (guint64) balance.stat.considered, (guint64) balance.stat.expected);
     return 0;
 }
 
@@ -801,9 +880,14 @@ run_scrub (int fd, const char *uuid, const char *operation, guint64 expected)
 int
 main (int argc, char **argv)
 {
+    gboolean convert_check = argc == 8 && (g_str_equal (argv[1], "balance-convert-check") ||
+        g_str_equal (argv[1], "balance-convert-resume-check"));
+    gboolean convert_start = argc == 10 && (g_str_equal (argv[1], "balance-convert") ||
+        g_str_equal (argv[1], "balance-resume"));
+    gboolean convert_status = argc == 6 && g_str_equal (argv[1], "balance-convert-status");
     gboolean replace_check = argc == 15 && g_str_equal (argv[1], "replace-check");
 #ifdef MAJORIS_BTRFS_STATUS_ONLY
-    if (!replace_check && (argc != 5 || !g_str_equal (argv[1], "replace-status")))
+    if (!replace_check && !convert_check && !convert_status && (argc != 5 || !g_str_equal (argv[1], "replace-status")))
         return fail ("This helper accepts only read-only Btrfs replacement requests.");
     alarm (10);
 #endif
@@ -818,7 +902,7 @@ main (int argc, char **argv)
     gboolean replace_start = argc == 15 && g_str_equal (argv[1], "replace-start");
     guint64 device, expected = 0, target = 0, current;
     if (geteuid () != 0 || (!set && !check && !check_member && !balance && !scrub &&
-        !replace_status && !replace_cancel && !replace_start && !replace_check &&
+        !convert_check && !convert_start && !replace_status && !replace_cancel && !replace_start && !replace_check &&
         (argc != 5 || !g_str_equal (argv[1], "get-default"))) ||
         !g_path_is_absolute (argv[2]) || !g_uuid_string_is_valid (argv[3]) ||
         !g_ascii_string_to_unsigned (argv[4], 10, 1, G_MAXUINT64, &device, NULL) ||
@@ -843,14 +927,14 @@ main (int argc, char **argv)
             return fail ("Could not verify the Btrfs scrub member topology.");
         return run_scrub (mount, argv[3], argv[1], count);
     }
-    if (balance) {
+    if (balance || convert_check || convert_start) {
         guint64 count, usage = 0;
         gboolean filtered = g_str_equal (argv[1], "balance-data") || g_str_equal (argv[1], "balance-metadata");
         if (!g_ascii_string_to_unsigned (argv[5], 10, 1, G_MAXUINT64, &count, NULL) ||
-            (filtered ? argc != 7 || !g_ascii_string_to_unsigned (argv[6], 10, 0, 100, &usage, NULL) : argc != 6) ||
-            !verify_maintenance_topology (mount, argv[3], count, filtered || g_str_equal (argv[1], "balance-resume")))
+            (!convert_check && !convert_start && (filtered ? argc != 7 || !g_ascii_string_to_unsigned (argv[6], 10, 0, 100, &usage, NULL) : argc != 6)) ||
+            !verify_maintenance_topology (mount, argv[3], count, convert_check || convert_start || filtered || g_str_equal (argv[1], "balance-resume")))
             return fail ("Could not verify the Btrfs maintenance request, member topology or scrub state.");
-        return run_balance (mount, argv[3], argv[1], usage);
+        return run_balance (mount, argv[3], argv[1], usage, count, convert_check || convert_start ? argv + 6 : NULL);
     }
 
     if (check_member) {

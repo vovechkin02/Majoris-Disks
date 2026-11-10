@@ -154,7 +154,7 @@ namespace MajorisDisks {
             progress.text = "%.1f%%".printf (current.progress_1000 / 10.0);
             if (!dispatched && current.state == 2) {
                 outcome.visible = true;
-                outcome.subtitle = "The kernel reports completion. The reviewed source and target identities are unavailable for verification.";
+                outcome.subtitle = current.completion_message ();
             }
             update_controls ();
             if (was_active && !current.active && !dispatched)
@@ -217,15 +217,7 @@ namespace MajorisDisks {
                 var current = yield backend.replace_btrfs_device (anchor, anchor_identity, report, source,
                     target, identity, sequence, avoid);
                 show_status (current);
-                if (current.state == 2) {
-                    string detail = "Completed and membership verified. ";
-                    if (current.read_errors != 0 || current.write_errors != 0)
-                        detail += "The kernel reported replacement errors. ";
-                    if (current.warning != "")
-                        detail += current.warning + " ";
-                    outcome.subtitle = detail + "A separate scrub can check stored data.";
-                } else
-                    outcome.subtitle = current.state_label ();
+                outcome.subtitle = current.completion_message ();
             } catch (Error error) {
                 outcome.subtitle = "Completion could not be verified. " + error.message;
             } finally {

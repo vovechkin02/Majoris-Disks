@@ -1690,11 +1690,12 @@ namespace MajorisDisks {
                 }
                 yield refresh ();
                 var refreshed_target = snapshot.blocks.lookup (target.path);
-                if (status.state == 2 && (refreshed_target == null || refreshed_target.number != target.number ||
-                    refreshed_target.type_id != "btrfs" || refreshed_target.uuid != current.uuid))
+                status.membership_verified = status.state == 2 && refreshed_target != null &&
+                    refreshed_target.number == target.number && refreshed_target.type_id == "btrfs" &&
+                    refreshed_target.uuid == current.uuid;
+                if (status.state == 2 && !status.membership_verified)
                     status.warning = (status.warning + "\nUDisks has yet to confirm the refreshed target membership.").strip ();
-                outcome.successful = status.state == 2 && status.write_errors == 0 && status.read_errors == 0 &&
-                    status.warning == "";
+                outcome.successful = status.verified_completion;
                 outcome.summary = outcome.successful ? "Btrfs replacement completed and membership verified" :
                     status.state == 2 ? "Btrfs replacement finished and needs attention" : status.state_label ();
                 if (!outcome.successful) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
@@ -1710,12 +1711,44 @@ namespace MajorisDisks {
             }
         }
 
-        internal async string btrfs_maintenance (StorageBlock block, string identity, string action, uint usage) throws Error {
+        internal async BtrfsConversionPlan review_btrfs_conversion (StorageBlock block, string identity,
+            BtrfsProfileType data, BtrfsProfileType metadata, bool resume = false) throws Error {
+            if ((data == BtrfsProfileType.UNKNOWN && metadata == BtrfsProfileType.UNKNOWN) ||
+                (data != BtrfsProfileType.UNKNOWN && !data.convertible ()) ||
+                (metadata != BtrfsProfileType.UNKNOWN && !metadata.convertible ()))
+                throw new IOError.INVALID_ARGUMENT ("Select at least one supported target profile.");
+            var current = yield query_btrfs_allocation (block);
+            var plan = new BtrfsConversionPlan (current, data, metadata);
+            string output = yield btrfs_maintenance (block, identity,
+                resume ? "balance-convert-resume-check" : "balance-convert-check", 0, plan);
+            var after = yield query_btrfs_allocation (block);
+            var fields = output.split (" ");
+            uint64 workspace = 0;
+            if (fields.length != 3 || fields[0].length != 64 ||
+                !(fields[1] == "standard" || fields[1] == "reduce") ||
+                !uint64.try_parse (fields[2], out workspace) || workspace == 0)
+                throw new IOError.INVALID_DATA ("The helper returned an invalid conversion assessment.");
+            if (!current.same_members (after) || !current.same_allocations (after))
+                throw new IOError.BUSY ("Allocation or membership changed during review. Reassess the conversion.");
+            plan.token = fields[0];
+            plan.reduces_redundancy = fields[1] == "reduce";
+            plan.workspace = workspace;
+            return plan;
+        }
+
+        internal async string btrfs_maintenance (StorageBlock block, string identity, string action, uint usage,
+            BtrfsConversionPlan? plan = null, bool confirm_reduction = false) throws Error {
+            bool convert = action == "balance-convert" || (action == "balance-resume" && plan != null);
+            bool review = action == "balance-convert-check" || action == "balance-convert-resume-check";
+            bool conversion_status = action == "balance-convert-status";
+            if ((convert || review) && (plan == null || (convert &&
+                (plan.token == "" || plan.reduces_redundancy != confirm_reduction))))
+                throw new IOError.INVALID_ARGUMENT ("A reviewed and confirmed conversion plan is required.");
             bool start = action == "balance-data" || action == "balance-metadata";
             bool scrub = action.has_prefix ("scrub-");
-            bool long_running = start || action == "balance-resume" || action == "scrub-readonly";
-            bool status = action == "balance-status" || action == "scrub-status";
-            if ((!long_running && !status && action != "balance-pause" && action != "balance-cancel" &&
+            bool long_running = start || convert || action == "balance-resume" || action == "scrub-readonly";
+            bool status = action == "balance-status" || action == "scrub-status" || conversion_status;
+            if ((!long_running && !status && !review && action != "balance-pause" && action != "balance-cancel" &&
                 action != "scrub-cancel") || usage > 100)
                 throw new IOError.INVALID_ARGUMENT ("Invalid Btrfs maintenance operation.");
             synchronize ();
@@ -1732,6 +1765,8 @@ namespace MajorisDisks {
             StorageBlock[] members = {};
             foreach (var member in snapshot.blocks.get_values ()) {
                 if (member.type_id != "btrfs" || member.uuid != uuid || !member.available) continue;
+                if ((convert || review) && member.physical_drive?.smart_failing == true)
+                    throw new IOError.FAILED ("A member reports failing SMART health. Review Replace Btrfs Device.");
                 if (!status) {
                     var safety = StorageSafetyService.assess (member, snapshot.dependencies);
                     if ((!scrub && member.read_only) || safety.system_critical || safety.unknown_dependencies || safety.active_dependents)
@@ -1742,29 +1777,72 @@ namespace MajorisDisks {
             if (members.length != count)
                 throw new IOError.NOT_SUPPORTED ("The complete Btrfs member set is required.");
 
-            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", BTRFS_DEFAULT_HELPER,
+            string helper_path = review || conversion_status ? BTRFS_STATUS_HELPER : BTRFS_DEFAULT_HELPER;
+            if (!FileUtils.test (helper_path, FileTest.IS_EXECUTABLE))
+                throw new IOError.NOT_SUPPORTED ("Install the Btrfs status helper to assess profile conversion.");
+            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", helper_path,
                 action, mounts[0], uuid, block.number.to_string (), count.to_string () };
             if (start) argv += usage.to_string ();
+            if (convert || review) {
+                if (plan.reviewed.uuid != uuid || plan.reviewed.member_count != count)
+                    throw new IOError.BUSY ("The reviewed filesystem identity changed.");
+                foreach (var member in members) {
+                    bool matched = false;
+                    foreach (var reviewed in plan.reviewed.members)
+                        if (reviewed.number == member.number && member.number != 0) matched = true;
+                    if (!matched)
+                        throw new IOError.BUSY ("UDisks reports a changed Btrfs member set.");
+                }
+                argv += plan.data.argument ();
+                argv += plan.metadata.argument ();
+                if (convert) {
+                    argv += plan.token;
+                    argv += confirm_reduction ? "reduce" : "standard";
+                }
+            }
             var lifetime = backend_lifetime;
             StorageJob? job = null;
+            if (review) plan.hold_review (locks, block, members, snapshot.dependencies, lifetime);
             if (long_running) {
-                locks.acquire_members (block, members, snapshot.dependencies);
-                job = jobs.begin (scrub ? "Read-only Btrfs scrub" : "Btrfs balance", block, snapshot.dependencies);
-                jobs.phase (job, StorageJobState.RUNNING, "Waiting for the Btrfs kernel operation");
+                if (convert) {
+                    if (!plan.take_review (locks, block))
+                        throw new IOError.BUSY ("The conversion review expired. Review the current filesystem again.");
+                } else {
+                    locks.acquire_members (block, members, snapshot.dependencies);
+                }
+                job = jobs.begin (scrub ? "Read-only Btrfs scrub" :
+                    convert ? "Btrfs profile conversion" : "Btrfs balance", block, snapshot.dependencies);
+                jobs.phase (job, StorageJobState.RUNNING, convert ? "Converting Btrfs allocation profiles" :
+                    "Waiting for the Btrfs kernel operation");
             }
             var outcome = new StorageOperationResult ();
             bool dispatched = false;
             try {
+                if (convert || review) {
+                    foreach (var member in members)
+                        yield KernelStorageSafety.require_no_holders (member, lifetime);
+                    var current = yield query_btrfs_allocation (block);
+                    if (!plan.reviewed.same_members (current) || !plan.reviewed.same_allocations (current) ||
+                        !(mounts[0] in (block.filesystem?.mounts ?? new string[0])))
+                        throw new IOError.BUSY ("The reviewed Btrfs mount, membership or allocation changed.");
+                }
                 lifetime.set_error_if_cancelled ();
                 var helper = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
                 dispatched = true;
                 string? output, diagnostic;
-                yield helper.communicate_utf8_async (null, status ? lifetime : null, out output, out diagnostic);
-                if (!helper.get_successful ())
-                    throw new IOError.FAILED (diagnostic?.strip () ?? "Btrfs maintenance did not complete.");
+                yield helper.communicate_utf8_async (null, status || review ? lifetime : null, out output, out diagnostic);
+                if (!helper.get_successful ()) {
+                    if (helper.get_if_exited () && (helper.get_exit_status () == 126 || helper.get_exit_status () == 127)) {
+                        dispatched = false;
+                        throw new IOError.PERMISSION_DENIED ("Btrfs authorization was cancelled or denied.");
+                    }
+                    string detail = diagnostic?.strip () ?? "";
+                    throw new IOError.FAILED (detail != "" ? detail : "Btrfs maintenance did not complete.");
+                }
+                if (review || conversion_status) return (output ?? "").strip ();
                 var fields = (output ?? "").strip ().split (" ");
                 uint64 completed = 0, considered = 0, expected = 0;
-                if (fields.length != 4 || !(fields[0] in new string[] { "idle", "running", "paused", "completed", "interrupted" }) ||
+                if (fields.length != 4 || !(fields[0] in new string[] { "idle", "running", "paused", "completed", "interrupted", "incomplete" }) ||
                     !uint64.try_parse (fields[1], out completed) || !uint64.try_parse (fields[2], out considered) ||
                     !uint64.try_parse (fields[3], out expected))
                     throw new IOError.INVALID_DATA ("The Btrfs helper returned invalid maintenance status.");
@@ -1778,11 +1856,36 @@ namespace MajorisDisks {
                     "Balance %s · %s completed · %s examined · %s expected chunks").printf (
                     fields[0], completed.to_string (), considered.to_string (), expected.to_string ());
                 outcome.successful = fields[0] == "completed" && (!scrub || (completed == 0 && considered == 0 && expected == 0));
+                if (plan != null && long_running) {
+                    yield refresh ();
+                    var observed = yield query_btrfs_allocation (block);
+                    var terminal = new BtrfsConversionStatus (yield btrfs_maintenance (
+                        block, identity, "balance-convert-status", 0));
+                    outcome.successful = fields[0] == "completed" && terminal.state == "idle" &&
+                        plan.verified (observed);
+                    outcome.summary = outcome.successful ? "Profile conversion completed and allocation verified." :
+                        fields[0] == "paused" ? "Conversion paused. Review current allocation before resuming." :
+                        fields[0] == "interrupted" ? "Conversion interrupted. Some chunks may already have moved." :
+                        "Conversion ended with an unverified or incomplete allocation. Reassess before continuing.";
+                    if (!outcome.successful && plan.reviewed.same_members (observed)) {
+                        outcome.summary += "\nData: %s · Metadata: %s · System: %s".printf (
+                            plan.category_verified (observed, BtrfsAllocationKind.DATA) ? "matches review" : "needs review",
+                            plan.category_verified (observed, BtrfsAllocationKind.METADATA) ? "matches review" : "needs review",
+                            plan.category_verified (observed, BtrfsAllocationKind.SYSTEM) ? "matches review" : "needs review");
+                    }
+                }
                 if (long_running && !outcome.successful) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                 return outcome.summary;
             } catch (Error error) {
+                if (review) plan.release_review ();
                 outcome.fail ("Could not confirm the Btrfs maintenance outcome", error);
-                if (dispatched && long_running) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                if (dispatched && long_running) {
+                    outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    if (convert) {
+                        try { yield refresh (); }
+                        catch (Error refresh_error) {}
+                    }
+                }
                 throw error;
             } finally {
                 if (job != null) {

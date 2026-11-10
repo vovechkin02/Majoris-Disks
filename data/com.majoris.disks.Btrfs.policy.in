@@ -3,8 +3,8 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <action id="com.majoris.disks.btrfs-replacement-status">
-    <description>Inspect Btrfs device replacement and target eligibility</description>
-    <message>Check Btrfs device replacement status or target eligibility</message>
+    <description>Inspect Btrfs maintenance status and eligibility</description>
+    <message>Check Btrfs replacement or balance status and eligibility</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>yes</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/majoris-disks-btrfs-status</annotate>
   </action>

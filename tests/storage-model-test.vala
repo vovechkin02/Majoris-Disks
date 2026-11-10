@@ -1509,6 +1509,41 @@ private static void test_btrfs_filesystem_info () {
     }
 }
 
+private static void test_btrfs_conversion_model () {
+    try {
+        var rows = Variant.parse (new VariantType ("(tta(sttt)a(ttttssbb)tttbstb)"),
+            "(1000, 1, [('Data', 100, 90, 17), ('Metadata', 100, 10, 516), ('System', 8, 2, 514)], " +
+            "[(1, 42, 1000, 400, 'member', 'Present', true, false)], 102, 500, 10, false, 'none', 0, true)");
+        var report = new BtrfsFilesystemInfo ("fixture", "Fixture", rows);
+        var plan = new BtrfsConversionPlan (report, BtrfsProfileType.RAID1, BtrfsProfileType.RAID1C3);
+        var observed = new BtrfsFilesystemInfo ("fixture", "Fixture", rows);
+        observed.members[0].error_counters = { 0, 0, 0, 0, 0 };
+        assert (plan.verified (observed));
+        observed.profiles[2].flags = 34;
+        assert (!plan.verified (observed));
+        observed.profiles[2].flags = 514;
+        var partial = new BtrfsAllocationProfile (new Variant ("(sttt)", "Data single", (uint64) 10, (uint64) 1, (uint64) 1));
+        observed.profiles += partial;
+        assert (!plan.verified (observed));
+        observed = new BtrfsFilesystemInfo ("fixture", "Fixture", rows);
+        observed.members[0].uuid = "different";
+        assert (!plan.verified (observed));
+        assert (BtrfsProfileType.from_flags (8193) == BtrfsProfileType.UNKNOWN);
+        assert (BtrfsAllocationKind.from_flags (5) == BtrfsAllocationKind.MIXED);
+        assert (!BtrfsProfileType.RAID6.convertible ());
+        var paused = new BtrfsConversionStatus ("paused 1 2 3 raid1 raid1c3 0");
+        assert (paused.state == "paused" && paused.completed == 1 && paused.expected == 3);
+        assert (paused.data == BtrfsProfileType.RAID1 && paused.metadata == BtrfsProfileType.RAID1C3);
+        try {
+            new BtrfsConversionStatus ("completed 0 0 0 - - 0");
+            assert_not_reached ();
+        } catch (IOError.INVALID_DATA error) {}
+    } catch (Error error) {
+        Test.message ("%s", error.message);
+        Test.fail ();
+    }
+}
+
 private static void test_btrfs_replacement_model () {
     try {
         string uuid = Uuid.string_random ();
@@ -1548,7 +1583,21 @@ private static void test_btrfs_replacement_model () {
         assert (info.replacement_restriction (source) != "");
         assert (new BtrfsReplacementStatus (uuid, "1 850 12 0 2 3 0").active);
         assert (new BtrfsReplacementStatus (uuid, "4 850 12 0 2 3 0").active);
-        assert (!new BtrfsReplacementStatus (uuid, "2 1000 12 24 0 0 0").active);
+        var finished = new BtrfsReplacementStatus (uuid, "2 1000 12 24 0 0 0");
+        assert (!finished.active && !finished.verified_completion);
+        assert (finished.completion_message ().contains ("could not be verified"));
+        finished.membership_verified = true;
+        assert (finished.verified_completion);
+        assert (finished.completion_message ().contains ("completed and membership verified"));
+        finished.write_errors = 1;
+        assert (!finished.verified_completion && finished.completion_message ().contains ("reported replacement errors"));
+        finished.write_errors = 0;
+        finished.membership_verified = false;
+        foreach (string diagnostic in new string[] { "UDisks has yet to confirm target membership.",
+            "The resulting target identity is unknown.", "Replacement may be partial." }) {
+            finished.warning = diagnostic;
+            assert (!finished.verified_completion && finished.completion_message ().contains (diagnostic));
+        }
         assert (!new BtrfsReplacementStatus (uuid, "3 0 12 24 0 0 0").active);
         assert (new BtrfsReplacementStatus (uuid, "999 0 12 24 0 0 0").state_label () == "Unknown replacement state");
         try {
@@ -1565,6 +1614,7 @@ public static int main (string[] args) {
     Test.init (ref args);
     Test.add_func ("/storage/btrfs-filesystem-info", test_btrfs_filesystem_info);
     Test.add_func ("/storage/btrfs-replacement", test_btrfs_replacement_model);
+    Test.add_func ("/storage/btrfs-conversion", test_btrfs_conversion_model);
     if (Environment.get_variable ("MAJORIS_CAPACITY_LOOP") != null)
         Test.add_func ("/operations/capacity-udisks-fixture", test_capacity_udisks_fixture);
     if (Environment.get_variable ("MAJORIS_CAPACITY_FIXTURE") != null)

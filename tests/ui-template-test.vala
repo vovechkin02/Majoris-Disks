@@ -247,6 +247,7 @@ public static int main (string[] args) {
     assert (encrypted_resize.requested == 12288);
     Object[] instances = {
         new BtrfsDeviceReplaceDialog (backend, block),
+        new BtrfsProfileConversionDialog (backend, block),
         new PartitionMap (), new PartitionSegment (), new DriveView (), window,
         new SidebarGroupHeading ("Test"), new DeviceRow (drive), new VolumeRow (block),
         new DriveInformationDialog (drive, block), new InformationRow ("Test", "Value", false),
@@ -270,7 +271,7 @@ public static int main (string[] args) {
         new DriveSettingsDialog (drive), new HealthPreferences (), new BenchmarkDialog (backend, drive), new DiskImageConfirmation (), new BlankDiskImageDialog (), new VirtualImageDialog ()
     };
     string[] resources = {
-        "btrfs-device-replace-dialog.ui",
+        "btrfs-device-replace-dialog.ui", "btrfs-profile-conversion-dialog.ui",
         "lvm-recovery-dialog.ui", "lvm-cache-dialog.ui", "lvm-layout-dialog.ui",
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",
         "device-row.ui", "volume-row.ui", "information-row.ui", "sidebar-group-heading.ui",

@@ -1,7 +1,7 @@
 <interface>
   <template class="MajorisDisksBtrfsBalanceDialog" parent="AdwAlertDialog">
     <property name="heading">Btrfs Maintenance</property>
-    <property name="body">Choose a usage limit for a data or metadata balance. This does not convert allocation profiles.</property>
+    <property name="body">Choose a usage limit for a filtered balance, or review a profile conversion.</property>
     <property name="extra-child">
       <object class="AdwActionRow">
         <property name="title">Maximum chunk usage (%)</property>
@@ -12,6 +12,7 @@
     </property>
     <responses>
       <response id="close">Close</response>
+      <response id="convert">Convert Allocation Profiles…</response>
       <response id="balance-status">Balance Status</response>
       <response id="scrub-readonly">Start Read-Only Scrub</response>
       <response id="scrub-status">Scrub Status</response>

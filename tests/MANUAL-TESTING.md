@@ -72,3 +72,25 @@ The native fixture invokes the actual restricted helper as root. It verifies fix
 - Run the existing Btrfs discovery and mount regressions with MAJORIS_DISKS_RUN_BTRFS_MOUNT_TESTS=1.
 
 The Debian 13 guest uses a temporary udev rule scoped to its three disposable backing files because UDisks defaults loop devices to HintSystem. This leaves the installed helper's safety rules in force. The guest run covered healthy, larger-target, surviving-copy, injected failing member, missing RAID 1, nonredundant, undersized, unsafe-target and cancellation scenarios. The kernel allocated new SINGLE groups during degraded recovery. Check the warning and resulting profiles alongside the verified target association and payload checksum.
+
+## Btrfs allocation-profile conversion
+
+Use a dedicated Debian 13 guest with `btrfs-progs`, `udisks2`, `udisks2-btrfs`, Polkit and the built helpers installed at the configured libexec path. Enable the Btrfs module in the guest if UDisks does not load it by default.
+
+```sh
+sudo busctl --system call org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager \
+  org.freedesktop.UDisks2.Manager EnableModule sb btrfs true
+sudo env MAJORIS_DISKS_RUN_BTRFS_PROFILE_TESTS=1 sh \
+  tests/btrfs-profile-conversion-integration.sh build/btrfs-profile-conversion-test combined
+```
+
+The script creates private image-backed loop devices and verifies the fixture UUID, member paths, profile rows and payload SHA-256. Repeat with `data`, `metadata`, `raid1c3`, `raid1c4`, `raid10`, `dup`, `reduce`, `workspace`, `unsafe`, `missing`, `interrupt`, `cancel` and `monitor`. A control test may observe completion before the control can be exercised. Record that outcome separately.
+
+- In **Btrfs Maintenance**, confirm that the existing usage-filtered data and metadata balances still work. Open **Convert Allocation Profiles…** and check the UUID, member count, per-member workspace, allocation rows and current kernel status.
+- Review distinct data and metadata targets. Check that the review includes system allocation with the metadata target and shows the contiguous-workspace budget. Go back from the review, verify the local review lock is released, then start again and cancel the authorization prompt. The allocation and kernel balance state should remain unchanged.
+- On a redundant disposable fixture, review a lower-copy or lower-tolerance target and check for the stronger confirmation. Confirm it and independently verify the data, metadata and system rows with `btrfs filesystem df`.
+- On a sufficiently long conversion, close and reopen the dialog. Observe live chunk counts, pause and review the saved targets before resuming. In a separate run, cancel the kernel balance, record the resulting profile sets and review a fresh soft conversion for any remaining groups.
+- Check that read-only, missing-member, insufficient-member and insufficient-workspace fixtures are refused. Confirm that the dialog reports uncertain allocation if the helper or UDisks stops responding during a conversion. Rediscover actual kernel state before any further write.
+- Exercise replacement with verified membership, recorded errors, and incomplete UDisks reconciliation. Only the fully verified outcome should receive the unqualified success message.
+
+The `restart` case restarts UDisks between review and dispatch inside the guest and checks that the reviewed plan is refused. The `faults` case takes the Meson-built `libbtrfs-balance-faults.so` as the fourth script argument. It injects failures into a direct instance of the installed native helper using the same disposable fixture checks. Run both cases only in the dedicated guest.

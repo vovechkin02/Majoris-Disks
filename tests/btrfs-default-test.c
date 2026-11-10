@@ -24,6 +24,57 @@ fixture_space_info (int fd, struct btrfs_ioctl_space_args *spaces)
     return 0;
 }
 
+static GVariant *
+profile_rows (guint64 data, guint64 meta, guint64 system)
+{
+    GVariantBuilder rows = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(sttt)"));
+    g_variant_builder_add (&rows, "(sttt)", "Data", (guint64) (64 * MIB), (guint64) MIB, data);
+    g_variant_builder_add (&rows, "(sttt)", "Metadata", (guint64) (64 * MIB), (guint64) MIB, meta);
+    g_variant_builder_add (&rows, "(sttt)", "System", (guint64) (8 * MIB), (guint64) MIB, system);
+    return g_variant_ref_sink (g_variant_builder_end (&rows));
+}
+
+static void
+test_conversion_plan (void)
+{
+    const Profile *single = find_profile ("single", 0);
+    const Profile *raid1 = find_profile ("raid1", 0);
+    const Profile *raid1c3 = find_profile ("raid1c3", 0);
+    g_assert_cmpuint (single->flag, ==, PROFILE_SINGLE);
+    g_assert_cmpuint (raid1c3->members, ==, 3);
+    g_assert_cmpuint (find_profile ("raid10", 0)->members, ==, 4);
+    g_assert_null (find_profile ("raid5", 0));
+    g_assert_null (find_profile ("17", 0));
+    g_autoptr(GVariant) rows = profile_rows (1, 4 | BTRFS_BLOCK_GROUP_DUP, 2 | BTRFS_BLOCK_GROUP_DUP);
+    Conversion increase = { .data = raid1, .metadata = raid1c3 };
+    g_assert_null (assess_allocations (rows, MIB, &increase, NULL));
+    g_assert_true (increase.changes);
+    g_assert_false (increase.risk);
+    g_assert_false (increase.force);
+    g_assert_cmpuint (increase.workspace, ==, (256 + 64 + 64 + 8 + 1) * MIB);
+    Conversion reduce_metadata = { .metadata = single };
+    g_assert_null (assess_allocations (rows, 0, &reduce_metadata, NULL));
+    g_assert_true (reduce_metadata.risk);
+    g_assert_true (reduce_metadata.force);
+    g_autoptr(GVariant) mirrored = profile_rows (1 | BTRFS_BLOCK_GROUP_RAID1, 4, 2);
+    Conversion reduce_data = { .data = single };
+    g_assert_null (assess_allocations (mirrored, 0, &reduce_data, NULL));
+    g_assert_true (reduce_data.risk);
+    g_assert_false (reduce_data.force);
+    struct btrfs_balance_args filter = { 0 };
+    set_conversion_filter (&filter, raid1);
+    g_assert_cmpuint (filter.flags, ==, BTRFS_BALANCE_ARGS_CONVERT | BTRFS_BALANCE_ARGS_SOFT);
+    g_assert_cmpuint (filter.target, ==, BTRFS_BLOCK_GROUP_RAID1);
+    g_assert_cmpuint (extent_gap (0, 128 * MIB), ==, 63 * MIB);
+    g_assert_cmpuint (extent_gap (64 * MIB, 66 * MIB), ==, MIB);
+    for (guint i = 0; i < 3; i++) {
+        const guint64 unsupported[] = { 5, 1 | (1ULL << 40), 1 | BTRFS_BLOCK_GROUP_RAID5 };
+        g_autoptr(GVariant) invalid = profile_rows (unsupported[i], 4, 2);
+        Conversion rejected = { .data = single };
+        g_assert_nonnull (assess_allocations (invalid, 0, &rejected, NULL));
+    }
+}
+
 static gpointer
 fail_allocation (gsize size)
 {
@@ -143,5 +194,6 @@ main (int argc, char **argv)
     g_test_init (&argc, &argv, NULL);
     g_test_add_func ("/btrfs-default/mount-identity", test_mount_identity);
     g_test_add_func ("/btrfs-default/space-info", test_space_info);
+    g_test_add_func ("/btrfs-default/profile-conversion", test_conversion_plan);
     return g_test_run ();
 }

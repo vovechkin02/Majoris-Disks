@@ -1,0 +1,70 @@
+<interface>
+  <template class="MajorisDisksBtrfsProfileConversionDialog" parent="AdwDialog">
+    <property name="title">Btrfs Profile Conversion</property>
+    <property name="content-width">640</property>
+    <property name="content-height">620</property>
+    <property name="child">
+      <object class="AdwToolbarView">
+        <child type="top"><object class="AdwHeaderBar"/></child>
+        <property name="content">
+          <object class="AdwPreferencesPage">
+            <child>
+              <object class="AdwPreferencesGroup">
+                <property name="title">Current Allocation</property>
+                <child><object class="AdwActionRow" id="allocation">
+                  <property name="title">Profiles and member workspace</property>
+                  <property name="subtitle">Reading kernel allocation…</property>
+                </object></child>
+              </object>
+            </child>
+            <child>
+              <object class="AdwPreferencesGroup">
+                <property name="title">Conversion Targets</property>
+                <property name="description">Review checks placement and redundancy for the selected targets. RAID 5 and RAID 6 conversion is disabled.</property>
+                <child><object class="AdwComboRow" id="data_row">
+                  <property name="title">Data</property>
+                  <property name="sensitive">false</property>
+                </object></child>
+                <child><object class="AdwComboRow" id="metadata_row">
+                  <property name="title">Metadata and System</property>
+                  <property name="sensitive">false</property>
+                </object></child>
+                <child><object class="GtkButton" id="review_button">
+                  <property name="label">Review Conversion</property>
+                  <property name="sensitive">false</property>
+                  <property name="halign">end</property>
+                  <property name="margin-top">12</property>
+                  <style><class name="suggested-action"/></style>
+                </object></child>
+              </object>
+            </child>
+            <child>
+              <object class="AdwPreferencesGroup">
+                <property name="title">Kernel Balance</property>
+                <child><object class="AdwActionRow" id="status_row">
+                  <property name="title">Status</property>
+                  <property name="subtitle">Checking kernel state…</property>
+                </object></child>
+                <child><object class="GtkProgressBar" id="progress">
+                  <property name="visible">false</property>
+                  <property name="margin-top">8</property>
+                </object></child>
+                <child><object class="GtkBox">
+                  <property name="spacing">8</property>
+                  <property name="margin-top">12</property>
+                  <child><object class="GtkButton" id="pause_button"><property name="label">Pause</property><property name="sensitive">false</property></object></child>
+                  <child><object class="GtkButton" id="resume_button"><property name="label">Resume</property><property name="sensitive">false</property></object></child>
+                  <child><object class="GtkButton" id="cancel_button"><property name="label">Cancel Balance</property><property name="sensitive">false</property></object></child>
+                </object></child>
+                <child><object class="AdwActionRow" id="result_row">
+                  <property name="title">Result</property>
+                  <property name="subtitle">Closing this dialog stops monitoring. The kernel balance can continue.</property>
+                </object></child>
+              </object>
+            </child>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>

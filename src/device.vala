@@ -9,6 +9,23 @@ namespace MajorisDisks {
         public uint64 read_errors;
         public uint64 result;
         public string warning = "";
+        public bool membership_verified;
+        public bool verified_completion {
+            get { return state == 2 && membership_verified && read_errors == 0 && write_errors == 0 && warning == ""; }
+        }
+
+        public string completion_message () {
+            if (state != 2) return state_label ();
+            if (verified_completion)
+                return "Replacement completed and membership verified. A separate scrub can check stored data.";
+            string message = "The kernel finished replacement. The operation needs attention.";
+            if (read_errors != 0 || write_errors != 0)
+                message += " The kernel reported replacement errors.";
+            message += membership_verified ? " Filesystem membership was verified." :
+                " Filesystem membership could not be verified.";
+            if (warning != "") message += " " + warning;
+            return message;
+        }
         public bool active { get { return state == 1 || state == 4; } }
 
         public BtrfsReplacementStatus (string uuid, string output) throws Error {
@@ -53,11 +70,208 @@ namespace MajorisDisks {
         }
     }
 
+    internal enum BtrfsAllocationKind {
+        UNKNOWN, DATA, METADATA, SYSTEM, MIXED;
+
+        public static BtrfsAllocationKind from_flags (uint64 flags) {
+            switch (flags & 7) {
+            case 1: return DATA;
+            case 2: return SYSTEM;
+            case 4: return METADATA;
+            case 5: return MIXED;
+            default: return UNKNOWN;
+            }
+        }
+    }
+
+    internal enum BtrfsProfileType {
+        UNKNOWN, SINGLE, DUP, RAID0, RAID1, RAID10, RAID1C3, RAID1C4, RAID5, RAID6;
+
+        public static BtrfsProfileType from_flags (uint64 flags) {
+            switch (flags & ~((uint64) 7)) {
+            case 0: return SINGLE;
+            case 8: return RAID0;
+            case 16: return RAID1;
+            case 32: return DUP;
+            case 64: return RAID10;
+            case 128: return RAID5;
+            case 256: return RAID6;
+            case 512: return RAID1C3;
+            case 1024: return RAID1C4;
+            default: return UNKNOWN;
+            }
+        }
+
+        public string argument () {
+            switch (this) {
+            case SINGLE: return "single";
+            case DUP: return "dup";
+            case RAID0: return "raid0";
+            case RAID1: return "raid1";
+            case RAID10: return "raid10";
+            case RAID1C3: return "raid1c3";
+            case RAID1C4: return "raid1c4";
+            case RAID5: return "raid5";
+            case RAID6: return "raid6";
+            default: return "-";
+            }
+        }
+
+        public uint minimum_members () {
+            switch (this) {
+            case SINGLE: case DUP: return 1;
+            case RAID0: case RAID1: case RAID5: return 2;
+            case RAID1C3: case RAID6: return 3;
+            case RAID10: case RAID1C4: return 4;
+            default: return 0;
+            }
+        }
+
+        public uint copies () {
+            switch (this) {
+            case SINGLE: case RAID0: return 1;
+            case DUP: case RAID1: case RAID10: return 2;
+            case RAID1C3: return 3;
+            case RAID1C4: return 4;
+            default: return 0;
+            }
+        }
+
+        public string redundancy () {
+            switch (this) {
+            case SINGLE: case RAID0: return "one copy";
+            case DUP: return "two copies on one member";
+            case RAID1: case RAID10: return "two copies on separate members";
+            case RAID1C3: return "three copies on separate members";
+            case RAID1C4: return "four copies on separate members";
+            default: return "unknown copy layout";
+            }
+        }
+
+        public bool convertible () {
+            return this != UNKNOWN && this != RAID5 && this != RAID6;
+        }
+
+        public static BtrfsProfileType from_argument (string name) {
+            for (int i = (int) SINGLE; i <= (int) RAID6; i++) {
+                var profile = (BtrfsProfileType) i;
+                if (profile.argument () == name) return profile;
+            }
+            return UNKNOWN;
+        }
+    }
+
+    internal class BtrfsConversionStatus : Object {
+        public string state;
+        public uint64 completed;
+        public uint64 considered;
+        public uint64 expected;
+        public uint64 kernel_flags;
+        public BtrfsProfileType data;
+        public BtrfsProfileType metadata;
+
+        public BtrfsConversionStatus (string output) throws Error {
+            string[] fields = output.split (" ");
+            if (fields.length != 7 || !(fields[0] in new string[] { "idle", "running", "paused" }) ||
+                !uint64.try_parse (fields[1], out completed) || !uint64.try_parse (fields[2], out considered) ||
+                !uint64.try_parse (fields[3], out expected) || !uint64.try_parse (fields[6], out kernel_flags))
+                throw new IOError.INVALID_DATA ("The kernel balance status is unavailable.");
+            state = fields[0];
+            data = BtrfsProfileType.from_argument (fields[4]);
+            metadata = BtrfsProfileType.from_argument (fields[5]);
+        }
+    }
+
+    internal class BtrfsConversionPlan : Object {
+        public BtrfsFilesystemInfo reviewed { get; private set; }
+        public BtrfsProfileType data { get; private set; }
+        public BtrfsProfileType metadata { get; private set; }
+        public string token = "";
+        public bool reduces_redundancy;
+        public uint64 workspace;
+        private StorageOperationLocks? review_locks;
+        private StorageBlock? review_anchor;
+        private Cancellable? review_backend;
+
+        public void hold_review (StorageOperationLocks locks, StorageBlock anchor, StorageBlock[] members,
+                                 StorageDependencyService dependencies, Cancellable backend) throws Error {
+            locks.acquire_members (anchor, members, dependencies);
+            review_locks = locks;
+            review_anchor = anchor;
+            review_backend = backend;
+        }
+
+        public bool take_review (StorageOperationLocks locks, StorageBlock anchor) {
+            if (review_locks != locks || review_anchor != anchor || review_backend == null ||
+                review_backend.is_cancelled ()) return false;
+            review_locks = null;
+            review_anchor = null;
+            review_backend = null;
+            return true;
+        }
+
+        public void release_review () {
+            if (review_locks != null && review_anchor != null)
+                review_locks.release (review_anchor);
+            review_locks = null;
+            review_anchor = null;
+            review_backend = null;
+        }
+
+        ~BtrfsConversionPlan () { release_review (); }
+
+        public BtrfsConversionPlan (BtrfsFilesystemInfo reviewed, BtrfsProfileType data, BtrfsProfileType metadata) {
+            this.reviewed = reviewed;
+            this.data = data;
+            this.metadata = metadata;
+        }
+
+        public double physical_allocation_delta () {
+            double delta = 0;
+            foreach (var row in reviewed.profiles) {
+                var target = row.kind == BtrfsAllocationKind.DATA ? data : metadata;
+                if (target != BtrfsProfileType.UNKNOWN)
+                    delta += (double) row.allocated * ((int) target.copies () - (int) row.profile.copies ());
+            }
+            return delta;
+        }
+
+        public bool category_verified (BtrfsFilesystemInfo current, BtrfsAllocationKind kind) {
+            BtrfsProfileType target = kind == BtrfsAllocationKind.DATA ? data : metadata;
+            uint observed = 0;
+            foreach (var row in current.profiles) {
+                if (row.kind != kind) continue;
+                if (!row.profile.convertible () || row.allocated == 0 || row.used > row.allocated ||
+                    (target != BtrfsProfileType.UNKNOWN && target != row.profile))
+                    return false;
+                observed |= 1U << (int) row.profile;
+            }
+            if (target != BtrfsProfileType.UNKNOWN) return observed != 0;
+            uint original = 0;
+            foreach (var row in reviewed.profiles)
+                if (row.kind == kind) original |= 1U << (int) row.profile;
+            return observed != 0 && observed == original;
+        }
+
+        public bool verified (BtrfsFilesystemInfo current) {
+            if (!reviewed.same_members (current) || current.exclusive_operation != "none") return false;
+            foreach (var member in current.members)
+                if (member.has_errors || member.error_counters.length != 5) return false;
+            foreach (var row in current.profiles)
+                if (row.kind == BtrfsAllocationKind.UNKNOWN || row.kind == BtrfsAllocationKind.MIXED) return false;
+            return category_verified (current, BtrfsAllocationKind.DATA) &&
+                category_verified (current, BtrfsAllocationKind.METADATA) &&
+                category_verified (current, BtrfsAllocationKind.SYSTEM);
+        }
+    }
+
     internal class BtrfsAllocationProfile : Object {
         public string label;
         public uint64 allocated;
         public uint64 used;
         public uint64 flags;
+        public BtrfsAllocationKind kind { get { return BtrfsAllocationKind.from_flags (flags); } }
+        public BtrfsProfileType profile { get { return BtrfsProfileType.from_flags (flags); } }
 
         public BtrfsAllocationProfile (Variant row) {
             row.get ("(sttt)", out label, out allocated, out used, out flags);
@@ -78,6 +292,33 @@ namespace MajorisDisks {
         public string exclusive_operation;
         public uint64 replication_overhead;
         public bool overhead_known;
+
+        public bool same_members (BtrfsFilesystemInfo other) {
+            if (uuid != other.uuid || member_count != other.member_count ||
+                members.length != member_count || other.members.length != member_count)
+                return false;
+            foreach (var member in members) {
+                bool found = false;
+                foreach (var candidate in other.members)
+                    if (member.id == candidate.id && member.number != 0 && member.number == candidate.number &&
+                        member.uuid == candidate.uuid && candidate.state == "Present")
+                        found = true;
+                if (!found) return false;
+            }
+            return true;
+        }
+
+        public bool same_allocations (BtrfsFilesystemInfo other) {
+            if (profiles.length != other.profiles.length) return false;
+            foreach (var row in profiles) {
+                bool found = false;
+                foreach (var candidate in other.profiles)
+                    if (row.flags == candidate.flags && row.allocated == candidate.allocated)
+                        found = true;
+                if (!found) return false;
+            }
+            return true;
+        }
 
         public string replacement_restriction (BtrfsMemberInfo source, bool avoid = false) {
             if (!Uuid.string_is_valid (uuid) || source.filesystem_uuid != uuid)

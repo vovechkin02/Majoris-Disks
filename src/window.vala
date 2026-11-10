@@ -490,7 +490,11 @@ namespace MajorisDisks {
             var dialog = new BtrfsBalanceDialog (!block.read_only && !block.system_hint, !block.system_hint);
             dialog.response.connect ((response) => {
                 if (response == "close") return;
-                backend.btrfs_maintenance.begin (block, identity, response, dialog.usage_limit, (object, result) => {
+                if (response == "convert") {
+                    new BtrfsProfileConversionDialog (backend, block).present (this);
+                    return;
+                }
+                backend.btrfs_maintenance.begin (block, identity, response, dialog.usage_limit, null, false, (object, result) => {
                     try { show_check_message ("Btrfs Maintenance", backend.btrfs_maintenance.end (result)); }
                     catch (Error error) { show_check_message ("Could not confirm Btrfs maintenance", operation_error (error)); }
                 });

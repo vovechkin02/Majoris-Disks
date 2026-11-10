@@ -5,7 +5,7 @@ storage_model_sources = files('device.vala', 'layout.vala', 'hierarchy.vala', 's
   'storage-operation.vala', 'health-monitor.vala', 'disk-benchmark.vala', 'disk-image-copy.vala', 'xz-stream.c', 'nbd-identity.c', 'btrfs-inspect.c', 'virtual-disk.vala', 'virtual-disk-attachment.vala', 'blkid.vapi', 'filesystem-resize.vala', 'kernel-storage-safety.vala', 'mount-restoration.vala', 'restoration-credential.vala')
 luks_ui_sources = files('luks-credential-dialog.vala')
 sources = storage_model_sources + luks_ui_sources + files('main.vala', 'health-preferences.vala', 'benchmark-dialog.vala', 'udisks-service.vala', 'window.vala',
-  'drive-view.vala', 'filesystem-usage.vala', 'partition-map.vala', 'btrfs-device-replace-dialog.vala')
+  'drive-view.vala', 'filesystem-usage.vala', 'partition-map.vala', 'btrfs-device-replace-dialog.vala', 'btrfs-profile-conversion-dialog.vala')
 
 executable('majoris-disks', sources, resources,
   include_directories: xz_include, dependencies: deps, install: true)

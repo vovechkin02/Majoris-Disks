@@ -43,6 +43,20 @@ foreach scenario : ['healthy', 'larger', 'prefer-survivor', 'failing', 'missing'
     args: [meson.current_source_dir() / 'tests/btrfs-device-replace-integration.sh', btrfs_default_helper, scenario],
     depends: btrfs_status_helper, timeout: 240, is_parallel: false)
 endforeach
+btrfs_profile_test = executable('btrfs-profile-conversion-test', 'tests/btrfs-profile-conversion-test.vala',
+  storage_model_sources, 'src/udisks-service.vala', include_directories: xz_include,
+  dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+foreach scenario : ['data', 'metadata', 'raid1c3', 'raid1c4', 'raid10', 'dup', 'combined', 'reduce', 'workspace', 'interrupt', 'cancel', 'monitor', 'missing', 'unsafe', 'restart']
+  test('btrfs-profile-conversion-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/btrfs-profile-conversion-integration.sh', btrfs_profile_test, scenario],
+    depends: [btrfs_default_helper, btrfs_status_helper], timeout: 360, is_parallel: false)
+endforeach
+btrfs_balance_faults = shared_module('btrfs-balance-faults', 'tests/btrfs-balance-faults.c',
+  dependencies: [dependency('glib-2.0'), meson.get_compiler('c').find_library('dl')])
+test('btrfs-profile-conversion-faults', sh,
+  args: [meson.current_source_dir() / 'tests/btrfs-profile-conversion-integration.sh',
+    btrfs_profile_test, 'faults', btrfs_balance_faults],
+  depends: [btrfs_default_helper, btrfs_status_helper], timeout: 180, is_parallel: false)
 if mount_dep.found()
   test('mount-restoration-integration', sh,
     args: [meson.current_source_dir() / 'tests/mount-restoration-integration.sh', mount_restoration_helper],
@@ -67,7 +81,7 @@ if xvfb.found()
   ui_test = executable('ui-template-test', 'tests/ui-template-test.vala',
     storage_model_sources + luks_ui_sources + files('src/udisks-service.vala', 'src/window.vala',
       'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala', 'src/health-preferences.vala',
-      'src/benchmark-dialog.vala', 'src/btrfs-device-replace-dialog.vala'),
+      'src/benchmark-dialog.vala', 'src/btrfs-device-replace-dialog.vala', 'src/btrfs-profile-conversion-dialog.vala'),
     resources, include_directories: xz_include, dependencies: deps)
   test('ui-templates', xvfb, args: ['-a', ui_test])
 endif
