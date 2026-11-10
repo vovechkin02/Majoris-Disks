@@ -245,6 +245,36 @@ test_quota_parser (void)
     }
 }
 
+static void
+test_scrub_checkpoint (void)
+{
+    const char *uuid = "01234567-89ab-cdef-0123-456789abcdef";
+    guint64 now = g_get_real_time () / G_USEC_PER_SEC;
+    g_autoptr(GString) text = g_string_new ("scrub status:1\n");
+    g_string_append_printf (text, "%s:1", uuid);
+#define ZERO(name) g_string_append (text, "|" #name ":0");
+    SCRUB_FIELDS (ZERO)
+#undef ZERO
+    g_string_append_printf (text, "|last_physical:4096|t_start:%" G_GUINT64_FORMAT
+        "|t_resumed:0|duration:1|canceled:1|finished:1\n", now);
+    ScrubMember member = { .info = { .devid = 1, .total_bytes = 8192 } };
+    g_assert_true (scrub_checkpoint (text->str, uuid, &member, 1, 0, now, now, FALSE));
+    g_assert_true (member.recorded);
+    g_assert_cmpuint (member.saved.last_physical, ==, 4096);
+    member.recorded = FALSE;
+    g_assert_false (scrub_checkpoint (text->str, uuid, &member, 1, 2, now, now, FALSE));
+    g_assert_false (scrub_checkpoint (text->str, uuid, &member, 1, 0, now + 1, now, FALSE));
+    g_string_append_c (text, '\n');
+    g_assert_false (scrub_checkpoint (text->str, uuid, &member, 1, 0, now, now, FALSE));
+    g_string_truncate (text, text->len - 1);
+    const char *counter = strstr (text->str, "|read_errors:0") + strlen ("|read_errors:");
+    gsize position = counter - text->str;
+    g_string_erase (text, position, 1);
+    g_string_insert (text, position, "18446744073709551616");
+    member.recorded = FALSE;
+    g_assert_false (scrub_checkpoint (text->str, uuid, &member, 1, 0, now, now, FALSE));
+}
+
 int
 main (int argc, char **argv)
 {
@@ -308,5 +338,6 @@ main (int argc, char **argv)
     g_test_add_func ("/btrfs-default/space-info", test_space_info);
     g_test_add_func ("/btrfs-default/profile-conversion", test_conversion_plan);
     g_test_add_func ("/btrfs-default/quota-parser", test_quota_parser);
+    g_test_add_func ("/btrfs-default/scrub-checkpoint", test_scrub_checkpoint);
     return g_test_run ();
 }

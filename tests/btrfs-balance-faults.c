@@ -37,6 +37,10 @@ ioctl (int fd, unsigned long request, ...)
     const char *fault = getenv ("MAJORIS_TEST_BTRFS_BALANCE_FAULT");
     if (request == BTRFS_IOC_SCRUB_PROGRESS && fault && strcmp (fault, "active-scrub") == 0)
         return 0;
+    if (request == BTRFS_IOC_SCRUB_PROGRESS && fault && strcmp (fault, "scrub-status-unavailable") == 0) {
+        errno = EIO;
+        return -1;
+    }
     if (request == BTRFS_IOC_SPACE_INFO && fault && strcmp (fault, "allocation-failure") == 0) {
         errno = EIO;
         return -1;
@@ -86,8 +90,10 @@ g_file_get_contents (const gchar *name, gchar **contents, gsize *length, GError 
 {
     const char *fault = getenv ("MAJORIS_TEST_BTRFS_BALANCE_FAULT");
     if (fault && g_str_has_suffix (name, "/exclusive_operation") &&
-        (strcmp (fault, "active-replacement") == 0 || strcmp (fault, "unknown-exclusive") == 0)) {
-        *contents = g_strdup (strcmp (fault, "active-replacement") == 0 ? "device replace\n" : "future operation\n");
+        (strcmp (fault, "active-replacement") == 0 || strcmp (fault, "active-balance") == 0 ||
+         strcmp (fault, "unknown-exclusive") == 0)) {
+        *contents = g_strdup (strcmp (fault, "active-replacement") == 0 ? "device replace\n" :
+            strcmp (fault, "active-balance") == 0 ? "balance\n" : "future operation\n");
         if (length) *length = strlen (*contents);
         return TRUE;
     }

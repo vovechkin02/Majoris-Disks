@@ -14,9 +14,7 @@
       <response id="close">Close</response>
       <response id="convert">Convert Allocation Profiles…</response>
       <response id="balance-status">Balance Status</response>
-      <response id="scrub-readonly">Start Read-Only Scrub</response>
-      <response id="scrub-status">Scrub Status</response>
-      <response id="scrub-cancel" appearance="destructive">Cancel Scrub</response>
+      <response id="scrub">Manage Scrub…</response>
       <response id="balance-data">Balance Data</response>
       <response id="balance-metadata">Balance Metadata</response>
       <response id="balance-pause">Pause</response>

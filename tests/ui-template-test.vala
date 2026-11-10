@@ -249,6 +249,7 @@ public static int main (string[] args) {
         new BtrfsDeviceReplaceDialog (backend, block),
         new BtrfsProfileConversionDialog (backend, block),
         new BtrfsQuotaDialog (backend, block),
+        new BtrfsScrubDialog (backend, block),
         new BtrfsQgroupLimitDialog (new BtrfsQuotaStatus (Uuid.string_random (),
             "('qgroup',1,0,true,'%s',[],[],true)".printf (string.nfill (64, 'a'))), new BtrfsQgroup (), false),
         new PartitionMap (), new PartitionSegment (), new DriveView (), window,
@@ -274,7 +275,7 @@ public static int main (string[] args) {
         new DriveSettingsDialog (drive), new HealthPreferences (), new BenchmarkDialog (backend, drive), new DiskImageConfirmation (), new BlankDiskImageDialog (), new VirtualImageDialog ()
     };
     string[] resources = {
-        "btrfs-device-replace-dialog.ui", "btrfs-profile-conversion-dialog.ui", "btrfs-quota-dialog.ui",
+        "btrfs-device-replace-dialog.ui", "btrfs-profile-conversion-dialog.ui", "btrfs-quota-dialog.ui", "btrfs-scrub-dialog.ui",
         "btrfs-qgroup-limit-dialog.ui",
         "lvm-recovery-dialog.ui", "lvm-cache-dialog.ui", "lvm-layout-dialog.ui",
         "window.ui", "drive-view.ui", "partition-map.ui", "partition-segment.ui",

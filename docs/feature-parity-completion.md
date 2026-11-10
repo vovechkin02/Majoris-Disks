@@ -202,8 +202,8 @@ On Debian 13.5, `meson setup build/config-recovery`, `meson compile -C build/con
 | STOR-21 | Btrfs balance filtered data/metadata | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Kernel ioctl + Polkit; restricted usage filters | Linux Btrfs ioctls and btrfs-progs | Linux feature | Implemented restricted in current ZIP | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
 | STOR-22 | Btrfs balance pause/resume/cancel/status | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | No automatic persistent progress reconstruction | Linux Btrfs ioctls and btrfs-progs | Linux feature | Implemented in source | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
 | STOR-23 | Btrfs balance profile conversion | UDisksService, btrfs-default-helper.c, Btrfs Profile Conversion | Verified online data, metadata and system conversion using typed targets, contiguous workspace checks and saved kernel balance controls | Linux Btrfs balance, space and device-tree ioctls; UDisks2; Polkit | Linux feature | Implemented with restrictions | Native, model and GTK tests plus Debian 13 disposable-device scenarios | See profile-conversion validation below. |
-| STOR-24 | Btrfs scrub start (read-only), status, cancel | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Reads all members; one process may run synchronously to completion | Linux Btrfs ioctls and btrfs-progs | Linux feature | Implemented restricted | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
-| STOR-25 | Btrfs scrub repair mode/resume/history | UDisksService, btrfs-default-helper.c, btrfs-inspect.c | Historical results not persisted in UI | Linux Btrfs ioctls and btrfs-progs | Linux feature | Missing | btrfs-default-helper plus opt-in Btrfs fixture | Open. Acceptance case pending. |
+| STOR-24 | Btrfs read-only scrub, live status and cancellation | Btrfs Scrub, UDisksService, restricted native helper | Whole filesystem or a verified member. Per-member counters and filesystem-wide kernel cancellation. | btrfs-progs 6.14 and Linux Btrfs ioctls | Linux feature | Implemented and execution-tested | Debian 13 disposable scrub, mount and service fixtures | Independent kernel monitoring also detects external scrubs. |
+| STOR-25 | Btrfs scrub repair, checkpoint resume and history | Btrfs Scrub, UDisksService, restricted native helper | Verified repair outcomes, restart recovery and bounded per-filesystem history | btrfs-progs 6.14 checkpoint and protected Majoris history | Linux feature | Implemented and execution-tested within the restrictions below | Disposable data and metadata corruption, cancellation/resume, client exit and guest reboot | See Btrfs scrub lifecycle below. |
 | STOR-26 | Btrfs capacity profile-aware usable-space estimate | UDisksService, btrfs-inspect.c, Btrfs Allocation | Separates kernel logical capacity and available-space estimate from verified Btrfs member allocation | Linux Btrfs ioctls, sysfs and statvfs | Linux feature | Partially implemented | Native Btrfs discovery fixture and storage-model | Parity overhead and future chunk placement remain unknown. |
 | STOR-27 | Btrfs quotas/qgroups/subvolume limits | UDisksService, Btrfs Quotas, Btrfs Subvolumes, native Btrfs helpers | Filesystem and subvolume quotas | Btrfs quota tree, quota control, rescan and qgroup ioctls | Linux analogue | Implemented and execution-tested for native quota management | Opt-in traditional and simple quota fixtures on Debian 13 QEMU | See the capability breakdown below. |
 | STOR-27a | Btrfs mounted member and profile discovery | UDisksService, btrfs-inspect.c, Btrfs Allocation | Reports kernel-confirmed missing IDs separately from verified device numbers and keeps every reported profile row | Btrfs FS_INFO, DEV_INFO and SPACE_INFO ioctls and sysfs | Linux feature | Partially implemented | Healthy and read-only degraded RAID 1 discovery executed through the native probe | Desktop rendering, active replacement source identity and other degraded topologies remain open. |
@@ -448,3 +448,53 @@ GtkBuilder XML and theme.
   unverified. The live kernel removed the deleted snapshot's group and
   rejected the attempt to create a synthetic orphan level-0 group. The
   parser's stale-group result is covered by a mock.
+
+
+## Btrfs scrub lifecycle
+
+**Backend.** Majoris uses Debian 13's btrfs-progs 6.14 as the single scrub engine. The native helper constructs a fixed argument vector for foreground `btrfs scrub start` or `resume` under a detached supervisor. It pins the verified mount or selected block device. Filesystem and member UUIDs, device IDs, block membership and mount identity are checked separately from display names. The selected block's Btrfs UUID and member UUID are also checked against its superblock. Majoris uses `BTRFS_IOC_SCRUB_PROGRESS` to discover live work and `BTRFS_IOC_SCRUB_CANCEL` to cancel it. It waits for the kernel to stop before acknowledging cancellation. External scrubs can be observed and explicitly cancelled across the filesystem. [Debian btrfs-scrub manual](https://manpages.debian.org/trixie/btrfs-progs/btrfs-scrub.8.en.html)
+
+**Safety and authorization.** The service uses the existing storage dependency checks, kernel holder checks, member locks, backend lifetime and StorageJobManager. A review token binds the dialog selection to the unique mount and member identities. The helper rechecks it after Polkit authorization, shares the privileged Btrfs maintenance lock, and checks for conflicting kernel operations before dispatch. Inspection uses the existing read-only Polkit helper. Start, resume and cancel use the existing administrator action. Repair requires a verified writable mount and members, recognized data, metadata and system allocation profiles, and readable device health counters. A failing SMART/NVMe report or existing write/flush failures blocks repair.
+
+**Results and health.** The dialog reports member data and metadata bytes, extents, read/checksum/metadata/superblock errors, corrected, uncorrectable and unverified counters, checksum discards, unchecksummed extents, and allocation failures. Checked sums preserve the distinction between complete and partial aggregates. Byte counts measure physical member work, including separately scanned replicas and any work repeated by the upstream resume engine. Lifetime device statistics and SMART/NVMe indications are shown separately. Read-only scrub can detect an alternate good copy, so the Linux corrected counter in read-only mode is labelled as recoverable damage. Repair and uncorrectable outcomes are distinct. The dialog shows bytes without estimating a completion percentage. [Linux 6.12 scrub implementation](https://github.com/torvalds/linux/blob/v6.12/fs/btrfs/scrub.c)
+
+**Persistence.** btrfs-progs owns its checkpoint under `/var/lib/btrfs`. Majoris verifies its format, filesystem, scope, freshness and offsets before resuming and preserves the original mode. Majoris stores a separate versioned, checksummed GKeyFile under `/var/lib/majoris-disks-scrub/`, keyed by filesystem UUID. Each file retains up to 20 entries within a 512 KiB cap, including member identities, operation UUID, start/end timestamps where known, mode, scope, status and per-device counters. Root ownership, symlink checks, bounded parsing and atomic durable replacement protect the records. An interrupted attempt can appear with an unknown end time. Majoris keeps results with the verified member set they describe. [btrfs-progs 6.14 checkpoint and resume implementation](https://github.com/kdave/btrfs-progs/blob/v6.14/cmds/scrub.c)
+
+**UI and reference.** Open **Btrfs Maintenance → Manage Scrub** for mode, member selection, progress, history and controls. The GtkBuilder template inherits the existing GTK4/libadwaita styling. The supplied GNOME sources were reviewed for asynchronous preparation, object removal and job progress patterns. Majoris uses its existing job manager and mounted-filesystem safety flow, with no imported GNOME source.
+
+| Capability | Classification |
+| --- | --- |
+| Whole filesystem and selected-member read-only scrub, separate live counters, history, restricted authorization | Implemented and execution-tested |
+| Repair of recoverable RAID1 data and metadata corruption, reporting of uncorrectable single-copy damage | Implemented and execution-tested |
+| Kernel cancellation, genuine checkpoint resume, external discovery, client exit and reboot recovery | Implemented and execution-tested |
+| SMART and NVMe presentation with real drives | Implemented but not execution-tested on physical drives |
+| Start/resume on missing-member filesystems, repair on read-only mounts, protected filesystems, zoned or parity/unknown repair layouts | Intentionally restricted |
+| External scrub adoption/resume when the original mode and scope cannot be established | Intentionally restricted |
+| Independent cancellation of a single member during a filesystem-wide scrub | Unsupported by the filesystem-wide kernel cancellation interface |
+| Exact remaining bytes and prior unverified counts after an abrupt interruption before Majoris saves the attempt | Unsupported by the verified btrfs-progs 6.14 checkpoint format |
+
+The two comparison/API matrix Markdown files named in the task were absent from the supplied attachments and checkout. The scrub rows above update the repository's existing parity register.
+
+
+### Execution record
+
+| Check | Outcome |
+| --- | --- |
+| Debian 13 Meson setup, compile and default suite | Passed. 9 Meson tests passed, 61 opted-out or prerequisite-dependent cases skipped, 0 failed. The native helper unit test included strict checkpoint scope, timestamp and overflow parsing. The scrub GtkBuilder template loaded under Xvfb. |
+| Clean, RAID1 multi-member and selected-member read-only scrubs | Passed. Finished member counts and payload bytes matched the fixtures. |
+| Recoverable data corruption, uncorrectable single-copy corruption and recoverable metadata corruption | Passed. The read-only run detected a usable mirror, the repair run corrected it, and the single-copy case reported uncorrectable damage. The metadata case recorded verification errors and corrections on the targeted member. |
+| Cancellation and genuine resumption | Passed. Verified kernel stop, resumable history, rejection of an altered checkpoint, upstream resume timestamp and payload integrity. |
+| External activity, degraded topology, invalid inputs, injected failures and authorization | Passed. The fixtures exercised duplicate start, active balance/replacement, unknown profile, device errors, unavailable kernel status, remount identity changes, invalid UUID and member IDs, missing members, stale or overflowing checkpoint, truncated history, read-only repair denial and unauthorized Polkit dispatch. |
+| Client exit and UDisks restart | Passed. A new service client rediscovered the kernel scrub after the original client exited and after UDisks restarted. The detached supervisor saved a clean terminal result. |
+| Debian 13 QEMU guest reboot | Passed. The boot ID changed, the original UUID and nonzero checkpoint were recognized, and explicit resume preserved the payload SHA-256. The result reported the unavailable pre-reboot unverified count. |
+| Existing discovery, mount, filtered balance, device replacement, profile conversion, quotas, subvolume and snapshot workflows | Passed in the disposable guest. The replacement suite ran 9 scenarios and profile conversion ran 16. The quota service fixture exercised subvolumes, snapshots and default-subvolume changes after its runtime was installed. |
+| Interactive desktop confirmation dismissal and physical SMART/NVMe devices | Not executed. The GTK template and disposable UDisks client were exercised separately. |
+
+The guest used Linux 6.12.115, btrfs-progs 6.14 and UDisks 2.10.1. The changed
+backend lives in `btrfs-scrub.h` and `btrfs-default-helper.c`. The application
+changes are in `btrfs-scrub.vala`, `btrfs-scrub-dialog.vala`,
+`udisks-service.vala`, `window.vala` and the two scrub/maintenance templates.
+Meson, the GResource manifest and the existing Polkit policy register the new
+sources and restricted inspection. The test changes cover the native parser,
+template loading, the UDisks client, the disposable scrub and reboot fixtures,
+the shared fault shim and the existing disposable mount regression.

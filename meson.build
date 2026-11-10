@@ -32,6 +32,20 @@ test('nbd-helper', nbd_helper_test)
 btrfs_default_test = executable('btrfs-default-test', 'tests/btrfs-default-test.c', 'src/btrfs-inspect.c', 'src/btrfs-quota.c',
   include_directories: xz_include, dependencies: [dependency('gio-2.0'), blkid_c])
 test('btrfs-default-helper', btrfs_default_test)
+foreach scenario : ['clean', 'multi', 'member', 'corrected', 'uncorrectable', 'metadata', 'cancel', 'external', 'degraded', 'invalid']
+  test('btrfs-scrub-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/btrfs-scrub-integration.sh', btrfs_default_helper, scenario],
+    depends: btrfs_status_helper, timeout: 300, is_parallel: false)
+endforeach
+btrfs_scrub_service_test = executable('btrfs-scrub-service-test', 'tests/btrfs-scrub-service-test.vala',
+  storage_model_sources, 'src/udisks-service.vala', include_directories: xz_include,
+  dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+foreach scenario : ['service', 'interruption']
+  test('btrfs-scrub-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/btrfs-scrub-integration.sh', btrfs_default_helper,
+      scenario, btrfs_scrub_service_test],
+    depends: btrfs_status_helper, timeout: 300, is_parallel: false)
+endforeach
 foreach scenario : ['traditional', 'simple']
   test('btrfs-quota-' + scenario + '-integration', sh,
     args: [meson.current_source_dir() / 'tests/btrfs-quota-integration.sh', btrfs_default_helper, scenario],
@@ -69,6 +83,10 @@ foreach scenario : ['data', 'metadata', 'raid1c3', 'raid1c4', 'raid10', 'dup', '
 endforeach
 btrfs_balance_faults = shared_module('btrfs-balance-faults', 'tests/btrfs-balance-faults.c',
   dependencies: [dependency('glib-2.0'), meson.get_compiler('c').find_library('dl')])
+test('btrfs-scrub-faults', sh,
+  args: [meson.current_source_dir() / 'tests/btrfs-scrub-integration.sh', btrfs_default_helper,
+    'faults', btrfs_balance_faults],
+  depends: btrfs_status_helper, timeout: 180, is_parallel: false)
 test('btrfs-quota-faults-integration', sh,
   args: [meson.current_source_dir() / 'tests/btrfs-quota-integration.sh', btrfs_default_helper,
     'faults', btrfs_balance_faults],
@@ -102,7 +120,7 @@ if xvfb.found()
     storage_model_sources + luks_ui_sources + files('src/udisks-service.vala', 'src/window.vala',
       'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala', 'src/health-preferences.vala',
       'src/benchmark-dialog.vala', 'src/btrfs-device-replace-dialog.vala', 'src/btrfs-profile-conversion-dialog.vala',
-      'src/btrfs-quota-dialog.vala'),
+      'src/btrfs-quota-dialog.vala', 'src/btrfs-scrub-dialog.vala'),
     resources, include_directories: xz_include, dependencies: deps)
   test('ui-templates', xvfb, args: ['-a', ui_test])
 endif

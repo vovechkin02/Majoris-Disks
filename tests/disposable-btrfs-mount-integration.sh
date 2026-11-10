@@ -96,9 +96,9 @@ source_number=$(stat -c '%r' "$source")
 "$helper" balance-status "$fixture/target" "$uuid" "$source_number" 1 | grep -q "^idle "
 "$helper" balance-data "$fixture/target" "$uuid" "$source_number" 1 0 | grep -q "^completed "
 "$helper" balance-metadata "$fixture/target" "$uuid" "$source_number" 1 0 | grep -q "^completed "
-"$helper" scrub-status "$fixture/target" "$uuid" "$source_number" 1 | grep -q "^idle "
-"$helper" scrub-readonly "$fixture/target" "$uuid" "$source_number" 1 | grep -q "^completed 0 0 0$"
-"$helper" scrub-status "$fixture/target" "$uuid" "$source_number" 1 | grep -q "^idle "
+"$helper" scrub-status "$fixture/target" "$uuid" "$source_number" 1 | grep -q "^never-run "
+"$helper" scrub-readonly "$fixture/target" "$uuid" "$source_number" 1 | grep -q "^clean readonly "
+"$helper" scrub-status "$fixture/target" "$uuid" "$source_number" 1 | grep -q "^clean readonly "
 truncate -s 1G "$fixture/extra.img"
 extra_loop=$(losetup --find --show --nooverlap "$fixture/extra.img")
 losetup -j "$fixture/extra.img" | grep -q -F "$extra_loop:"

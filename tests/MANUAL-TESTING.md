@@ -133,3 +133,51 @@ and rescans are absent. Cancel authorization and verify the actual state remains
 visible. When creating a subvolume or snapshot, choose **Review Quota Settings
 After Creation** to open its stable level-0 ID. If quota configuration fails,
 the newly created object remains available.
+
+
+## Btrfs scrub
+
+Use a disposable Debian 13 QEMU guest with the Btrfs kernel module, btrfs-progs
+6.14, UDisks with its Btrfs module enabled, Polkit, and the installed Majoris
+Btrfs helpers and policy. Live cases require `MAJORIS_DISKS_RUN_BTRFS_SCRUB_TESTS=1`.
+The fixture verifies loop backing files and mounted UUIDs before modifying them.
+
+```sh
+meson compile -C build
+meson test -C build --print-errorlogs
+sudo env MAJORIS_DISKS_RUN_BTRFS_SCRUB_TESTS=1 \
+    meson test -C build --no-rebuild --print-errorlogs 'btrfs-scrub-*'
+```
+
+The data and metadata cases map the target logical extent to both verified RAID1
+members and compare the bytes before corrupting a single replica offline. The
+single-copy case verifies an uncorrectable result. The cancellation case checks
+that an altered checkpoint is rejected and that the restored checkpoint receives
+a nonzero upstream resume timestamp. The client interruption case terminates
+the client process, observes the active kernel scrub from a new client, restarts
+UDisks, and checks the terminal history.
+
+For the reboot case, run the following commands as root in the same disposable
+guest. Save the exact private fixture directory printed by the prepare phase and
+supply it to the verify phase after the guest boots. The fixture stays mounted
+between prepare and reboot. The verify phase checks the boot ID, filesystem UUID,
+resumption timestamp and payload hash before cleaning up.
+
+```sh
+export MAJORIS_DISKS_RUN_BTRFS_SCRUB_TESTS=1
+sh tests/btrfs-scrub-reboot-integration.sh /usr/libexec/majoris-disks-btrfs-default prepare
+systemctl reboot
+# After reboot, set the opt-in again and substitute the printed fixture directory.
+export MAJORIS_DISKS_RUN_BTRFS_SCRUB_TESTS=1
+sh tests/btrfs-scrub-reboot-integration.sh /usr/libexec/majoris-disks-btrfs-default verify "$fixture"
+```
+
+For interactive acceptance, open **Btrfs Maintenance → Manage Scrub** on the
+disposable mount. Review both modes and scopes. Use **Back** on the start
+confirmation and verify the state stays idle. Start a rate-limited scrub, close
+and reopen the dialog, then verify the member rows and byte counters. Confirm
+cancellation, resume from the saved session, and open the detailed history. On
+a writable mount the read-only confirmation should describe internal writes.
+On the repair fixture, verify that a recovered read-only copy and a corrected
+repair result have different messages. Check real-drive SMART/NVMe indications
+separately from the fixture's Btrfs lifetime counters.

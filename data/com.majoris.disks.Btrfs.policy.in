@@ -4,7 +4,7 @@
 <policyconfig>
   <action id="com.majoris.disks.btrfs-replacement-status">
     <description>Inspect Btrfs maintenance status and eligibility</description>
-    <message>Check Btrfs replacement, balance, or quota status and eligibility</message>
+    <message>Check Btrfs replacement, balance, quota, or scrub status and eligibility</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>yes</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXECDIR@/majoris-disks-btrfs-status</annotate>
   </action>

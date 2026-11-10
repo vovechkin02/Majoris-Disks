@@ -493,9 +493,13 @@ namespace MajorisDisks {
 
         private void manage_btrfs_balance (StorageBlock block) {
             string identity = backend.modification_identity (block);
-            var dialog = new BtrfsBalanceDialog (!block.read_only && !block.system_hint, !block.system_hint);
+            var dialog = new BtrfsBalanceDialog (!block.read_only && !block.system_hint);
             dialog.response.connect ((response) => {
                 if (response == "close") return;
+                if (response == "scrub") {
+                    new BtrfsScrubDialog (backend, block).present (this);
+                    return;
+                }
                 if (response == "convert") {
                     new BtrfsProfileConversionDialog (backend, block).present (this);
                     return;
@@ -2985,9 +2989,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.SpinButton usage;
         public uint usage_limit { get { return (uint) usage.get_value_as_int (); } }
 
-        public BtrfsBalanceDialog (bool writable, bool scrubbable = true) {
-            set_response_enabled ("scrub-readonly", scrubbable);
-            set_response_enabled ("scrub-cancel", scrubbable);
+        public BtrfsBalanceDialog (bool writable) {
             foreach (string action in new string[] { "balance-data", "balance-metadata", "balance-pause",
                 "balance-resume", "balance-cancel" })
                 set_response_enabled (action, writable);

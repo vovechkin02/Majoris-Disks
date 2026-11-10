@@ -1922,6 +1922,133 @@ namespace MajorisDisks {
             }
         }
 
+        internal async string btrfs_scrub (StorageBlock block, string identity, string action,
+                                          uint64 scope = 0, string review = "") throws Error {
+            bool inspect = action == "scrub-status" || action == "scrub-history";
+            bool cancel = action == "scrub-cancel";
+            bool repair = action == "scrub-repair";
+            bool start = repair || action == "scrub-readonly";
+            bool resume = action == "scrub-resume";
+            if (!inspect && !cancel && !start && !resume)
+                throw new IOError.INVALID_ARGUMENT ("Invalid Btrfs scrub request.");
+            synchronize ();
+            var proxy = require_volume (block, "Filesystem.BTRFS");
+            string uuid = proxy.get_cached_property ("uuid")?.get_string () ?? "";
+            uint64 count = proxy.get_cached_property ("num_devices")?.get_uint64 () ?? 0;
+            string[] mounts = block.filesystem?.mounts ?? new string[0];
+            if (creation_identity_changed (block, identity) || mounts.length != 1 ||
+                !Uuid.string_is_valid (uuid) || count == 0 || block.number == 0)
+                throw new IOError.NOT_FOUND ("A stable Btrfs mount and device identity are required.");
+
+            string helper = inspect ? BTRFS_STATUS_HELPER : BTRFS_DEFAULT_HELPER;
+            if (!FileUtils.test ("/usr/bin/pkexec", FileTest.IS_EXECUTABLE) ||
+                !FileUtils.test (helper, FileTest.IS_EXECUTABLE) ||
+                (!inspect && !cancel && !FileUtils.test ("/usr/bin/btrfs", FileTest.IS_EXECUTABLE)))
+                throw new IOError.NOT_SUPPORTED ("The authorized Btrfs scrub backend is unavailable.");
+
+            var lifetime = backend_lifetime;
+            StorageBlock[] members = {};
+            foreach (var member in snapshot.blocks.get_values ()) {
+                if (member.type_id != "btrfs" || member.uuid != uuid || !member.available) continue;
+                if (!inspect) {
+                    var safety = StorageSafetyService.assess (member, snapshot.dependencies);
+                    var drive = member.physical_drive;
+                    if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents ||
+                        ((repair || resume) && drive != null && (drive.smart_failing || drive.nvme_warnings.length > 0)))
+                        throw new IOError.BUSY ("A Btrfs member is protected, failing or has unresolved dependencies.");
+                }
+                members += member;
+            }
+            if (members.length != count)
+                throw new IOError.NOT_SUPPORTED ("The complete Btrfs member set is required.");
+
+            string[] argv = { "/usr/bin/pkexec", "--disable-internal-agent", helper,
+                action, mounts[0], uuid, block.number.to_string (), count.to_string () };
+            if (start) argv += scope.to_string ();
+            if (!inspect) {
+                if (review.length != 64)
+                    throw new IOError.INVALID_DATA ("Refresh the verified Btrfs scrub review before continuing.");
+                argv += review;
+            }
+            StorageJob? job = null;
+            var result = new StorageOperationResult ();
+            bool dispatched = false;
+            uint progress_timer = 0;
+            bool polling = false;
+            if (start || resume) {
+                locks.acquire_members (block, members, snapshot.dependencies);
+                job = jobs.begin ("Btrfs scrub", block, snapshot.dependencies);
+            }
+            try {
+                if (job != null) {
+                    foreach (var member in members)
+                        yield KernelStorageSafety.require_no_holders (member, lifetime);
+                    jobs.phase (job, StorageJobState.RUNNING, "Waiting for scrub and verifying the result");
+                }
+                lifetime.set_error_if_cancelled ();
+                if (creation_identity_changed (block, identity) || !(mounts[0] in (block.filesystem?.mounts ?? new string[0])))
+                    throw new IOError.BUSY ("The Btrfs mount changed before scrub dispatch.");
+                var process = new Subprocess.newv (argv, SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE);
+                dispatched = true;
+                if (job != null) {
+                    progress_timer = Timeout.add_seconds (2, () => {
+                        if (!polling) {
+                            polling = true;
+                            btrfs_scrub.begin (block, identity, "scrub-status", 0, "", (object, task) => {
+                                polling = false;
+                                try {
+                                    var report = new BtrfsScrubReport (btrfs_scrub.end (task));
+                                    if (progress_timer != 0 && report.state == BtrfsScrubState.RUNNING)
+                                        jobs.progress (job, report.progress_label (), 0, false);
+                                } catch (Error error) {
+                                    // The worker still supplies the independently verified terminal result.
+                                }
+                            });
+                        }
+                        return Source.CONTINUE;
+                    });
+                }
+                string? output, diagnostic;
+                yield process.communicate_utf8_async (null, inspect ? lifetime : null, out output, out diagnostic);
+                if (!process.get_successful ()) {
+                    if (process.get_if_exited () && (process.get_exit_status () == 126 || process.get_exit_status () == 127)) {
+                        dispatched = false;
+                        throw new IOError.PERMISSION_DENIED ("Btrfs authorization was cancelled or denied.");
+                    }
+                    throw new IOError.FAILED (diagnostic?.strip () ?? "The scrub backend did not return a result.");
+                }
+                synchronize ();
+                lifetime.set_error_if_cancelled ();
+                if (creation_identity_changed (block, identity) ||
+                    require_volume (block, "Filesystem.BTRFS") != proxy ||
+                    proxy.get_cached_property ("uuid")?.get_string () != uuid ||
+                    proxy.get_cached_property ("num_devices")?.get_uint64 () != count)
+                    throw new IOError.NOT_FOUND ("The Btrfs identity changed during scrub.");
+                if (job != null) {
+                    var report = new BtrfsScrubReport (output ?? "");
+                    result.summary = report.summary ();
+                    result.successful = report.state == BtrfsScrubState.CLEAN || report.state == BtrfsScrubState.CORRECTED;
+                    if (report.state == BtrfsScrubState.CANCELLED) result.status = StorageOperationStatus.CANCELLED;
+                    else if (!result.successful) result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    yield refresh ();
+                }
+                return output ?? "";
+            } catch (Error error) {
+                result.fail ("Could not confirm Btrfs scrub", error);
+                if (dispatched) result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                throw error;
+            } finally {
+                if (progress_timer != 0) {
+                    Source.remove (progress_timer);
+                    progress_timer = 0;
+                }
+                if (job != null) {
+                    jobs.finish (job, result);
+                    locks.release (block);
+                }
+            }
+        }
+
         internal async string btrfs_maintenance (StorageBlock block, string identity, string action, uint usage,
             BtrfsConversionPlan? plan = null, bool confirm_reduction = false) throws Error {
             bool convert = action == "balance-convert" || (action == "balance-resume" && plan != null);
@@ -1931,11 +2058,9 @@ namespace MajorisDisks {
                 (plan.token == "" || plan.reduces_redundancy != confirm_reduction))))
                 throw new IOError.INVALID_ARGUMENT ("A reviewed and confirmed conversion plan is required.");
             bool start = action == "balance-data" || action == "balance-metadata";
-            bool scrub = action.has_prefix ("scrub-");
-            bool long_running = start || convert || action == "balance-resume" || action == "scrub-readonly";
-            bool status = action == "balance-status" || action == "scrub-status" || conversion_status;
-            if ((!long_running && !status && !review && action != "balance-pause" && action != "balance-cancel" &&
-                action != "scrub-cancel") || usage > 100)
+            bool long_running = start || convert || action == "balance-resume";
+            bool status = action == "balance-status" || conversion_status;
+            if ((!long_running && !status && !review && action != "balance-pause" && action != "balance-cancel") || usage > 100)
                 throw new IOError.INVALID_ARGUMENT ("Invalid Btrfs maintenance operation.");
             synchronize ();
             var proxy = require_volume (block, "Filesystem.BTRFS");
@@ -1955,7 +2080,7 @@ namespace MajorisDisks {
                     throw new IOError.FAILED ("A member reports failing SMART health. Review Replace Btrfs Device.");
                 if (!status) {
                     var safety = StorageSafetyService.assess (member, snapshot.dependencies);
-                    if ((!scrub && member.read_only) || safety.system_critical || safety.unknown_dependencies || safety.active_dependents)
+                    if (member.read_only || safety.system_critical || safety.unknown_dependencies || safety.active_dependents)
                         throw new IOError.BUSY ("A Btrfs member is protected or has unresolved dependencies.");
                 }
                 members += member;
@@ -1996,8 +2121,7 @@ namespace MajorisDisks {
                 } else {
                     locks.acquire_members (block, members, snapshot.dependencies);
                 }
-                job = jobs.begin (scrub ? "Read-only Btrfs scrub" :
-                    convert ? "Btrfs profile conversion" : "Btrfs balance", block, snapshot.dependencies);
+                job = jobs.begin (convert ? "Btrfs profile conversion" : "Btrfs balance", block, snapshot.dependencies);
                 jobs.phase (job, StorageJobState.RUNNING, convert ? "Converting Btrfs allocation profiles" :
                     "Waiting for the Btrfs kernel operation");
             }
@@ -2038,10 +2162,9 @@ namespace MajorisDisks {
                     proxy.get_cached_property ("uuid")?.get_string () != uuid ||
                     proxy.get_cached_property ("num_devices")?.get_uint64 () != count)
                     throw new IOError.NOT_FOUND ("The Btrfs filesystem changed during maintenance.");
-                outcome.summary = (scrub ? "Scrub %s · %s read errors · %s checksum errors · %s uncorrectable errors" :
-                    "Balance %s · %s completed · %s examined · %s expected chunks").printf (
+                outcome.summary = "Balance %s · %s completed · %s examined · %s expected chunks".printf (
                     fields[0], completed.to_string (), considered.to_string (), expected.to_string ());
-                outcome.successful = fields[0] == "completed" && (!scrub || (completed == 0 && considered == 0 && expected == 0));
+                outcome.successful = fields[0] == "completed";
                 if (plan != null && long_running) {
                     yield refresh ();
                     var observed = yield query_btrfs_allocation (block);

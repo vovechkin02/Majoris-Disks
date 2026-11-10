@@ -1,0 +1,64 @@
+<interface>
+  <template class="MajorisDisksBtrfsScrubDialog" parent="AdwDialog">
+    <property name="title">Btrfs Scrub</property>
+    <property name="content-width">660</property>
+    <property name="content-height">640</property>
+    <property name="child">
+      <object class="AdwToolbarView">
+        <child type="top"><object class="AdwHeaderBar"/></child>
+        <property name="content">
+          <object class="AdwPreferencesPage">
+            <child><object class="AdwPreferencesGroup">
+              <property name="title">Scrub Options</property>
+              <property name="description">Scrub verifies stored blocks. Device replacement swaps a member, profile conversion relocates block groups, and filesystem checking examines structural consistency. Recovery requires separate diagnosis.</property>
+              <child><object class="AdwComboRow" id="mode_row">
+                <property name="title">Mode</property>
+                <property name="sensitive">false</property>
+                <property name="model"><object class="GtkStringList"><items>
+                  <item>Read-only</item><item>Repair-enabled</item>
+                </items></object></property>
+              </object></child>
+              <child><object class="AdwComboRow" id="scope_row">
+                <property name="title">Scope</property>
+                <property name="sensitive">false</property>
+              </object></child>
+              <child><object class="AdwActionRow" id="allocation_row">
+                <property name="title">Allocation profiles</property>
+                <property name="use-markup">false</property>
+                <property name="subtitle">Reading filesystem allocation…</property>
+              </object></child>
+              <child><object class="GtkButton" id="start_button">
+                <property name="label">Review and Start</property>
+                <property name="halign">end</property>
+                <property name="sensitive">false</property>
+                <style><class name="suggested-action"/></style>
+              </object></child>
+            </object></child>
+            <child><object class="AdwPreferencesGroup">
+              <property name="title">Current Status</property>
+              <property name="description">Closing the dialog stops monitoring. The scrub continues independently.</property>
+              <child><object class="AdwActionRow" id="status_row">
+                <property name="title">Btrfs filesystem</property>
+                <property name="use-markup">false</property>
+                <property name="subtitle">Checking kernel state…</property>
+              </object></child>
+              <child><object class="GtkBox">
+                <property name="spacing">8</property>
+                <child><object class="GtkButton" id="refresh_button"><property name="label">Refresh</property></object></child>
+                <child><object class="GtkButton" id="resume_button"><property name="label">Resume</property><property name="sensitive">false</property></object></child>
+                <child><object class="GtkButton" id="cancel_button"><property name="label">Cancel Scrub</property><property name="sensitive">false</property></object></child>
+              </object></child>
+            </object></child>
+            <child><object class="AdwPreferencesGroup" id="devices_group">
+              <property name="title">Member Progress</property>
+            </object></child>
+            <child><object class="AdwPreferencesGroup" id="history_group">
+              <property name="title">Recent Majoris Scrubs</property>
+              <property name="description">Saved outcomes for this verified member set. Lifetime device counters are separate from the errors found during each scrub.</property>
+            </object></child>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>
