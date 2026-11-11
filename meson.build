@@ -132,8 +132,26 @@ foreach scenario : ['near3', 'far2', 'offset2', 'odd']
     timeout: 300, is_parallel: false)
 endforeach
 test('mdraid-member-bitmap-readd', sh,
-  args: [meson.current_source_dir() / 'tests/mdraid-bitmap-readd-integration.sh', mdraid_service_test, mdraid_helper],
+  args: [meson.current_source_dir() / 'tests/mdraid-bitmap-readd-integration.sh', mdraid_service_test],
   timeout: 300, is_parallel: false)
+test('mdraid-member-full-rebuild-control', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-bitmap-readd-integration.sh', mdraid_service_test, 'full'],
+  timeout: 300, is_parallel: false)
+test('mdraid-member-bitmap-evidence-faults', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-bitmap-readd-integration.sh', mdraid_service_test, 'faults',
+    mdraid_helper_faults],
+  timeout: 300, is_parallel: false)
+test('mdraid-member-readd-interruption', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-bitmap-readd-integration.sh', mdraid_service_test, 'interruption',
+    mdraid_helper_faults],
+  timeout: 300, is_parallel: false)
+foreach scenario : ['review-churn', 'authorization-churn', 'helper-churn', 'reuse', 'moved', 'bitmap-changed',
+                    'post-attach-loss', 'restart']
+  test('mdraid-member-readd-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/mdraid-bitmap-readd-integration.sh', mdraid_service_test, scenario,
+      mdraid_helper_faults],
+    timeout: 300, is_parallel: false)
+endforeach
 foreach scenario : ['disappearance', 'reuse']
   test('mdraid-recovery-device-' + scenario, sh,
     args: [meson.current_source_dir() / 'tests/mdraid-identity-integration.sh', mdraid_service_test, scenario],

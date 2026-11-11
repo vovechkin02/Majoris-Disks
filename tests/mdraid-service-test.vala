@@ -163,6 +163,62 @@ private async void exercise (string[] args) throws Error {
         anchor.raid.kernel.state, anchor.raid.kernel.layout, anchor.raid.kernel.policy,
         anchor.raid.kernel.bitmap, anchor.raid.degraded);
     switch (action) {
+    case "review-readd":
+    case "re-add-member":
+    case "expect-readd-interruption":
+    case "expect-readd-rejection":
+        if (target == null) throw new IOError.INVALID_ARGUMENT ("A fixture member is required.");
+        bool assisted;
+        string recovery_review = yield backend.review_raid_readd (anchor, target, review, target_identity, out assisted);
+        print ("re-add review %s %s\n", assisted ? "bitmap" : "current", recovery_review);
+        if (action == "re-add-member")
+            print ("%s\n", yield backend.change_raid_member_state (anchor, target, true, review, target_identity, recovery_review));
+        if (action == "expect-readd-interruption") {
+            try {
+                yield backend.change_raid_member_state (anchor, target, true, review, target_identity, recovery_review);
+                assert_not_reached ();
+            } catch (Error error) {
+                assert (error is IOError.FAILED || error is IOError.CANCELLED || error is IOError.TIMED_OUT);
+                if (Environment.get_variable ("MAJORIS_MDRAID_HELPER_FAULT") == "verification-timeout")
+                    assert (error is IOError.TIMED_OUT);
+                bool classified = false;
+                for (uint n = 0; n < backend.jobs.jobs.get_n_items (); n++) {
+                    var job = backend.jobs.jobs.get_item (n) as StorageJob;
+                    if (job.operation != "Re-add former RAID member") continue;
+                    assert (job.result != null && !job.result.successful);
+                    assert (job.result.status == StorageOperationStatus.NEEDS_ATTENTION);
+                    classified = true;
+                }
+                assert (classified);
+                print ("Re-add interruption reconciled without retry\n");
+            }
+        }
+        if (action == "expect-readd-rejection") {
+            string mode = Environment.get_variable ("MAJORIS_MDRAID_HELPER_FAULT") ?? "";
+            if (mode == "review-churn") {
+                var churn = new Subprocess.newv ({ "/bin/sh", Environment.get_variable ("MAJORIS_MDRAID_CHURN_SCRIPT"),
+                    fixture, target.device, "reject-target-disappearance" }, SubprocessFlags.NONE);
+                yield churn.wait_check_async ();
+                yield backend.refresh ();
+            }
+            try {
+                yield backend.change_raid_member_state (anchor, target, true, review, target_identity, recovery_review);
+                assert_not_reached ();
+            } catch (Error error) {
+                if (mode == "review-churn")
+                    assert (error is IOError.NOT_SUPPORTED || error is IOError.NOT_FOUND || error is IOError.BUSY);
+                else {
+                    assert (error is IOError.FAILED);
+                    for (uint n = 0; n < backend.jobs.jobs.get_n_items (); n++) {
+                        var job = backend.jobs.jobs.get_item (n) as StorageJob;
+                        if (job.operation == "Re-add former RAID member")
+                            assert (job.result != null && job.result.status != StorageOperationStatus.NEEDS_ATTENTION);
+                    }
+                }
+                print ("Re-add rejected at %s: %s\n", mode, error.message);
+            }
+        }
+        break;
     case "expect-helper-failure":
         if (target == null) throw new IOError.INVALID_ARGUMENT ("A fixture member is required.");
         bool helper_failed = false;

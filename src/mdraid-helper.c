@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <gio/gio.h>
+#include <linux/fs.h>
 #include <linux/major.h>
 #include <linux/raid/md_u.h>
 #include <stdio.h>
@@ -74,8 +75,13 @@ open_block (Block *block, const char *number)
 static char *
 disk_sequence (const Block *block)
 {
+    guint64 sequence;
+    if (ioctl (block->fd, BLKGETDISKSEQ, &sequence) != 0 || !sequence)
+        return NULL;
     g_autofree char *partition = read_attr (block->sysfs, "partition");
-    return read_attr (block->sysfs, partition ? "../diskseq" : "diskseq");
+    g_autofree char *live = read_attr (block->sysfs, partition ? "../diskseq" : "diskseq");
+    g_autofree char *opened = g_strdup_printf ("%" G_GUINT64_FORMAT, sequence);
+    return g_strcmp0 (live, opened) == 0 ? g_steal_pointer (&live) : NULL;
 }
 
 static char *
@@ -166,8 +172,9 @@ read_metadata (GVariant *record, const char *uuid, Metadata *metadata)
 
 static gboolean
 verify_array (const Block *array, const Block *member, const char *md, const char *uuid,
-              const Metadata *target, gboolean readd)
+              GVariant *target_record, const Metadata *target, const char *review)
 {
+    gboolean readd = review != NULL;
     g_autofree char *version = g_strdup_printf ("1.%u", target->version);
     if (!uuid_matches (md, uuid) || !is_attr (md, "level", "raid1") ||
         !is_attr (md, "raid_disks", "2") || !is_attr (md, "metadata_version", version) ||
@@ -197,20 +204,30 @@ verify_array (const Block *array, const Block *member, const char *md, const cha
         } else {
             Block survivor = { .fd = -1 };
             gboolean opened = open_block (&survivor, number);
-            g_autoptr (GVariant) record = opened ? majoris_mdraid_read_superblock (survivor.fd) : NULL;
             g_autofree char *survivor_seq = opened ? disk_sequence (&survivor) : NULL;
             g_autofree char *target_seq = disk_sequence (member);
+            g_autofree char *token = NULL;
+            g_autoptr (GVariant) record = opened && !readd ? majoris_mdraid_read_superblock (survivor.fd) : NULL;
+            MajorisMdRaidReadd eligibility = opened && readd ?
+                majoris_mdraid_review_readd (target_record, survivor.fd, md, &token) :
+                MAJORIS_MDRAID_READD_INCOMPATIBLE;
             if (survivor.fd >= 0) close (survivor.fd);
             Metadata metadata;
-            if (!survivor_seq || !target_seq || g_str_equal (survivor_seq, target_seq) ||
-                !read_metadata (record, uuid, &metadata) || metadata.slot != slot ||
-                g_str_equal (metadata.member_uuid, target->member_uuid) ||
-                metadata.version != target->version || metadata.sectors != target->sectors ||
-                target->events > metadata.events ||
-                (metadata.events != target->events &&
-                 (!readd || metadata.events - target->events != 1 || (target->features & 1U) == 0 ||
-                  !is_attr (md, "consistency_policy", "bitmap"))))
+            if (!survivor_seq || !target_seq || g_str_equal (survivor_seq, target_seq))
                 return FALSE;
+            if (readd) {
+                if (eligibility == MAJORIS_MDRAID_READD_STALE)
+                    g_printerr ("The former member predates the retained bitmap history.\n");
+                else if (eligibility == MAJORIS_MDRAID_READD_UNVERIFIED_BITMAP)
+                    g_printerr ("Bitmap history could not be verified. Re-addition is unavailable.\n");
+                if (!token || !g_str_equal (token, review))
+                    return FALSE;
+            } else if (!read_metadata (record, uuid, &metadata) || metadata.slot != slot ||
+                       g_str_equal (metadata.member_uuid, target->member_uuid) ||
+                       metadata.version != target->version || metadata.sectors != target->sectors ||
+                       metadata.events != target->events) {
+                return FALSE;
+            }
             found_survivor = TRUE;
         }
         found++;
@@ -221,10 +238,12 @@ verify_array (const Block *array, const Block *member, const char *md, const cha
 int
 main (int argc, char **argv)
 {
-    if (geteuid () != 0 || argc != 10 ||
+    if (geteuid () != 0 || argc < 2 ||
         (!g_str_equal (argv[1], "mark-faulty") && !g_str_equal (argv[1], "re-add-member")))
         return 2;
     gboolean readd = g_str_equal (argv[1], "re-add-member");
+    if (argc != (readd ? 11 : 10))
+        return 2;
     Block array = { .fd = -1 }, member = { .fd = -1 };
     if (!open_block (&array, argv[2]) || !open_block (&member, argv[4]))
         return 2;
@@ -239,7 +258,7 @@ main (int argc, char **argv)
         !g_str_equal (member_seq, argv[5]) || !read_metadata (record, argv[6], &target) ||
         !g_str_equal (target.member_uuid, argv[7]) || !g_str_equal (argv[8], target.slot ? "1" : "0") ||
         !valid_events || events != target.events ||
-        !verify_array (&array, &member, md, argv[6], &target, readd)) {
+        !verify_array (&array, &member, md, argv[6], record, &target, readd ? argv[10] : NULL)) {
         g_printerr ("The reviewed RAID1 metadata, redundancy or device identity could not be verified.\n");
         return 2;
     }
@@ -253,7 +272,10 @@ main (int argc, char **argv)
     }
     g_autofree char *array_path = mdadm_path (&array);
     g_autofree char *member_path = mdadm_path (&member);
-    if (!array_path || !member_path)
+    g_autofree char *current_array_seq = disk_sequence (&array);
+    g_autofree char *current_member_seq = disk_sequence (&member);
+    if (!array_path || !member_path ||
+        g_strcmp0 (current_array_seq, array_seq) != 0 || g_strcmp0 (current_member_seq, member_seq) != 0)
         return 2;
     const char *command[] = { "/usr/sbin/mdadm", "--manage", array_path, "--re-add", member_path, NULL };
     const char *environment[] = { "PATH=/usr/sbin:/usr/bin", "LC_ALL=C", NULL };

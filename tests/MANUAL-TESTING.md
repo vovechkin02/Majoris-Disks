@@ -386,11 +386,38 @@ test must additionally reconcile sysfs and UDisks; percent complete alone is
 never sufficient. Healthy current state without matching historical member
 identity may be displayed but cannot attribute an interrupted operation.
 
-Run `mdraid-member-bitmap-readd`. It writes a controlled degraded payload and
-measures sectors actually written to the former member between re-add and idle.
-Record that count and component size. Report partial writes only when the count
-is smaller; a full rebuild is a valid measured result, not evidence of bitmap
-acceleration. Require expected slot, in_sync, zero degraded and payload checksum.
+Install the built mdraid helper and its matching Polkit action in the disposable
+guest. With `MAJORIS_DISKS_RUN_MDRAID_TESTS=1`, run the following Meson tests.
+
+- `mdraid-member-readd-integration` checks the existing no-write workflow.
+- `mdraid-member-bitmap-readd` writes 1 MiB at 8 MiB while degraded, requires an
+  event gap greater than one, and records the survivor bitmap header and kernel
+  reconstruction samples. The test requires actual member writes below the
+  component size, the original member UUID and slot, both members in sync, zero
+  degraded slots, idle synchronization, and a matching 16 MiB payload checksum.
+- `mdraid-member-full-rebuild-control` uses a fresh empty replacement after
+  bitmap review refuses the former member. It checks the same terminal health
+  and checksum and requires writes at least as large as the component.
+- `mdraid-member-bitmap-evidence-faults` injects bad bitmap evidence into the
+  client reads and checks that the former member stays absent.
+- `mdraid-member-readd-review-churn`, `-authorization-churn`, `-helper-churn`,
+  `-reuse`, `-moved` and `-bitmap-changed` check that an expired review cannot
+  attach the former member. The bitmap test changes only the helper's view of
+  the evidence. The churn tests detach or move only fixture-owned loops.
+- `mdraid-member-readd-interruption` terminates the helper before dispatch and
+  after mdadm succeeds. It also simulates a success reply with no attached
+  member to exercise the final-verification timeout. Require conservative
+  result classification and independent checks of kernel state and payload.
+- `mdraid-member-readd-post-attach-loss` fails and detaches the owned former
+  member after observing recovery. `mdraid-member-readd-restart` restarts
+  UDisks during observed recovery and verifies terminal health from a fresh
+  client.
+
+In RAID Management, activate the former-member row to verify eligibility. With
+covered degraded writes, the confirmation should explain that the bitmap may
+limit reconstruction and that redundancy returns after synchronization. Check
+the active reconstruction and terminal messages separately.
+
 The ordinary bitmap fixture restarts UDisks in both enabled and disabled states;
 verify the UI also rediscovers each. External/unknown bitmap states stay
 inspection-only and must not be rewritten after restart.

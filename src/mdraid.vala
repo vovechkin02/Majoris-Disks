@@ -1,4 +1,9 @@
 namespace MajorisDisks {
+    [CCode (cname = "MajorisMdRaidReadd", cprefix = "MAJORIS_MDRAID_READD_", cheader_filename = "mdraid-superblock.h")]
+    internal extern enum MdRaidReadd {
+        INCOMPATIBLE, UNVERIFIED_BITMAP, STALE, CURRENT, BITMAP;
+    }
+
     public enum MdRaidSyncAction {
         UNKNOWN, IDLE, RECOVER, RESYNC, CHECK, REPAIR, RESHAPE, FROZEN;
 
@@ -30,7 +35,11 @@ namespace MajorisDisks {
         public uint64 component_sectors;
 
         [CCode (cname = "majoris_mdraid_read_superblock", cheader_filename = "mdraid-superblock.h")]
-        private static extern Variant? read_native (int fd);
+        internal static extern Variant? read_native (int fd);
+
+        [CCode (cname = "majoris_mdraid_review_readd", cheader_filename = "mdraid-superblock.h")]
+        internal static extern MdRaidReadd review_readd (Variant former, int survivor_fd, string md,
+            out string? token);
 
         public static MdRaidSuperblock? inspect (int fd) {
             var data = read_native (fd);

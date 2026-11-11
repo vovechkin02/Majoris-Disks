@@ -158,7 +158,7 @@ namespace MajorisDisks {
                 if (!live || !backend.can_change_raid_member_state (context, block, true)) continue;
                 var row = new Adw.ActionRow () {
                     title = block.preferred,
-                    subtitle = "Former member · Activate to review re-addition",
+                    subtitle = "Former member · Activate to verify re-add eligibility",
                     use_markup = false,
                     activatable = true
                 };

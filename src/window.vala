@@ -106,7 +106,7 @@ namespace MajorisDisks {
                 dialog.replace_requested.connect (() => manage_raid_member (dialog.current_context, true, true));
                 dialog.spare_requested.connect (() => manage_raid_member (dialog.current_context, true));
                 dialog.remove_requested.connect ((member) => manage_raid_member (member, false));
-                dialog.member_state_requested.connect ((member, readd) => confirm_raid_member_state (dialog.current_context, member, readd));
+                dialog.member_state_requested.connect ((member, readd) => confirm_raid_member_state.begin (dialog.current_context, member, readd));
                 dialog.check_requested.connect (() => start_raid_check (dialog.current_context));
                 dialog.repair_requested.connect (() => confirm_raid_repair (dialog.current_context));
                 dialog.bitmap_requested.connect ((enable) => confirm_raid_bitmap (dialog.current_context, enable));
@@ -517,13 +517,24 @@ namespace MajorisDisks {
             dialog.present (this);
         }
 
-        private void confirm_raid_member_state (StorageBlock anchor, StorageBlock member, bool readd) {
+        private async void confirm_raid_member_state (StorageBlock anchor, StorageBlock member, bool readd) {
             string review = backend.raid_review_identity (anchor);
             string member_identity = backend.modification_identity (member);
+            string recovery_review = "";
+            bool assisted = false;
+            if (readd) {
+                try {
+                    recovery_review = yield backend.review_raid_readd (anchor, member, review, member_identity, out assisted);
+                } catch (Error error) {
+                    show_check_message ("Re-addition unavailable", operation_error (error));
+                    return;
+                }
+            }
             var dialog = new HardwareActionConfirmationDialog () {
                 heading = readd ? "Re-add Former RAID Member?" : "Mark RAID Member Faulty?",
-                body = readd ?
-                    "Re-add %s to %s only if its existing superblock and event counter permit reintegration. The kernel will determine what must be synchronized.".printf (
+                body = assisted ?
+                    "%s previously belonged to this array and its original slot is free. The array recorded changes while the member was absent. The verified bitmap may limit reconstruction to affected regions. The kernel may still require a full rebuild. Redundancy returns after reconstruction completes.".printf (member.preferred) : readd ?
+                    "Re-add %s to its original slot in %s. The kernel will determine what must be synchronized. Redundancy returns after synchronization completes.".printf (
                         member.preferred, anchor.raid?.uuid ?? "") :
                     "Mark %s faulty in %s. The array will immediately lose redundancy, and failure of the remaining drive can cause data loss.".printf (
                         member.preferred, anchor.raid?.uuid ?? "")
@@ -531,7 +542,7 @@ namespace MajorisDisks {
             dialog.response.connect ((response) => {
                 if (response != "continue" || pending.contains (anchor.path)) return;
                 pending.insert (anchor.path, anchor);
-                backend.change_raid_member_state.begin (anchor, member, readd, review, member_identity, (object, result) => {
+                backend.change_raid_member_state.begin (anchor, member, readd, review, member_identity, recovery_review, (object, result) => {
                     pending.remove (anchor.path);
                     try {
                         notifications.add_toast (new Adw.Toast (backend.change_raid_member_state.end (result)));

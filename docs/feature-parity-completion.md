@@ -611,10 +611,9 @@ requires native member metadata, expected roles and final kernel health.
 | Replacement target disappearance and device-number reuse | Implemented and execution-tested | Detached target and same-number substitute reject the previous review; no attachment or payload change. Other disappearance timings remain unexecuted. |
 | Lost UDisks reply / helper result | Implemented and execution-tested with controlled injection | Real AddDevice acceptance followed by lost reply is reconciled without retry. Unknown exits and actual helper SIGKILL before/after the kernel ioctl are classified conservatively. |
 | Graphical Polkit and dialog acceptance | Implemented and execution-tested for the exercised cases | Installed GNOME application approved fault marking, handled definitive denial and prompt cancellation, rejected a member removed during authorization, and rebound after UDisks restart. |
-| Controlled-write bitmap-assisted re-add | Partially implemented; acceptance failed | New measurement fixture refused by preserved event-counter restriction (former 19, survivor 22). No accelerated or partial reconstruction claim. Existing eligible former-member re-add still passes. |
+| MDRAID — Bitmap-assisted former-member re-addition after degraded writes | Implemented and execution-tested on native RAID1 metadata 1.0, 1.1 and 1.2 | In the 1.2 acceptance run, the former member was at event 19, the survivor and bitmap at 22, and the cleared boundary at 18. The member wrote 131,103 sectors for a 161,792-sector component, returned to its original slot with zero degradation, and retained the payload checksum. The [follow-up report](mdraid-release-hardening-2026-11-11.md#follow-up--bitmap-assisted-former-member-re-addition-after-degraded-writes) preserves the original refusal and records the new execution. |
 | Durable historical operation attribution | Unsupported in this pass | Current kernel rediscovery and in-memory member evidence retained; no privileged journal or automatic replay added. |
 
-The default Debian 13 suite passes with opt-in skips. The controlled-write
-bitmap requirement remains open. Original execution evidence above is retained,
-and new mdraid definitions
+The default Debian 13 suite passes with opt-in skips. The live bitmap result
+applies to the tested portable version 4 internal bitmap. The mdraid definitions
 use MDRAID-01 through MDRAID-05 without renumbering established STOR entries.

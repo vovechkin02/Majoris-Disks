@@ -205,8 +205,15 @@ mdraid_transition() {
     member_uuid=$(printf '%s\n' "$metadata" | sed -n 's/^MD_DEV_UUID=//p')
     events=$(printf '%s\n' "$metadata" | sed -n 's/^MD_EVENTS=//p')
     [ -n "$member_uuid" ] && [ -n "$events" ]
+    set --
+    if [ "$operation" = re-add-member ]; then
+        reviewed=$(mdraid_call review-readd "$target" 1) || return
+        token=$(printf '%s\n' "$reviewed" | awk '/^re-add review / { print $4 }')
+        [ "${#token}" = 64 ] || return 1
+        set -- "$token"
+    fi
     "$helper" "$operation" "$(cat "/sys/class/block/${md##*/}/dev")" \
         "$(cat "/sys/class/block/${md##*/}/diskseq")" \
         "$(cat "/sys/class/block/${target##*/}/dev")" "$(cat "/sys/class/block/${target##*/}/diskseq")" \
-        "$array_uuid" "$member_uuid" "$slot" "$events"
+        "$array_uuid" "$member_uuid" "$slot" "$events" "$@"
 }

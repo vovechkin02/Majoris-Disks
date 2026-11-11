@@ -3080,8 +3080,58 @@ namespace MajorisDisks {
                 active && raid.topology.members.length == 2 && verified_raid_recovery (raid);
         }
 
+        internal async string review_raid_readd (StorageBlock anchor, StorageBlock member,
+            string review, string member_identity, out bool assisted) throws Error {
+            assisted = false;
+            synchronize ();
+            if (review == "" || raid_review_identity (anchor) != review ||
+                creation_identity_changed (member, member_identity) || !can_change_raid_member_state (anchor, member, true))
+                throw new IOError.NOT_SUPPORTED ("The reviewed RAID1 member transition is unavailable.");
+            var raid = anchor.raid;
+            var topology = raid.topology;
+            var kernel = raid.kernel;
+            if (topology.members.length != 1 || !kernel.verify_members (topology) ||
+                topology.members[0].block == null || !topology.members[0].synchronized_member () ||
+                MdRaidKernelState.bitmap_kind (kernel.bitmap) != MdRaidKernelState.bitmap_kind (raid.bitmap_location))
+                throw new IOError.NOT_SUPPORTED ("The surviving member or kernel bitmap configuration could not be verified.");
+            var survivor = topology.members[0].block;
+            string survivor_identity = modification_identity (survivor);
+            var lifetime = backend_lifetime;
+            var safety = StorageSafetyService.assess (anchor, snapshot.dependencies);
+            if (safety.system_critical || safety.unknown_dependencies || safety.mounted || safety.active_dependents)
+                throw new IOError.BUSY ("The array is protected or has active storage consumers.");
+            yield KernelStorageSafety.require_idle (anchor, lifetime);
+            yield KernelStorageSafety.require_idle (member, lifetime);
+            int former_fd = yield open_block (member, "r", DIRECT_IO, lifetime);
+            Variant? former;
+            try { former = MdRaidSuperblock.read_native (former_fd); }
+            finally { Posix.close (former_fd); }
+            if (former == null || former.get_child_value (0).get_string () != raid.uuid ||
+                !((int) former.get_child_value (6).get_uint32 () in topology.missing_slots))
+                throw new IOError.NOT_SUPPORTED ("The former member’s superblock and slot could not be verified.");
+            int fd = yield open_block (survivor, "r", DIRECT_IO, lifetime);
+            MdRaidReadd eligibility;
+            string? token;
+            try {
+                eligibility = MdRaidSuperblock.review_readd (former, fd,
+                    "/sys/dev/block/" + KernelStorageSafety.device_number (anchor.number) + "/md", out token);
+            } finally { Posix.close (fd); }
+            synchronize ();
+            if (raid_review_identity (anchor) != review || creation_identity_changed (member, member_identity) ||
+                creation_identity_changed (survivor, survivor_identity) || !can_change_raid_member_state (anchor, member, true))
+                throw new IOError.BUSY ("The array or a member changed during review.");
+            if (eligibility == MdRaidReadd.STALE)
+                throw new IOError.NOT_SUPPORTED ("The former member predates the retained bitmap history. A separate replacement is required.");
+            if (eligibility == MdRaidReadd.UNVERIFIED_BITMAP)
+                throw new IOError.NOT_SUPPORTED ("Bitmap history could not be verified. Re-addition is unavailable.");
+            if (token == null)
+                throw new IOError.NOT_SUPPORTED ("The former member and surviving member metadata are incompatible.");
+            assisted = eligibility == MdRaidReadd.BITMAP;
+            return token;
+        }
+
         internal async string change_raid_member_state (StorageBlock anchor, StorageBlock member, bool readd,
-            string review, string member_identity) throws Error {
+            string review, string member_identity, string recovery_review = "") throws Error {
             synchronize ();
             if (review == "" || raid_review_identity (anchor) != review ||
                 creation_identity_changed (member, member_identity) || !can_change_raid_member_state (anchor, member, readd))
@@ -3093,6 +3143,7 @@ namespace MajorisDisks {
             string sector;
             string physical = MdRaidKernelState.physical_device (member, out sector);
             string member_seq = MdRaidKernelState.sequence_from_identity (physical);
+            var original_survivor = readd && raid.topology.members.length == 1 ? raid.topology.members[0] : null;
             StorageBlock[] locked = { member };
             foreach (var row in raid.topology.members)
                 if (row.block != null && row.block != member) locked += row.block;
@@ -3109,6 +3160,12 @@ namespace MajorisDisks {
                     throw new IOError.BUSY ("The array is protected or has active storage consumers.");
                 yield KernelStorageSafety.require_idle (anchor, lifetime);
                 if (readd) yield KernelStorageSafety.require_idle (member, lifetime);
+                if (readd) {
+                    bool assisted;
+                    string current_review = yield review_raid_readd (anchor, member, review, member_identity, out assisted);
+                    if (recovery_review != current_review)
+                        throw new IOError.BUSY ("The former member or bitmap history changed after confirmation.");
+                }
                 int fd = yield open_block (member, "r", DIRECT_IO, lifetime);
                 MdRaidSuperblock? metadata;
                 try { metadata = MdRaidSuperblock.inspect (fd); }
@@ -3125,6 +3182,7 @@ namespace MajorisDisks {
                     readd ? "re-add-member" : "mark-faulty", KernelStorageSafety.device_number (anchor.number),
                     MdRaidKernelState.sequence_from_identity (original.identity), KernelStorageSafety.device_number (member_number),
                     member_seq, uuid, metadata.member_uuid, metadata.slot.to_string (), metadata.events.to_string () };
+                if (readd) args += recovery_review;
                 jobs.phase (job, StorageJobState.RUNNING, "Waiting for authorization and kernel validation");
                 var helper = new Subprocess.newv (args, SubprocessFlags.STDERR_PIPE | SubprocessFlags.STDOUT_SILENCE);
                 dispatched = true;
@@ -3143,6 +3201,8 @@ namespace MajorisDisks {
                 }
                 int64 deadline = get_monotonic_time () + 30 * TimeSpan.SECOND;
                 bool rebuilding = false;
+                bool observed_attachment = false;
+                uint64 progress_sectors = 0;
                 while (true) {
                     synchronize ();
                     lifetime.set_error_if_cancelled ();
@@ -3152,29 +3212,62 @@ namespace MajorisDisks {
                         kernel.layout != original.layout || kernel.metadata != original.metadata ||
                         member.number != member_number || MdRaidKernelState.physical_device (member, out sector) != physical)
                         break;
+                    bool attached = false;
                     if (topology != null && kernel.verify_members (topology)) {
+                        bool survivor_present = !readd;
                         foreach (var row in topology.members) {
-                            if (row.block != member) continue;
+                            if (row.block != member) {
+                                survivor_present |= original_survivor != null && row.block == original_survivor.block &&
+                                    row.slot == original_survivor.slot && row.kernel_identity == original_survivor.kernel_identity &&
+                                    row.synchronized_member ();
+                                continue;
+                            }
+                            attached = row.slot == metadata.slot && !("faulty" in row.states) && !("blocked" in row.states);
                             bool verified = readd ? row.slot == metadata.slot && row.synchronized_member () &&
                                 verified_raid_recovery (raid) :
                                 raid.degraded == 1 && kernel.degraded == "1" && kernel.action == "idle" &&
                                 topology.synchronized_count == 1 && "faulty" in row.states;
                             if (verified) {
+                                if (readd) {
+                                    if (original_survivor == null || topology.members.length != 2 ||
+                                        !MdRaidKernelState.same_uuid (metadata.member_uuid, row.metadata_uuid))
+                                        throw new IOError.INVALID_DATA ("The returning member’s identity could not be verified.");
+                                    var surviving = topology.members[topology.members[0] == row ? 1 : 0];
+                                    if (surviving.block != original_survivor.block ||
+                                        surviving.kernel_identity != original_survivor.kernel_identity ||
+                                        !MdRaidKernelState.same_uuid (surviving.metadata_uuid, original_survivor.metadata_uuid))
+                                        throw new IOError.INVALID_DATA ("The surviving member’s identity changed during reconstruction.");
+                                    yield verify_reconstruction_metadata (uuid, kernel, topology, lifetime);
+                                    synchronize ();
+                                    if (anchor.raid != raid || raid.kernel?.identity != original.identity ||
+                                        raid.topology?.member_evidence () != topology.member_evidence () ||
+                                        !verified_raid_recovery (raid))
+                                        throw new IOError.BUSY ("The array changed during final verification.");
+                                }
                                 outcome.successful = true;
-                                outcome.summary = readd ? "Former RAID member synchronized" :
+                                outcome.summary = readd ? "The former RAID member has been re-added and reconstruction completed." :
                                     "Member marked faulty. The array is now degraded.";
                                 return outcome.summary;
                             }
                         }
+                        if (readd && observed_attachment && !attached)
+                            throw new IOError.FAILED ("The former member disappeared from its slot during reconstruction.");
+                        if (!survivor_present)
+                            throw new IOError.FAILED ("The surviving RAID member is no longer synchronized.");
+                        observed_attachment |= attached;
                     }
-                    if (readd && (kernel.action == "recover" || kernel.action == "resync")) {
+                    if (readd && attached && (kernel.action == "recover" || kernel.action == "resync")) {
+                        if (!rebuilding || progress_sectors != kernel.completed_sectors)
+                            deadline = get_monotonic_time () + 120 * TimeSpan.SECOND;
+                        progress_sectors = kernel.completed_sectors;
                         rebuilding = true;
-                        jobs.progress (job, "Synchronizing the former RAID member", kernel.progress, kernel.progress >= 0);
-                    } else if (kernel.action == "idle") {
+                        jobs.progress (job, "The former RAID member was accepted. Reconstruction is still running.",
+                            kernel.progress, kernel.progress >= 0);
+                    } else if (kernel.action == "idle" || (readd && kernel.action == "recover")) {
                         if (rebuilding) deadline = get_monotonic_time () + 30 * TimeSpan.SECOND;
                         rebuilding = false;
-                        if (get_monotonic_time () >= deadline) break;
                     } else break;
+                    if (get_monotonic_time () >= deadline) break;
                     yield settle_delay (lifetime);
                 }
                 throw new IOError.TIMED_OUT ("The final RAID member state could not be verified.");
