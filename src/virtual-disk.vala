@@ -194,12 +194,15 @@ namespace MajorisDisks {
                 throw new IOError.INVALID_ARGUMENT ("Compression requires converting an existing image to QCOW2.");
             if (destination.query_exists (token))
                 throw new IOError.EXISTS ("An image already exists at the selected destination.");
+            var publication = new ImagePublication (path);
             string directory = Path.build_filename (parent, ".majoris-" + Uuid.string_random ());
             if (DirUtils.create (directory, 0700) != 0)
                 throw new IOError.FAILED ("Could not create a private conversion directory.");
             string temporary = Path.build_filename (directory, "disk");
             int fd = -1;
+            string? original = null;
             ImageOperationJournal? recovery = null;
+            bool published_uncertain = false;
             try {
                 recovery = new ImageOperationJournal (grow != null ? "Grow disk image copy" : "Write disk image", path,
                     "Review the destination and the private work directory " + directory + ".");
@@ -216,7 +219,7 @@ namespace MajorisDisks {
                 }
                 if (source != null) {
                     fd = open_image (source);
-                    string? original = image_identity (fd);
+                    original = image_identity (fd);
                     if (original == null) throw new IOError.INVALID_DATA ("Could not identify the selected source image.");
                     var information = yield inspect_fd (fd, token);
                     if (grow == null) capacity = information.capacity;
@@ -250,34 +253,41 @@ namespace MajorisDisks {
                     if (progress != null) verify_progress = (fraction) => progress (0.8 + fraction * 0.2);
                     yield run (fd, directory, { "compare", "-p", "-f", information.format, "-F", format,
                         "/source", "/output/disk" }, token, verify_progress);
-                    if (original != image_identity (fd))
-                        throw new IOError.INVALID_DATA ("The source image changed during conversion.");
-                    int current_source = open_image (source);
-                    bool same_source = original == image_identity (current_source);
-                    Posix.close (current_source);
-                    if (!same_source)
-                        throw new IOError.INVALID_DATA ("The selected image path changed during conversion.");
                 }
                 int output = open_image (File.new_for_path (temporary));
+                Posix.Stat verified_output = {};
                 try {
                     var verified = yield inspect_fd (output, token);
                     if (verified.format != format || verified.capacity != capacity)
                         throw new IOError.INVALID_DATA ("The output format or virtual capacity did not match the request.");
-                    if (Posix.fchmod (output, 0600) != 0 || Posix.fsync (output) != 0)
-                        throw new IOError.FAILED ("Could not flush the verified image: " + Posix.strerror (Posix.errno));
-                } finally { Posix.close (output); }
-                if (grow != null) {
-                    if (grow.identity != image_identity (fd))
-                        throw new IOError.INVALID_DATA ("The source image changed during verification.");
-                    if (check_source != null) check_source (fd);
+                    if (Posix.fchmod (output, 0600) != 0)
+                        throw new IOError.FAILED ("Could not set private permissions on the verified image.");
+                    verified_output = ImagePublication.flush (output);
+                } catch (Error error) {
+                    Posix.close (output);
+                    throw error;
+                }
+                if (Posix.close (output) != 0) throw new IOError.FAILED ("Could not close the verified image.");
+                if (source != null) {
+                    if (grow != null && check_source != null) check_source (fd);
+                    int current_source = open_image (source);
+                    bool unchanged = original == image_identity (current_source) && original == image_identity (fd);
+                    Posix.close (current_source);
+                    if (!unchanged)
+                        throw new IOError.INVALID_DATA ("The source image changed before publication.");
                 }
                 token.set_error_if_cancelled ();
-                if (rename_without_replacement (CURRENT_DIRECTORY, temporary, CURRENT_DIRECTORY, path, NO_REPLACEMENT) != 0)
-                    throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));
+                publication.publish (temporary, verified_output);
+            } catch (Error error) {
+                published_uncertain = ImagePublication.was_published (error);
+                if (published_uncertain) recovery?.retain_publication (error);
+                throw error;
             } finally {
                 if (fd >= 0) Posix.close (fd);
-                if (FileUtils.test (temporary, FileTest.EXISTS)) FileUtils.unlink (temporary);
-                if (DirUtils.remove (directory) == 0) recovery?.remove ();
+                if (!published_uncertain && FileUtils.test (temporary, FileTest.EXISTS)) FileUtils.unlink (temporary);
+                if (DirUtils.remove (directory) == 0) {
+                    if (!published_uncertain) recovery?.remove ();
+                }
                 else warning ("Could not remove image work directory %s", directory);
             }
         }

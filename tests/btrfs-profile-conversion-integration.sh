@@ -12,7 +12,7 @@ if [ "$(id -u)" != 0 ] || [ "$ID:$VERSION_ID" != debian:13 ]; then
     echo 'SKIP: requires root in a dedicated Debian 13 test environment'
     exit 77
 fi
-for tool in losetup mkfs.btrfs btrfs findmnt mountpoint udevadm pkexec sha256sum; do
+for tool in losetup mkfs.btrfs btrfs findmnt mountpoint udevadm busctl pkexec sha256sum; do
     if ! command -v "$tool" >/dev/null; then
         echo "SKIP: missing $tool"
         exit 77
@@ -100,6 +100,24 @@ set -- $devices
 mkfs.btrfs -f -U "$uuid" -d "$source_data" -m "$source_meta" "$@"
 for device do udevadm trigger --action=change "$device"; done
 udevadm settle
+for device do
+    object="/org/freedesktop/UDisks2/block_devices/${device##*/}"
+    attempt=0
+    while :; do
+        hint=$(busctl --system get-property org.freedesktop.UDisks2 "$object" \
+            org.freedesktop.UDisks2.Block HintSystem 2>/dev/null) || hint=""
+        observed_uuid=$(busctl --system get-property org.freedesktop.UDisks2 "$object" \
+            org.freedesktop.UDisks2.Block IdUUID 2>/dev/null) || observed_uuid=""
+        if [ "$hint" = 'b false' ] && [ "$observed_uuid" = "s \"$uuid\"" ]; then break; fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 50 ]; then
+            printf 'Fixture member %s did not settle. HintSystem=%s IdUUID=%s expected=%s\n' \
+                "$device" "$hint" "$observed_uuid" "$uuid" >&2
+            exit 1
+        fi
+        sleep 0.2
+    done
+done
 mount -o subvolid=5 "$1" "$mountpoint"
 test "$(findmnt -n -o UUID --mountpoint "$mountpoint")" = "$uuid"
 dd if=/dev/urandom of="$mountpoint/payload" bs=1M count="$payload" status=none

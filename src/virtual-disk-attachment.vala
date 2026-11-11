@@ -96,7 +96,7 @@ namespace MajorisDisks {
             return fields.length > 19 ? fields[19] : "";
         }
 
-        private static bool exporter_running (VirtualAttachment record) {
+        internal static bool exporter_running (VirtualAttachment record) {
             return record.exporter_start != "" && exporter_identity (record.exporter_pid) == record.exporter_start;
         }
 
@@ -118,11 +118,11 @@ namespace MajorisDisks {
             return Posix.lstat (path, out info) == 0 && Posix.S_ISREG (info.st_mode) && file_key (info) == key;
         }
 
-        private static bool token_has_device (string token) throws Error {
+        private static bool find_token_device (string token, out uint index) throws Error {
+            index = 0;
             var devices = Dir.open ("/sys/block");
             string? name;
             while ((name = devices.read_name ()) != null) {
-                uint index;
                 if (parse_device ("/dev/" + name, out index) && device_token (index) == token) return true;
             }
             return false;
@@ -140,8 +140,9 @@ namespace MajorisDisks {
                 catch (Error error) { continue; }
                 if (data.get_string ("image", "key") != key) continue;
                 Posix.Stat info = {};
+                uint index;
                 if (Posix.stat (path, out info) != 0 || get_real_time () / TimeSpan.SECOND - info.st_mtime < 180 ||
-                    token_has_device (name)) return true;
+                    find_token_device (name, out index)) return true;
                 uint pid = 0;
                 string started = "";
                 try {
@@ -159,6 +160,11 @@ namespace MajorisDisks {
             timer.set_callback (wait_tick.callback);
             timer.attach (MainContext.ref_thread_default ());
             yield;
+        }
+
+        private static bool reply_uncertain (Error error) {
+            return error is DBusError.NO_REPLY || error is DBusError.DISCONNECTED ||
+                error is IOError.TIMED_OUT || error is IOError.CLOSED;
         }
 
         private static Subprocess export_image (int fd, string format, string directory, string id, bool read_only) throws Error {
@@ -259,10 +265,23 @@ namespace MajorisDisks {
                 var bus = yield Bus.get (BusType.SYSTEM, token);
                 dispatched = true;
                 // After dispatch, wait for the result even if the user closes the dialog.
-                var reply = yield bus.call (BUS, OBJECT, BUS, "Attach",
-                    new Variant ("(stb)", id, inspected.capacity, read_only),
-                    new VariantType ("(u)"), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 180000, null);
-                uint index = reply.get_child_value (0).get_uint32 ();
+                uint index = 0;
+                try {
+                    var reply = yield bus.call (BUS, OBJECT, BUS, "Attach",
+                        new Variant ("(stb)", id, inspected.capacity, read_only),
+                        new VariantType ("(u)"), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 180000, null);
+                    index = reply.get_child_value (0).get_uint32 ();
+                } catch (Error error) {
+                    if (!reply_uncertain (error)) throw error;
+                    bool observed = false;
+                    for (int attempt = 0; attempt < 50; attempt++) {
+                        try {
+                            if (find_token_device (id, out index)) { observed = true; break; }
+                        } catch (Error scan_error) { break; }
+                        yield wait_tick ();
+                    }
+                    if (!observed) throw error;
+                }
                 connected = true;
                 if (device_token (index) != id)
                     throw new VirtualAttachmentError.UNCERTAIN ("The kernel attachment could not be verified. Recovery information was retained.");
@@ -277,8 +296,7 @@ namespace MajorisDisks {
                 }
                 return attached;
             } catch (Error error) {
-                if (dispatched && !connected && (error is DBusError.NO_REPLY || error is IOError.TIMED_OUT ||
-                    error is IOError.CLOSED || error is DBusError.DISCONNECTED ||
+                if (dispatched && !connected && (reply_uncertain (error) ||
                     DBusError.get_remote_error (error) == BUS + ".Error.Uncertain"))
                     throw new VirtualAttachmentError.UNCERTAIN ("The NBD result is uncertain. Recovery information was retained. " + error.message);
                 if (!connected) dispatched = false;
@@ -300,14 +318,27 @@ namespace MajorisDisks {
             if (device_token (record.index) != record.token)
                 throw new IOError.PERMISSION_DENIED ("The NBD attachment ownership changed.");
             var bus = yield Bus.get (BusType.SYSTEM);
-            yield bus.call (BUS, OBJECT, BUS, "Detach", new Variant ("(us)", record.index, record.token),
-                null, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 180000, null);
+            Error? lost_reply = null;
+            try {
+                yield bus.call (BUS, OBJECT, BUS, "Detach", new Variant ("(us)", record.index, record.token),
+                    null, DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 180000, null);
+            } catch (Error error) {
+                if (!reply_uncertain (error)) throw error;
+                lost_reply = error;
+            }
             for (int i = 0; i < 50 && device_token (record.index) == record.token; i++) yield wait_tick ();
             if (device_token (record.index) == record.token)
                 throw new IOError.TIMED_OUT ("NBD accepted the detach request, but the mapping is still present.");
             for (int i = 0; i < 50 && exporter_running (record); i++) yield wait_tick ();
             if (exporter_running (record))
                 throw new IOError.FAILED ("The NBD mapping was disconnected, but the QEMU exporter did not exit. Recovery details were retained.");
+            if (lost_reply != null) {
+                string sysfs = "/sys/block/nbd%u".printf (record.index);
+                string size;
+                if (!FileUtils.get_contents (sysfs + "/size", out size) || size.strip () != "0" ||
+                    FileUtils.test (sysfs + "/pid", FileTest.EXISTS))
+                    throw new VirtualAttachmentError.UNCERTAIN ("The detach reply was lost and the kernel device was not verified empty.");
+            }
             string directory = Path.build_filename (root (), record.token);
             if (FileUtils.test (directory, FileTest.IS_DIR)) remove_record (directory);
         }

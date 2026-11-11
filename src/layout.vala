@@ -75,6 +75,21 @@ namespace MajorisDisks {
         }
 
         public static void validate_resize (StorageBlock disk, StorageBlock target, uint64 size) throws Error {
+            uint64 maximum = maximum_resize (disk, target);
+            if (size == 0 || size % disk.logical_sector_size != 0)
+                throw new IOError.INVALID_ARGUMENT ("The new partition size must be sector aligned.");
+            if (size > maximum)
+                throw new IOError.NO_SPACE ("The requested size exceeds the available contiguous space.");
+            if (size < minimum_resize (disk, target))
+                throw new IOError.NO_SPACE ("The extended partition must contain every logical partition and its EBR margin.");
+        }
+
+        internal static uint64 partition_length (StorageBlock block) {
+            uint64 length = block.partition?.table_size ?? 0;
+            return length == 0 ? block.size : length;
+        }
+
+        public static uint64 maximum_resize (StorageBlock disk, StorageBlock target) throws Error {
             var table = disk.table;
             var part = target.partition;
             var parent = target.parent as StorageBlock;
@@ -83,19 +98,35 @@ namespace MajorisDisks {
                 sector == 0 || disk.size == 0 || target.size == 0 ||
                 (table.scheme != "gpt" && table.scheme != "dos"))
                 throw new IOError.NOT_SUPPORTED ("The partition geometry cannot be safely resized.");
-            if (size == 0 || size % sector != 0 || part.offset % sector != 0)
-                throw new IOError.INVALID_ARGUMENT ("The new size and partition start must be sector aligned.");
+            if (part.offset % sector != 0)
+                throw new IOError.INVALID_ARGUMENT ("The partition start must be sector aligned.");
             uint64 limit = disk.size;
+            uint64 current = partition_length (target);
+            if (table.scheme == "gpt") {
+                // GPT reserves the backup header and at least 16 KiB of entries.
+                uint64 entries = 16384 / sector + (16384 % sector == 0 ? 0 : 1);
+                if (limit / sector <= entries + 1)
+                    throw new IOError.INVALID_DATA ("The disk is too small for the GPT backup table.");
+                limit = (limit / sector - entries - 1) * sector;
+            }
             if (part.container) {
                 if (table.scheme != "dos" || parent != disk)
                     throw new IOError.INVALID_DATA ("The extended partition does not belong to this MBR disk.");
+                // The Debian 13 partition backend caps a populated extended
+                // partition at its existing length.
+                foreach (var child in table.partitions) {
+                    if (child.parent == target && child.partition?.logical == true &&
+                        part.offset < limit && current <= limit - part.offset)
+                        limit = part.offset + current;
+                }
             } else if (part.logical) {
                 var container = parent.partition;
+                uint64 container_size = partition_length (parent);
                 if (table.scheme != "dos" || container == null || !container.container ||
-                    container.offset >= limit || parent.size > limit - container.offset ||
+                    container.offset >= limit || container_size > limit - container.offset ||
                     part.offset <= container.offset)
                     throw new IOError.INVALID_DATA ("The extended partition boundary could not be verified.");
-                limit = container.offset + parent.size;
+                limit = container.offset + container_size;
             } else if (parent != disk) {
                 throw new IOError.INVALID_DATA ("The partition does not belong to the selected disk.");
             }
@@ -107,18 +138,18 @@ namespace MajorisDisks {
                 }
                 if (sibling.parent != parent) continue;
                 var other = sibling.partition;
-                if (other == null || sibling.size == 0)
+                uint64 sibling_size = partition_length (sibling);
+                if (other == null || sibling_size == 0 || other.offset >= disk.size ||
+                    sibling_size > disk.size - other.offset)
                     throw new IOError.INVALID_DATA ("An adjacent partition has unknown geometry.");
-                if (other.offset < part.offset && sibling.size > part.offset - other.offset)
+                if (other.offset < part.offset && sibling_size > part.offset - other.offset)
                     throw new IOError.INVALID_DATA ("The current partition overlaps an adjacent partition.");
                 if (other.offset >= part.offset) limit = uint64.min (limit, other.offset);
             }
-            if (!found || part.offset >= limit || target.size > limit - part.offset)
+            if (!found || part.offset >= limit || current > limit - part.offset)
                 throw new IOError.INVALID_DATA ("The current partition geometry is inconsistent.");
-            if (size > limit - part.offset)
-                throw new IOError.NO_SPACE ("The requested size crosses the next partition or container boundary.");
-            if (size < minimum_resize (disk, target))
-                throw new IOError.NO_SPACE ("The extended partition must contain every logical partition and its EBR margin.");
+            uint64 maximum = limit - part.offset;
+            return maximum - maximum % sector;
         }
 
         public static uint64 minimum_resize (StorageBlock disk, StorageBlock target) throws Error {
@@ -127,6 +158,8 @@ namespace MajorisDisks {
             if (part == null || sector == 0) throw new IOError.NOT_SUPPORTED ("The minimum partition boundary is unavailable.");
             if (!part.container) return sector;
             if (disk.table == null) throw new IOError.NOT_SUPPORTED ("The partition table is unavailable.");
+            if (part.offset > uint64.MAX - sector)
+                throw new IOError.INVALID_DATA ("The extended partition start is invalid.");
             uint64 end = part.offset + sector;
             foreach (var child in disk.table.partitions) {
                 var logical = child.partition;
@@ -136,24 +169,13 @@ namespace MajorisDisks {
                 end = uint64.max (end, logical.offset + child.size);
             }
             uint64 minimum = end - part.offset;
-            if (minimum % sector != 0) minimum += sector - minimum % sector;
-            return minimum;
-        }
-
-        public static uint64 maximum_resize (StorageBlock disk, StorageBlock target) throws Error {
-            var part = target.partition;
-            var parent = target.parent as StorageBlock;
-            if (disk.table == null || part == null || parent == null || part.offset >= disk.size)
-                throw new IOError.NOT_SUPPORTED ("The partition resize boundary is unavailable.");
-            uint64 limit = part.logical ? parent.partition.offset + parent.size : disk.size;
-            foreach (var sibling in disk.table.partitions) {
-                if (sibling == target || sibling.parent != parent || sibling.partition == null) continue;
-                if (sibling.partition.offset > part.offset) limit = uint64.min (limit, sibling.partition.offset);
+            if (minimum % sector != 0) {
+                uint64 margin = sector - minimum % sector;
+                if (minimum > uint64.MAX - margin)
+                    throw new IOError.INVALID_DATA ("The extended partition boundary is invalid.");
+                minimum += margin;
             }
-            if (limit <= part.offset) throw new IOError.INVALID_DATA ("The adjacent partition geometry is invalid.");
-            uint64 maximum = limit - part.offset;
-            uint64 sector = disk.logical_sector_size;
-            return sector == 0 ? maximum : maximum - maximum % sector;
+            return minimum;
         }
 
         public static Extent[] normalize (uint64 start, uint64 end, Extent[] occupied) {

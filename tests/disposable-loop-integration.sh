@@ -5,8 +5,9 @@ if [ "${MAJORIS_DISKS_RUN_LOOP_TESTS:-0}" != 1 ]; then
   echo "SKIP: set MAJORIS_DISKS_RUN_LOOP_TESTS=1 to run disposable UDisks loop tests"
   exit 77
 fi
+[ "$(id -u)" -eq 0 ] || { echo "SKIP: root is required to verify disposable kernel geometry"; exit 77; }
 
-for tool in udisksctl gdbus losetup truncate mktemp; do
+for tool in udisksctl gdbus losetup truncate mktemp blockdev sfdisk sha256sum dd; do
   command -v "$tool" >/dev/null || { echo "SKIP: $tool is unavailable"; exit 77; }
 done
 
@@ -14,8 +15,12 @@ fixture=$(mktemp "${TMPDIR:-/tmp}/majoris-disks-loop.XXXXXX.img")
 loop=""
 cleanup() {
   if [ -n "$loop" ]; then
-    udisksctl loop-delete --block-device "$loop" --no-user-interaction >/dev/null 2>&1 ||
-      echo "WARNING: failed to detach test loop $loop" >&2
+    backing=$(losetup --noheadings --raw --output BACK-FILE "$loop" 2>/dev/null) || backing=""
+    if [ "$backing" != "$fixture" ] ||
+      ! udisksctl loop-delete --block-device "$loop" --no-user-interaction >/dev/null 2>&1; then
+      echo "WARNING: could not confirm fixture detach. Retaining $fixture." >&2
+      return
+    fi
   fi
   rm -f -- "$fixture"
 }
@@ -38,6 +43,23 @@ object="/org/freedesktop/UDisks2/block_devices/$name"
 call() {
   gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$object" "$@"
 }
+wait_partition() {
+  path=$1
+  node=${path##*/}
+  attempt=0
+  while [ "$attempt" -lt 50 ]; do
+    if [ -b "/dev/$node" ] &&
+      [ "$(dirname "$(readlink -f "/sys/class/block/$node")")" = "$(readlink -f "/sys/class/block/$name")" ] &&
+      gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$path" \
+        --method org.freedesktop.DBus.Properties.Get org.freedesktop.UDisks2.Partition Number >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
+  echo "UDisks did not republish fixture partition $node" >&2
+  return 1
+}
 
 call --method org.freedesktop.UDisks2.Block.Format gpt "{}" >/dev/null
 created=$(call --method org.freedesktop.UDisks2.PartitionTable.CreatePartition 1048576 33554432 "" "Majoris test" "{}")
@@ -47,6 +69,21 @@ gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
   --method org.freedesktop.UDisks2.Block.Format ext4 "{'label': <'MAJORIS_TEST'>}" >/dev/null
 gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
   --method org.freedesktop.UDisks2.Filesystem.Check "{}" >/dev/null
+gpt_device="/dev/${partition##*/}"
+gpt_start=$(cat "/sys/class/block/${partition##*/}/start")
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
+  --method org.freedesktop.UDisks2.Partition.Resize 50331648 "{}" >/dev/null
+[ "$(blockdev --getsize64 "$gpt_device")" = 50331648 ]
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
+  --method org.freedesktop.UDisks2.Filesystem.Resize 0 "{}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
+  --method org.freedesktop.UDisks2.Filesystem.Resize 33554432 "{}" >/dev/null
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
+  --method org.freedesktop.UDisks2.Partition.Resize 33554432 "{}" >/dev/null
+[ "$(blockdev --getsize64 "$gpt_device")" = 33554432 ]
+[ "$(cat "/sys/class/block/${partition##*/}/start")" = "$gpt_start" ]
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
+  --method org.freedesktop.UDisks2.Filesystem.Check "{}" | grep -q true
 gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$partition" \
   --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
 
@@ -71,12 +108,35 @@ gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
   --method org.freedesktop.UDisks2.Filesystem.SetLabel MAJORIS_EDITED "{}" >/dev/null
 gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
   --method org.freedesktop.UDisks2.Filesystem.Check "{}" >/dev/null
-gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$extended" \
-  --method org.freedesktop.UDisks2.Partition.Resize 94371840 "{}" >/dev/null
+# The Debian 13 backend refused growing the populated extended partition from
+# 80 to 90 MiB. Exercise supported growth of its logical child within 80 MiB.
+logical_device="/dev/${logical##*/}"
+primary_device="/dev/${primary##*/}"
+logical_start=$(cat "/sys/class/block/${logical##*/}/start")
+primary_start=$(cat "/sys/class/block/${primary##*/}/start")
+primary_hash=$(dd if="$primary_device" bs=1M count=16 status=none | sha256sum)
+logical_hash=$(dd if="$logical_device" bs=1M count=16 status=none | sha256sum)
+sfdisk --dump "$loop"
+blockdev --getsize64 "$loop"
+blockdev --getss "$loop"
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$primary" \
+  --method org.freedesktop.UDisks2.Partition.Resize 20971520 "{}" >/dev/null
+[ "$(blockdev --getsize64 "$primary_device")" = 20971520 ]
+[ "$(cat "/sys/class/block/${primary##*/}/start")" = "$primary_start" ]
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
+  --method org.freedesktop.UDisks2.Partition.Resize 33554432 "{}" >/dev/null
+[ "$(blockdev --getsize64 "$logical_device")" = 33554432 ]
+[ "$(cat "/sys/class/block/${logical##*/}/start")" = "$logical_start" ]
+[ "$(dd if="$primary_device" bs=1M count=16 status=none | sha256sum)" = "$primary_hash" ]
+[ "$(dd if="$logical_device" bs=1M count=16 status=none | sha256sum)" = "$logical_hash" ]
+gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
+  --method org.freedesktop.UDisks2.Filesystem.Check "{}" >/dev/null
 gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$logical" \
   --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
+wait_partition "$extended"
 gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$extended" \
   --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
+wait_partition "$primary"
 gdbus call --system --dest org.freedesktop.UDisks2 --object-path "$primary" \
   --method org.freedesktop.UDisks2.Partition.Delete "{}" >/dev/null
 

@@ -5,7 +5,7 @@ set -eu
 skip() { echo "Skipped: $*"; exit 77; }
 [ "${MAJORIS_TEST_LUKS:-}" = 1 ] || skip "set MAJORIS_TEST_LUKS=1 in an isolated Linux test environment"
 [ "$(id -u)" -eq 0 ] || skip "requires root for disposable loop and dm-crypt fixtures"
-for tool in unshare losetup cryptsetup mkfs.ext4 mount umount python3; do
+for tool in unshare losetup cryptsetup mkfs.ext4 mount mountpoint umount python3; do
     command -v "$tool" >/dev/null || skip "$tool unavailable"
 done
 worker=$(realpath "${1:?provide the built Majoris LUKS worker}")
@@ -13,7 +13,9 @@ worker=$(realpath "${1:?provide the built Majoris LUKS worker}")
 service=${2:-}
 if [ -n "$service" ]; then
     service=$(realpath "$service")
-    command -v udisksctl >/dev/null && command -v udevadm >/dev/null || skip "UDisks or udev unavailable"
+    for tool in udisksctl udevadm busctl; do
+        command -v "$tool" >/dev/null || skip "$tool unavailable"
+    done
 fi
 if [ "${3:-}" != private ]; then
     unshare --mount --propagation private true 2>/dev/null || skip "private mount namespaces unavailable"
@@ -33,19 +35,29 @@ verify_loop() (
     [ -b "$1" ] && [ "$(losetup --noheadings --output BACK-FILE -- "$1")" = "$image" ]
 )
 cleanup() {
-    umount "$mountpoint" 2>/dev/null || :
+    retain=0
+    if mountpoint -q "$mountpoint" && ! umount "$mountpoint"; then retain=1; fi
     if [ -n "$fat_mount" ]; then
-        umount "$fat_mount" 2>/dev/null || :
+        if mountpoint -q "$fat_mount" && ! umount "$fat_mount"; then retain=1; fi
         rmdir "$fat_mount" 2>/dev/null || :
     fi
     for name in "$base-1" "$base-2"; do
-        if cryptsetup status "$name" 2>/dev/null | grep -Fq "$name is active"; then
-            cryptsetup close "$name" || :
+        if mapping=$(cryptsetup status "$name" 2>/dev/null); then
+            if verify_loop "$one" "$tmp/one.img" &&
+                [ "$(printf '%s\n' "$mapping" | awk '$1 == "device:" { print $2 }')" = "$one" ]; then
+                cryptsetup close "$name" || retain=1
+            else
+                retain=1
+            fi
         fi
     done
     for item in "one:$one" "two:$two" "raw:$raw" "fat:$fat"; do
         image="$tmp/${item%%:*}.img"; loop=${item#*:}
-        if [ -n "$loop" ] && verify_loop "$loop" "$image"; then losetup -d "$loop" || :; fi
+        if [ -n "$loop" ]; then
+            if ! verify_loop "$loop" "$image" || ! losetup -d "$loop" || verify_loop "$loop" "$image"; then
+                retain=1
+            fi
+        fi
     done
     if [ -n "$rule" ]; then
         rm -f -- "$rule"
@@ -53,6 +65,10 @@ cleanup() {
     fi
     if [ -n "$rules_directory_created" ]; then
         rmdir "$rules_directory_created" 2>/dev/null || :
+    fi
+    if [ "$retain" -ne 0 ]; then
+        echo "Could not verify fixture cleanup. Retaining $tmp." >&2
+        return
     fi
     rm -f -- "$tmp/"*.img "$tmp/"*.header "$tmp/"*.key "$tmp/"*.ticket "$tmp/"*.json
     rmdir "$mountpoint" "$tmp" 2>/dev/null || :
@@ -156,6 +172,23 @@ run_service() {
     verify_loop "$one" "$tmp/one.img" || return 1
     udevadm trigger --action=change --sysname-match="${one##*/}"
     udevadm settle --timeout=10
+    if [ "$1" = restore ]; then
+        object="/org/freedesktop/UDisks2/block_devices/${one##*/}"
+        attempt=0
+        while :; do
+            cleartext=$(busctl --system get-property org.freedesktop.UDisks2 "$object" \
+                org.freedesktop.UDisks2.Encrypted CleartextDevice 2>/dev/null) || cleartext=""
+            holders=$(ls "/sys/class/block/${one##*/}/holders")
+            if [ -z "$holders" ] && [ "$cleartext" = 'o "/"' ]; then break; fi
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 50 ]; then
+                printf 'Restore fixture did not become idle. Device=%s holders=%s cleartext=%s\n' \
+                    "$one" "$holders" "$cleartext" >&2
+                return 1
+            fi
+            sleep 0.2
+        done
+    fi
     "$service" "$one" "$tmp/one.img" "$1" "$2"
 }
 

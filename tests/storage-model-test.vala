@@ -375,7 +375,11 @@ private void test_extended_resize_boundaries () {
     disk.table.partitions = { extended, logical };
     try {
         assert (PartitionLayoutService.minimum_resize (disk, extended) == 9 * 1024 * 1024);
+        assert (PartitionLayoutService.maximum_resize (disk, extended) == 30 * 1024 * 1024);
+        assert (PartitionLayoutService.maximum_resize (disk, logical) == 29 * 1024 * 1024);
         PartitionLayoutService.validate_resize (disk, extended, 10 * 1024 * 1024);
+        try { PartitionLayoutService.validate_resize (disk, extended, 31 * 1024 * 1024); assert_not_reached (); }
+        catch (Error error) { assert (error is IOError.NO_SPACE); }
         try { PartitionLayoutService.validate_resize (disk, extended, 8 * 1024 * 1024); assert_not_reached (); }
         catch (Error error) { assert (error is IOError.NO_SPACE); }
     } catch (Error error) { GLib.error ("Unexpected mount-option error: %s", error.message); }

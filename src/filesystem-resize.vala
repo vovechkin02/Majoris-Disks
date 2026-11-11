@@ -411,8 +411,9 @@ namespace MajorisDisks {
             bool resize_filesystem, FilesystemCapability capability, uint64 minimum_size,
             uint64 maximum_size) {
             var plan = new FilesystemResizePlan ();
-            plan.direction = requested < block.size ? ResizeDirection.SHRINK :
-                requested > block.size ? ResizeDirection.GROW : ResizeDirection.NONE;
+            uint64 current_size = PartitionLayoutService.partition_length (block);
+            plan.direction = requested < current_size ? ResizeDirection.SHRINK :
+                requested > current_size ? ResizeDirection.GROW : ResizeDirection.NONE;
             plan.resize_filesystem = resize_filesystem;
             plan.mounted = block.filesystem?.mounted ?? false;
             plan.minimum_size = minimum_size;

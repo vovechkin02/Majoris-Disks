@@ -583,6 +583,7 @@ namespace MajorisDisks {
         public string uuid = "";
         public uint32 number;
         public uint64 offset;
+        public uint64 table_size;
         public uint64 flags;
         public bool container;
         public bool logical;

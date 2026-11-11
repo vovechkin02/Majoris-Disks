@@ -11,7 +11,8 @@ private void verify_fixture (File target, uint8[] expected, uint8[] before, int 
         throw new IOError.INVALID_DATA ("The restored device contents differ from the expected image.");
 }
 
-private async void exercise_devices (bool use_xz, bool partition, bool mbr, string? virtual_format) throws Error {
+private async void exercise_devices (bool use_xz, bool partition, bool mbr, string? virtual_format,
+    bool lost_rescan_reply) throws Error {
     string directory = DirUtils.make_tmp ("majoris-image-devices-XXXXXX");
     var source = File.new_for_path (Path.build_filename (directory, "source.img"));
     var copy = File.new_for_path (Path.build_filename (directory, "copy.img"));
@@ -20,6 +21,11 @@ private async void exercise_devices (bool use_xz, bool partition, bool mbr, stri
     var container = File.new_for_path (Path.build_filename (directory, "container." + extension));
     var oversized = File.new_for_path (Path.build_filename (directory, "oversized.raw"));
     var target = File.new_for_path (Path.build_filename (directory, "target.img"));
+    string dispatches = Path.build_filename (directory, "dispatches");
+    if (lost_rescan_reply) {
+        Environment.set_variable ("MAJORIS_IMAGE_DISPATCH_LOG", dispatches, true);
+        Environment.set_variable ("XDG_STATE_HOME", Path.build_filename (directory, "state"), true);
+    }
     var backend = new UDisksService ();
     StorageBlock? attached = null;
     bool safe_to_remove = true;
@@ -125,7 +131,13 @@ private async void exercise_devices (bool use_xz, bool partition, bool mbr, stri
             throw new IOError.FAILED ("Could not return the original fixture source.");
         var result = yield backend.restore_disk_image (restore_target, restore_source,
             backend.modification_identity (restore_target));
-        if (!result.successful)
+        if (lost_rescan_reply) {
+            string calls;
+            FileUtils.get_contents (dispatches, out calls);
+            if (result.successful || result.partial || result.status != StorageOperationStatus.NEEDS_ATTENTION ||
+                !result.technical_error.contains ("Injected lost reply") || calls != "Rescan\n")
+                throw new IOError.FAILED ("A lost rescan reply was not recorded as one uncertain operation.");
+        } else if (!result.successful)
             throw new IOError.FAILED (result.summary + " " + result.technical_error);
         yield backend.detach_disk_image (attached);
         attached = null;
@@ -146,9 +158,219 @@ private async void exercise_devices (bool use_xz, bool partition, bool mbr, stri
             FileUtils.unlink (compressed.get_path ());
             FileUtils.unlink (container.get_path ());
             FileUtils.unlink (oversized.get_path ());
-            DirUtils.remove (directory);
+            FileUtils.unlink (dispatches);
+            if (lost_rescan_reply) stdout.printf ("Recovery evidence directory: %s\n", directory);
+            else DirUtils.remove (directory);
         } else warning ("A loop attachment could not be reconciled. Retained fixtures in %s", directory);
     }
+}
+
+private async void exercise_partial_restore (bool compressed, bool disappear = false) throws Error {
+    const int CAPACITY = 128 * 1024 * 1024;
+    string directory = DirUtils.make_tmp ("majoris-partial-restore-XXXXXX");
+    Environment.set_variable ("XDG_STATE_HOME", Path.build_filename (directory, "state"), true);
+    var source = File.new_for_path (Path.build_filename (directory, "source.img"));
+    var packed = File.new_for_path (Path.build_filename (directory, "source.img.xz"));
+    var target = File.new_for_path (Path.build_filename (directory, "target.img"));
+    string moved = Path.build_filename (directory, "source-moved.img");
+    var backend = new UDisksService ();
+    StorageBlock? attached = null;
+    bool interrupted = false;
+    bool attachment_attempted = false;
+    try {
+        yield DiskImageCopy.create_blank (source, CAPACITY);
+        yield DiskImageCopy.create_blank (target, CAPACITY);
+        foreach (var file in new File[] { source, target }) {
+            var stream = file.open_readwrite ();
+            uint8[] marker = file == source ? "new".data : "old".data;
+            size_t count;
+            stream.output_stream.write_all (marker, out count);
+            ((Seekable) stream).seek (CAPACITY - marker.length, SeekType.SET);
+            stream.output_stream.write_all (marker, out count);
+            stream.close ();
+        }
+        if (compressed) {
+            var job = backend.jobs.begin_named ("Prepare compressed fixture", source.get_parse_name (), {});
+            yield DiskImageCopy.transform_xz (source, packed, true, backend.jobs, job);
+        }
+        yield backend.refresh ();
+        attachment_attempted = true;
+        string path = yield backend.attach_disk_image (target, false);
+        attached = backend.snapshot.blocks.lookup (path);
+        if (attached?.loop?.backing_file != target.get_path () || attached.read_only || attached.size != CAPACITY)
+            throw new IOError.INVALID_DATA ("Could not identify the disposable restore target.");
+        var reader = target.read ();
+        var poll = new TimeoutSource (1);
+        poll.set_callback (() => {
+            try {
+                ((Seekable) reader).seek (0, SeekType.SET);
+                var marker = reader.read_bytes (3);
+                if (marker.compare (new Bytes ("new".data)) != 0) return Source.CONTINUE;
+                for (uint i = 0; i < backend.jobs.jobs.get_n_items (); i++) {
+                    var job = (StorageJob) backend.jobs.jobs.get_item (i);
+                    if (job.operation == "Restore disk image" && job.cancelable) {
+                        if (disappear) interrupted = FileUtils.rename (source.get_path (), moved) == 0;
+                        else {
+                            interrupted = true;
+                            job.cancellable.cancel ();
+                        }
+                        return Source.REMOVE;
+                    }
+                }
+            } catch (Error error) { warning ("%s", error.message); return Source.REMOVE; }
+            return Source.CONTINUE;
+        });
+        poll.attach (MainContext.ref_thread_default ());
+        StorageOperationResult? result = null;
+        try {
+            result = yield backend.restore_disk_image (attached, compressed ? packed : source,
+                backend.modification_identity (attached));
+        } finally { poll.destroy (); }
+        if (!interrupted || result.successful || result.partial == disappear ||
+            result.status != StorageOperationStatus.NEEDS_ATTENTION)
+            throw new IOError.FAILED ("Unexpected result after an observed target write: " + result.summary);
+        ((Seekable) reader).seek (0, SeekType.SET);
+        assert (reader.read_bytes (3).compare (new Bytes ("new".data)) == 0);
+        ((Seekable) reader).seek (CAPACITY - 3, SeekType.SET);
+        assert (reader.read_bytes (3).compare (new Bytes (disappear ? "new".data : "old".data)) == 0);
+        reader.close ();
+        var journal = Dir.open (Path.build_filename (directory, "state", "majoris-disks", "imaging"));
+        assert (journal.read_name () != null);
+        stdout.printf (disappear ?
+            "Verified the writes and retained a recovery record after the original source path disappeared.\n" :
+            "Observed new data at the head, original data at the tail, and a retained recovery record.\n");
+    } finally {
+        if (attached != null && attached.loop?.backing_file == target.get_path ()) {
+            try {
+                yield backend.detach_disk_image (attached);
+                attachment_attempted = false;
+            } catch (Error error) { warning ("Could not detach the restore fixture: %s", error.message); }
+        }
+        if (!attachment_attempted) {
+            FileUtils.unlink (target.get_path ());
+            FileUtils.unlink (source.get_path ());
+            FileUtils.unlink (packed.get_path ());
+            FileUtils.unlink (moved);
+        }
+        stdout.printf ("Fixture evidence directory: %s\n", directory);
+    }
+}
+
+private async void exercise_interrupted_output (bool compressed, bool convert) throws Error {
+    string directory = DirUtils.make_tmp ("majoris-interrupted-output-XXXXXX");
+    var source = File.new_for_path (Path.build_filename (directory, "source.img"));
+    var destination = File.new_for_path (Path.build_filename (directory,
+        convert ? "output.qcow2" : compressed ? "output.img.xz" : "output.img"));
+    var backend = new UDisksService ();
+    StorageBlock? attached = null;
+    bool keep = false;
+    bool observed_output = false;
+    try {
+        yield DiskImageCopy.create_blank (source, 128 * 1024 * 1024);
+        var random = File.new_for_path ("/dev/urandom").read ();
+        var writer = source.open_readwrite ();
+        uint8[] buffer = new uint8[2 * 1024 * 1024];
+        size_t count;
+        random.read_all (buffer, out count);
+        assert (count == buffer.length);
+        writer.output_stream.write_all (buffer, out count);
+        assert (count == buffer.length);
+        writer.close ();
+        random.close ();
+        if (convert) {
+            var token = new Cancellable ();
+            try {
+                yield VirtualDisk.write_image (source, destination, "qcow2", 0, token, (fraction) => {
+                    if (fraction > 0) {
+                        observed_output = true;
+                        token.cancel ();
+                    }
+                });
+            } catch (IOError.CANCELLED error) {}
+        } else {
+            yield backend.refresh ();
+            keep = true;
+            string path = yield backend.attach_disk_image (source, true);
+            attached = backend.snapshot.blocks.lookup (path);
+            if (attached?.loop?.backing_file != source.get_path () || !attached.read_only)
+                throw new IOError.INVALID_DATA ("Could not verify the disposable backup source.");
+            var poll = new TimeoutSource (1);
+            poll.set_callback (() => {
+                try {
+                    var entries = Dir.open (directory);
+                    string? entry;
+                    while ((entry = entries.read_name ()) != null) {
+                        Posix.Stat output = {};
+                        if (!entry.has_prefix (".majoris-") ||
+                            Posix.lstat (Path.build_filename (directory, entry, "disk"), out output) != 0 ||
+                            output.st_size == 0)
+                            continue;
+                        for (uint i = 0; i < backend.jobs.jobs.get_n_items (); i++) {
+                            var job = (StorageJob) backend.jobs.jobs.get_item (i);
+                            if (job.operation == "Create disk image" && job.cancelable) {
+                                observed_output = true;
+                                job.cancellable.cancel ();
+                                return Source.REMOVE;
+                            }
+                        }
+                    }
+                } catch (FileError error) { warning ("%s", error.message); return Source.REMOVE; }
+                return Source.CONTINUE;
+            });
+            poll.attach (MainContext.ref_thread_default ());
+            try {
+                yield backend.create_disk_image (attached, destination, backend.modification_identity (attached), true);
+            } catch (IOError.CANCELLED error) {}
+            finally { poll.destroy (); }
+        }
+        if (!observed_output || destination.query_exists ())
+            throw new IOError.FAILED ("Cancellation did not stop publication after output began.");
+        var remaining = Dir.open (directory);
+        string? entry;
+        while ((entry = remaining.read_name ()) != null) {
+            if (entry.has_prefix (".majoris-"))
+                throw new IOError.FAILED ("Private output was left behind after cancellation.");
+        }
+    } finally {
+        if (attached?.loop?.backing_file == source.get_path ()) {
+            try { yield backend.detach_disk_image (attached); keep = false; }
+            catch (Error error) { warning ("Could not detach the backup fixture: %s", error.message); }
+        }
+        if (!keep) {
+            FileUtils.unlink (source.get_path ());
+            FileUtils.unlink (destination.get_path ());
+        }
+        if (keep || DirUtils.remove (directory) != 0)
+            stdout.printf ("Retained interruption fixture: %s\n", directory);
+    }
+}
+
+private async void crash_conversion_worker (string directory) throws Error {
+    var source = File.new_for_path (Path.build_filename (directory, "source.img"));
+    var destination = File.new_for_path (Path.build_filename (directory, "output.qcow2"));
+    yield VirtualDisk.write_image (source, destination, "qcow2", 0, new Cancellable (), (fraction) => {
+        if (fraction > 0) Posix._exit (95);
+    });
+    throw new IOError.FAILED ("The conversion worker returned without the simulated crash.");
+}
+
+private async void exercise_conversion_crash () throws Error {
+    string directory = DirUtils.make_tmp ("majoris-conversion-crash-XXXXXX");
+    Environment.set_variable ("XDG_STATE_HOME", Path.build_filename (directory, "state"), true);
+    var source = File.new_for_path (Path.build_filename (directory, "source.img"));
+    yield DiskImageCopy.create_blank (source, 128 * 1024 * 1024);
+    string executable = FileUtils.read_link ("/proc/self/exe");
+    var child = new Subprocess.newv ({ executable, "--crash-conversion-worker", directory }, SubprocessFlags.NONE);
+    yield child.wait_async ();
+    if (!child.get_if_exited () || child.get_exit_status () != 95 ||
+        FileUtils.test (Path.build_filename (directory, "output.qcow2"), FileTest.EXISTS))
+        throw new IOError.FAILED ("The conversion crash did not leave an unpublished result.");
+    var jobs = new StorageJobManager ();
+    ImageOperationJournal.recover (jobs);
+    var recovered = jobs.jobs.get_item (0) as StorageJob;
+    if (jobs.jobs.get_n_items () != 1 || recovered?.result?.status != StorageOperationStatus.NEEDS_ATTENTION)
+        throw new IOError.FAILED ("A new process did not recover the interrupted conversion record.");
+    stdout.printf ("Recovered interrupted conversion evidence in %s.\n", directory);
 }
 
 private const int NBD_FIXTURE_OFFSET = 32 * 1024 * 1024;
@@ -192,6 +414,147 @@ private void verify_nbd_cleanup (VirtualAttachment record) throws Error {
     if (VirtualDiskAttachment.lookup ("/dev/nbd%u".printf (record.index)) != null ||
         FileUtils.test (session, FileTest.EXISTS) || FileUtils.test (nbd_journal (record), FileTest.EXISTS))
         throw new IOError.FAILED ("The NBD fixture still has a managed mapping or runtime record.");
+}
+
+[CCode (cname = "pidfd_open", cheader_filename = "sys/pidfd.h")]
+private extern int fixture_pidfd_open (int pid, uint flags);
+[CCode (cname = "pidfd_send_signal", cheader_filename = "sys/pidfd.h")]
+private extern int fixture_pidfd_signal (int fd, int signal, void* info, uint flags);
+
+private uint find_fixture_exporter (uint pid, string token, int depth = 0) throws Error {
+    if (pid == 0 || depth > 8) return 0;
+    string process = "/proc/%u".printf (pid);
+    if (Path.get_basename (FileUtils.read_link (process + "/exe")) == "qemu-nbd") {
+        uint8[] cmdline;
+        FileUtils.get_data (process + "/cmdline", out cmdline);
+        for (int i = 0; i < cmdline.length; i++) {
+            if (cmdline[i] == 0) cmdline[i] = (uint8) ' ';
+        }
+        string arguments = (string) cmdline;
+        if ((" " + arguments).contains (" --export-name=" + token + " ")) return pid;
+        return 0;
+    }
+    string children;
+    FileUtils.get_contents (process + "/task/%u/children".printf (pid), out children);
+    foreach (var child in children.strip ().split (" ")) {
+        uint candidate;
+        if (!uint.try_parse (child, out candidate)) continue;
+        uint exporter = find_fixture_exporter (candidate, token, depth + 1);
+        if (exporter != 0) return exporter;
+    }
+    return 0;
+}
+
+private async bool exercise_nbd_interruption (bool client, bool during_restore) throws Error {
+    string directory = DirUtils.make_tmp ("majoris-nbd-interruption-XXXXXX");
+    var image = File.new_for_path (Path.build_filename (directory, "blank.qcow2"));
+    var copy = File.new_for_path (Path.build_filename (directory, "readback.img"));
+    var source = File.new_for_path (Path.build_filename (directory, "restore.img"));
+    var backend = new UDisksService ();
+    bool retain = false;
+    try {
+        uint64 capacity = (during_restore ? 256 : 64) * 1024 * 1024;
+        yield VirtualDisk.write_image (null, image, "qcow2", capacity, new Cancellable ());
+        if (during_restore) {
+            yield DiskImageCopy.create_blank (source, capacity);
+            var fixture = source.open_readwrite ();
+            size_t written;
+            fixture.output_stream.write_all ("new".data, out written);
+            assert (written == 3);
+            fixture.close ();
+        }
+        yield backend.refresh ();
+        retain = true;
+        string path = yield backend.attach_virtual_image (image, !during_restore);
+        var block = backend.snapshot.blocks.lookup (path);
+        var record = block?.virtual_attachment;
+        if (record == null || record.file != image.get_path () || block.table != null)
+            throw new IOError.INVALID_DATA ("The unpartitioned QCOW2 fixture was not verified.");
+        verify_nbd_journal (record);
+        string sysfs = "/sys/block/nbd%u".printf (record.index);
+        uint pid;
+        if (client) {
+            string pid_text;
+            FileUtils.get_contents (sysfs + "/pid", out pid_text);
+            var journal = new KeyFile ();
+            journal.load_from_file (nbd_journal (record), KeyFileFlags.NONE);
+            if (!uint.try_parse (pid_text.strip (), out pid) || pid == 0 ||
+                journal.get_uint64 ("attachment", "client-pid") != pid)
+                throw new IOError.INVALID_DATA ("The NBD client could not be identified.");
+            if (!FileUtils.test ("/proc/%u/exe".printf (pid), FileTest.EXISTS)) {
+                yield backend.detach_disk_image (block);
+                verify_nbd_cleanup (record);
+                retain = false;
+                stdout.printf ("SKIP: the active netlink mapping has no foreground NBD client process.\n");
+                return false;
+            }
+            if (Path.get_basename (FileUtils.read_link ("/proc/%u/exe".printf (pid))) != "nbd-client")
+                throw new IOError.INVALID_DATA ("The recorded client process no longer owns the mapping.");
+        } else pid = find_fixture_exporter (record.exporter_pid, record.token);
+        int pidfd = pid > 0 && pid <= int.MAX ? fixture_pidfd_open ((int) pid, 0) : -1;
+        if (pidfd < 0) throw new IOError.NOT_FOUND ("The fixture process could not be pinned.");
+        try {
+            if (during_restore) {
+                bool stopped = false;
+                ulong update = backend.jobs.changed.connect (() => {
+                    if (stopped) return;
+                    for (uint i = 0; i < backend.jobs.jobs.get_n_items (); i++) {
+                        var job = (StorageJob) backend.jobs.jobs.get_item (i);
+                        if (job.operation != "Restore disk image" || !job.progress_valid ||
+                            job.progress <= 0 || job.progress >= 1 || !job.phase.has_suffix (" s remaining"))
+                            continue;
+                        int device = Posix.open (block.device, Posix.O_RDONLY | Posix.O_NOFOLLOW | Posix.O_CLOEXEC);
+                        if (device < 0) return;
+                        uint8[] observed = new uint8[3];
+                        ssize_t count = Posix.read (device, observed, observed.length);
+                        Posix.close (device);
+                        if (count == 3 && new Bytes (observed).compare (new Bytes ("new".data)) == 0 &&
+                            VirtualDiskAttachment.lookup (block.device)?.token == record.token)
+                            stopped = fixture_pidfd_signal (pidfd, Posix.Signal.KILL, null, 0) == 0;
+                        return;
+                    }
+                });
+                StorageOperationResult? result = null;
+                try { result = yield backend.restore_disk_image (block, source, backend.modification_identity (block)); }
+                finally { backend.jobs.disconnect (update); }
+                if (!stopped || result.successful || !result.partial ||
+                    result.status != StorageOperationStatus.NEEDS_ATTENTION)
+                    throw new IOError.FAILED ("NBD target loss did not produce a verified partial restore: " + result.summary);
+                stdout.printf ("NBD target became unavailable after an independently observed write.\n");
+            } else if (VirtualDiskAttachment.lookup (block.device)?.token != record.token ||
+                fixture_pidfd_signal (pidfd, Posix.Signal.KILL, null, 0) != 0)
+                throw new IOError.FAILED ("Could not terminate the verified NBD fixture process.");
+        } finally { Posix.close (pidfd); }
+
+        if (!during_restore) {
+            bool read_failed = false;
+            try { yield backend.create_disk_image (block, copy, backend.modification_identity (block), true); }
+            catch (Error error) { read_failed = true; stdout.printf ("Interrupted NBD read: %s\n", error.message); }
+            if (!read_failed || copy.query_exists ())
+                throw new IOError.FAILED ("The interrupted attachment was reported as a successful backup.");
+        }
+        yield backend.refresh ();
+        var current = backend.snapshot.blocks.lookup (path);
+        if (current?.virtual_attachment?.token == record.token) {
+            yield backend.detach_disk_image (current);
+            verify_nbd_cleanup (record);
+        } else {
+            string size;
+            FileUtils.get_contents (sysfs + "/size", out size);
+            if (size.strip () != "0" || FileUtils.test (sysfs + "/pid", FileTest.EXISTS))
+                throw new IOError.FAILED ("The mapping is no longer owned by the fixture and was retained for review.");
+        }
+        retain = FileUtils.test (nbd_journal (record), FileTest.EXISTS);
+        return true;
+    } finally {
+        if (retain) stdout.printf ("Retained NBD fixture evidence: %s\n", directory);
+        else {
+            FileUtils.unlink (copy.get_path ());
+            FileUtils.unlink (image.get_path ());
+            FileUtils.unlink (source.get_path ());
+            DirUtils.remove (directory);
+        }
+    }
 }
 
 private async void exercise_nbd_devices () throws Error {
@@ -445,7 +808,97 @@ private async void exercise_image_conversions () throws Error {
     }
 }
 
+private void exercise_publication () throws Error {
+    string directory = DirUtils.make_tmp ("majoris-publication-test-XXXXXX");
+    string temporary = Path.build_filename (directory, "private");
+    string destination = Path.build_filename (directory, "published.img");
+    try {
+        FileUtils.set_contents (temporary, "verified fixture");
+        var publication = new ImagePublication (destination);
+        int fd = VirtualDisk.open_image (File.new_for_path (temporary));
+        Posix.Stat verified = {};
+        try { verified = ImagePublication.flush (fd); }
+        finally { Posix.close (fd); }
+        FileUtils.set_contents (destination, "existing fixture");
+        try {
+            publication.publish (temporary, verified);
+            assert_not_reached ();
+        } catch (IOError error) {}
+        string contents;
+        FileUtils.get_contents (destination, out contents);
+        assert (contents == "existing fixture");
+        assert (FileUtils.unlink (destination) == 0);
+        try {
+            publication.publish (temporary, verified, (fd) => -1);
+            assert_not_reached ();
+        } catch (ImagePublicationError.DURABILITY_UNVERIFIED error) {
+            var result = new StorageOperationResult ();
+            ImagePublication.describe_failure (result, "Failed", error);
+            assert (!result.successful && result.status == StorageOperationStatus.NEEDS_ATTENTION);
+        }
+        assert (!FileUtils.test (temporary, FileTest.EXISTS));
+        FileUtils.get_contents (destination, out contents);
+        assert (contents == "verified fixture");
+    } finally {
+        FileUtils.unlink (temporary);
+        FileUtils.unlink (destination);
+        DirUtils.remove (directory);
+    }
+}
+
+private void exercise_discovery_race () {
+    var disk = new StorageBlock ("/fixture");
+    var blank = new ImagePartitionLayout ();
+    assert (blank.matches_discovery (disk, {}));
+    var layout = new ImagePartitionLayout () { has_table = true, scheme = "gpt" };
+    layout.partitions = { ImagePartitionGeometry () { number = 1, offset = 1048576, size = 16777216 } };
+    assert (!layout.matches_discovery (disk, {}));
+    assert (!layout.matches_discovery (disk, { "7:1" }));
+    disk.table = new StoragePartitionTable ("gpt");
+    var part = new StorageBlock ("/fixture/part1") {
+        available = true, number = 0x701, size = 16777216,
+        partition = new StoragePartition () {
+            number = 1, offset = 1048576, table_path = disk.path, table_size = 16777216
+        }
+    };
+    disk.table.partitions = { part };
+    assert (!layout.matches_discovery (disk, {}));
+    assert (!layout.matches_discovery (disk, { "7:2" }));
+    part.partition.table_path = "/other";
+    assert (!layout.matches_discovery (disk, { "7:1" }));
+    part.partition.table_path = disk.path;
+    assert (layout.matches_discovery (disk, { "7:1" }));
+    assert (part.type_id == "");
+    disk.table.partitions = {};
+    assert (!layout.matches_discovery (disk, { "7:1" }));
+}
+
 public static int main (string[] args) {
+    if ("--discovery-race" in args) {
+        exercise_discovery_race ();
+        return 0;
+    }
+    if ("--conversion-crash" in args || (args.length == 3 && args[1] == "--crash-conversion-worker")) {
+        if (!VirtualDisk.available ()) return 77;
+        var crash_loop = new MainLoop ();
+        int crash_status = 0;
+        if (args.length == 3) crash_conversion_worker.begin (args[2], (object, result) => {
+            try { crash_conversion_worker.end (result); }
+            catch (Error error) { stderr.printf ("%s\n", error.message); crash_status = 1; }
+            crash_loop.quit ();
+        });
+        else exercise_conversion_crash.begin ((object, result) => {
+            try { exercise_conversion_crash.end (result); }
+            catch (Error error) { stderr.printf ("%s\n", error.message); crash_status = 1; }
+            crash_loop.quit ();
+        });
+        crash_loop.run ();
+        return crash_status;
+    }
+    if ("--publication" in args) {
+        try { exercise_publication (); return 0; }
+        catch (Error error) { stderr.printf ("%s\n", error.message); return 1; }
+    }
     if ("--convert" in args) {
         if (!VirtualDisk.available () || Environment.find_program_in_path ("sfdisk") == null ||
             Environment.find_program_in_path ("mkfs.ext4") == null)
@@ -486,6 +939,8 @@ public static int main (string[] args) {
         stdout.printf ("SKIP: sfdisk is required to create the partition fixture.\n");
         return 77;
     }
+    bool interrupted_conversion = "--interrupt-conversion" in args;
+    if (interrupted_conversion && !VirtualDisk.available ()) return 77;
     if (nbd) {
         string? missing = VirtualDiskAttachment.unavailable_reason ();
         if ((!imaging_enabled && Environment.get_variable ("MAJORIS_DISKS_RUN_NBD_TESTS") != "1") || missing != null ||
@@ -494,18 +949,38 @@ public static int main (string[] args) {
                 missing ?? "");
             return 77;
         }
-    } else if (!imaging_enabled && Environment.get_variable ("MAJORIS_DISKS_RUN_LOOP_TESTS") != "1") {
+    } else if (!interrupted_conversion && !imaging_enabled &&
+        Environment.get_variable ("MAJORIS_DISKS_RUN_LOOP_TESTS") != "1") {
         stdout.printf ("SKIP: set MAJORIS_DISKS_RUN_IMAGING_TESTS=1 to run disposable imaging tests\n");
         return 77;
     }
     var loop = new MainLoop ();
     int status = 0;
-    if (nbd) exercise_nbd_devices.begin ((object, result) => {
+    if (nbd && ("--kill-exporter" in args || "--kill-client" in args || "--lose-target" in args))
+        exercise_nbd_interruption.begin ("--kill-client" in args, "--lose-target" in args, (object, result) => {
+            try { if (!exercise_nbd_interruption.end (result)) status = 77; }
+            catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
+            loop.quit ();
+        });
+    else if (nbd) exercise_nbd_devices.begin ((object, result) => {
         try { exercise_nbd_devices.end (result); }
         catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
         loop.quit ();
     });
-    else exercise_devices.begin (use_xz, partition, "--mbr" in args, virtual_format, (object, result) => {
+    else if ("--interrupt-backup" in args || interrupted_conversion)
+        exercise_interrupted_output.begin (use_xz, interrupted_conversion, (object, result) => {
+            try { exercise_interrupted_output.end (result); }
+            catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
+            loop.quit ();
+        });
+    else if ("--partial" in args) exercise_partial_restore.begin (use_xz, "--disappear-source" in args,
+        (object, result) => {
+        try { exercise_partial_restore.end (result); }
+        catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
+        loop.quit ();
+    });
+    else exercise_devices.begin (use_xz, partition, "--mbr" in args, virtual_format, "--lost-rescan" in args,
+        (object, result) => {
         try { exercise_devices.end (result); }
         catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
         loop.quit ();

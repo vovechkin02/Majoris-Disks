@@ -4,7 +4,9 @@ namespace MajorisDisks {
     [CCode (cname = "write", cheader_filename = "unistd.h")]
     private extern ssize_t write_bytes (int fd, void* bytes, size_t count);
 
-    internal enum ImageWritePhase { VALIDATING, PREPARING, WRITING, FLUSHING, VERIFYING, WRITTEN_VERIFIED, RESCANNING, COMPLETED }
+    internal enum ImageWritePhase {
+        VALIDATING, PREPARING, WRITING, FLUSHING, VERIFYING, WRITTEN_VERIFIED, RECONCILING, RESCANNING, COMPLETED
+    }
 
     internal class ImageWriteState : Object {
         public ImageWritePhase phase;
@@ -24,13 +26,20 @@ namespace MajorisDisks {
         public void describe_failure (StorageOperationResult result, Error error) {
             string summary;
             switch (phase) {
-                case ImageWritePhase.WRITING: summary = "Writing stopped. The target may be partially overwritten."; break;
+                case ImageWritePhase.WRITING:
+                    summary = "Restoration stopped after writing began. The target may contain incomplete data."; break;
                 case ImageWritePhase.FLUSHING: summary = "All image bytes were written, but durability could not be confirmed."; break;
                 case ImageWritePhase.VERIFYING: summary = "All image bytes were written and flushed, but verification did not complete."; break;
                 case ImageWritePhase.WRITTEN_VERIFIED: summary = "The image was written and verified, but closing the target failed."; break;
+                case ImageWritePhase.RECONCILING:
+                    summary = "The image was written and verified, but the current source or target could not be confirmed."; break;
                 case ImageWritePhase.RESCANNING:
+                    bool reply_uncertain = error is DBusError.NO_REPLY || error is DBusError.DISCONNECTED ||
+                        error is IOError.TIMED_OUT || error is IOError.CLOSED || error is IOError.CANCELLED;
                     summary = rescan_completed ?
                         "The image was written and verified and the rescan completed, but the device model could not be refreshed." :
+                        rescan_requested && reply_uncertain ?
+                            "The image was written and verified, but the rescan outcome could not be confirmed." :
                         rescan_requested ? "The image was written and verified, but the partition rescan failed." :
                         "The image was written and verified, but a device rescan could not be requested.";
                     break;
@@ -121,6 +130,18 @@ namespace MajorisDisks {
                 warning ("Could not remove imaging operation record %s", path);
         }
 
+        internal void retain_publication (Error error) {
+            try {
+                var record = new KeyFile ();
+                record.load_from_file (path, KeyFileFlags.NONE);
+                record.set_string ("operation", "evidence", error.message);
+                FileUtils.set_contents_full (path, record.to_data (), -1,
+                    FileSetContentsFlags.CONSISTENT | FileSetContentsFlags.DURABLE, 0600);
+            } catch (Error journal_error) {
+                warning ("Could not update image publication evidence: %s", journal_error.message);
+            }
+        }
+
         internal static void recover (StorageJobManager jobs) {
             string root = directory ();
             if (!private_directory (root)) return;
@@ -155,6 +176,175 @@ namespace MajorisDisks {
                     }
                 }
             } catch (FileError error) { warning ("Could not read imaging recovery records: %s", error.message); }
+        }
+    }
+
+    internal errordomain ImagePublicationError {
+        DURABILITY_UNVERIFIED,
+        IDENTITY_UNVERIFIED
+    }
+
+    internal delegate int ImageDirectorySync (int fd);
+
+    internal class ImagePublication : Object {
+        private int directory = -1;
+        private string parent;
+        private string name;
+
+        public ImagePublication (string path) throws Error {
+            parent = Path.get_dirname (path);
+            name = Path.get_basename (path);
+            directory = Posix.open (parent, Posix.O_RDONLY | Posix.O_DIRECTORY | Posix.O_CLOEXEC | Posix.O_NOFOLLOW);
+            if (directory < 0)
+                throw new IOError.FAILED ("Could not open the destination directory: " + Posix.strerror (Posix.errno));
+        }
+
+        ~ImagePublication () {
+            if (directory >= 0) Posix.close (directory);
+        }
+
+        private static bool matches (Posix.Stat expected, Posix.Stat actual) {
+            return expected.st_dev == actual.st_dev && expected.st_ino == actual.st_ino &&
+                expected.st_size == actual.st_size && Posix.S_ISREG (actual.st_mode);
+        }
+
+        public static Posix.Stat flush (int fd) throws Error {
+            Posix.Stat verified = {};
+            if (Posix.fsync (fd) != 0 || Posix.fstat (fd, out verified) != 0 || !Posix.S_ISREG (verified.st_mode))
+                throw new IOError.FAILED ("Could not flush and identify the verified image.");
+            return verified;
+        }
+
+        private bool parent_matches () {
+            Posix.Stat pinned = {}, current = {};
+            return Posix.fstat (directory, out pinned) == 0 && Posix.lstat (parent, out current) == 0 &&
+                pinned.st_dev == current.st_dev && pinned.st_ino == current.st_ino && Posix.S_ISDIR (current.st_mode);
+        }
+
+        public void publish (string temporary, Posix.Stat verified, ImageDirectorySync sync_directory = Posix.fsync)
+            throws Error {
+            int work = Posix.open (Path.get_dirname (temporary),
+                Posix.O_RDONLY | Posix.O_DIRECTORY | Posix.O_CLOEXEC | Posix.O_NOFOLLOW);
+            if (work < 0) throw new IOError.FAILED ("Could not open the verified image's private directory.");
+            try {
+                string leaf = Path.get_basename (temporary);
+                Posix.Stat current = {};
+                if (!parent_matches () || Posix.lstat ("/proc/self/fd/%d/%s".printf (work, leaf), out current) != 0 ||
+                    !matches (verified, current))
+                    throw new IOError.INVALID_DATA ("The destination directory or verified output changed before publication.");
+                if (rename_without_replacement (work, leaf, directory, name, NO_REPLACEMENT) != 0)
+                    throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));
+                int destination_sync = sync_directory (directory);
+                int work_sync = sync_directory (work);
+                if (!parent_matches () ||
+                    Posix.lstat ("/proc/self/fd/%d/%s".printf (directory, name), out current) != 0 ||
+                    !matches (verified, current))
+                    throw new ImagePublicationError.IDENTITY_UNVERIFIED (
+                        "The image was published, but its final identity could not be verified. Review the destination.");
+                if (destination_sync != 0 || work_sync != 0)
+                    throw new ImagePublicationError.DURABILITY_UNVERIFIED (
+                        "The image was published, but its crash durability could not be verified.");
+            } finally { Posix.close (work); }
+        }
+
+        public static bool was_published (Error error) {
+            return error is ImagePublicationError.DURABILITY_UNVERIFIED ||
+                error is ImagePublicationError.IDENTITY_UNVERIFIED;
+        }
+
+        public static void describe_failure (StorageOperationResult result, string before_publication, Error error) {
+            bool published = was_published (error);
+            result.fail (published ? "Image publication requires attention" : before_publication, error);
+            if (published) {
+                result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                result.actual_state = error.message;
+            }
+        }
+    }
+
+    internal struct ImagePartitionGeometry {
+        public uint number;
+        public uint64 offset;
+        public uint64 size;
+        public bool container;
+    }
+
+    internal class ImagePartitionLayout : Object {
+        public ImagePartitionGeometry[] partitions = {};
+        public bool has_table;
+        public string scheme = "";
+
+        public bool matches_discovery (StorageBlock disk, string[] kernel) {
+            var model = disk.table?.partitions ?? new StorageBlock[0];
+            if (kernel.length != partitions.length || model.length != partitions.length ||
+                (disk.table != null) != has_table || (disk.table?.scheme ?? "") != scheme) return false;
+            foreach (var expected in partitions) {
+                bool matched = false;
+                foreach (var part in model) {
+                    var partition = part.partition;
+                    if (part.available && partition != null && partition.number == expected.number &&
+                        partition.table_path == disk.path && partition.offset == expected.offset &&
+                        partition.container == expected.container && partition.table_size == expected.size &&
+                        (expected.container || part.size == expected.size) &&
+                        KernelStorageSafety.device_number (part.number) in kernel) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return false;
+            }
+            return true;
+        }
+
+        public static async ImagePartitionLayout inspect_async (int fd, uint64 size, Cancellable token) throws Error {
+            var context = MainContext.ref_thread_default ();
+            ImagePartitionLayout? layout = null;
+            Error? failure = null;
+            new Thread<void*>.try ("image-partitions", () => {
+                try { layout = inspect (fd, size); }
+                catch (Error error) { failure = error; }
+                var resume = new IdleSource ();
+                resume.set_callback (inspect_async.callback);
+                resume.attach (context);
+                return null;
+            });
+            yield;
+            token.set_error_if_cancelled ();
+            if (failure != null) throw failure;
+            return layout;
+        }
+
+        public static ImagePartitionLayout inspect (int fd, uint64 size) throws Error {
+            if (size < 512 || size > int64.MAX)
+                throw new IOError.INVALID_DATA ("The image capacity cannot be probed.");
+            var probe = new BlkidProbe ();
+            if (probe.set_device (fd, 0, (int64) size) != 0 || probe.enable_superblocks (0) != 0 ||
+                probe.enable_partitions (1) != 0)
+                throw new IOError.FAILED ("Could not prepare the image partition probe.");
+            var layout = new ImagePartitionLayout ();
+            int status = probe.safe_probe ();
+            if (status == 1) return layout;
+            if (status != 0) throw new IOError.INVALID_DATA ("The image partition table could not be identified.");
+            layout.has_table = true;
+            unowned string table_type;
+            if (probe.lookup_value ("PTTYPE", out table_type) != 0)
+                throw new IOError.INVALID_DATA ("The image partition table type could not be identified.");
+            layout.scheme = table_type;
+            unowned var list = probe.get_partitions ();
+            if (list == null || list.count () < 0 || list.count () > 4096)
+                throw new IOError.INVALID_DATA ("The image partition list could not be read.");
+            for (int i = 0; i < list.count (); i++) {
+                unowned var part = list.get_partition (i);
+                if (part == null || part.number () <= 0 || part.start () <= 0 || part.size () <= 0 ||
+                    (uint64) part.start () >= size / 512 ||
+                    (uint64) part.size () > size / 512 - (uint64) part.start ())
+                    throw new IOError.INVALID_DATA ("The image contains invalid partition geometry.");
+                layout.partitions += ImagePartitionGeometry () {
+                    number = (uint) part.number (), offset = (uint64) part.start () * 512,
+                    size = (uint64) part.size () * 512, container = part.is_extended () != 0
+                };
+            }
+            return layout;
         }
     }
 
@@ -294,6 +484,7 @@ namespace MajorisDisks {
             int output = -1;
             string? work = null;
             ImageOperationJournal? recovery = null;
+            bool published_uncertain = false;
             try {
                 Posix.Stat info = {};
                 string? original = image_identity (input);
@@ -315,6 +506,7 @@ namespace MajorisDisks {
                 if (free.has_attribute (FileAttribute.FILESYSTEM_FREE) &&
                     free.get_attribute_uint64 (FileAttribute.FILESYSTEM_FREE) < size)
                     throw new IOError.NO_SPACE ("The destination has insufficient free space for the image.");
+                var publication = new ImagePublication (path);
                 string directory = Path.build_filename (parent, ".majoris-" + Uuid.string_random ());
                 if (DirUtils.create (directory, 0700) != 0)
                     throw new IOError.FAILED ("Could not create a private image output directory.");
@@ -341,19 +533,24 @@ namespace MajorisDisks {
                 Posix.close (current);
                 if (!source_matches)
                     throw new IOError.INVALID_DATA ("The source changed while converting the image.");
+                var verified_output = ImagePublication.flush (output);
                 int closed = Posix.close (output);
                 output = -1;
                 if (closed != 0) throw new IOError.FAILED ("Could not close the verified image.");
                 token.set_error_if_cancelled ();
-                if (rename_without_replacement (CURRENT_DIRECTORY, temporary, CURRENT_DIRECTORY, path,
-                    NO_REPLACEMENT) != 0)
-                    throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));
+                publication.publish (temporary, verified_output);
+            } catch (Error error) {
+                published_uncertain = ImagePublication.was_published (error);
+                if (published_uncertain) recovery?.retain_publication (error);
+                throw error;
             } finally {
                 Posix.close (input);
                 if (output >= 0) Posix.close (output);
                 if (work != null) {
-                    FileUtils.unlink (Path.build_filename (work, "disk"));
-                    if (DirUtils.remove (work) == 0) recovery?.remove ();
+                    if (!published_uncertain) FileUtils.unlink (Path.build_filename (work, "disk"));
+                    if (DirUtils.remove (work) == 0) {
+                        if (!published_uncertain) recovery?.remove ();
+                    }
                     else warning ("Could not remove the private image work directory %s", work);
                 }
             }
@@ -381,32 +578,47 @@ namespace MajorisDisks {
             string? path = destination.get_path ();
             if (path == null || parent == null || bytes < 512 || bytes > int64.MAX)
                 throw new IOError.INVALID_ARGUMENT ("Choose a local file and a valid image capacity.");
+            var publication = new ImagePublication (path);
             var temporary = parent.get_child (".majoris-" + Uuid.string_random ());
             var output = yield temporary.create_async (FileCreateFlags.PRIVATE, Priority.DEFAULT, token);
             bool published = false;
+            bool uncertain = false;
+            ImageOperationJournal? recovery = null;
             try {
+                recovery = new ImageOperationJournal ("Create blank disk image", path,
+                    "Review the final path and private output " + temporary.get_parse_name () + ".");
                 var seekable = output as Seekable;
                 if (seekable == null || !seekable.can_truncate ())
                     throw new IOError.NOT_SUPPORTED ("The destination does not support sizing image files.");
                 seekable.truncate ((int64) bytes, token);
                 var descriptor = output as FileDescriptorBased;
-                if (descriptor == null || Posix.fsync (descriptor.get_fd ()) != 0)
-                    throw new IOError.FAILED ("Could not flush the blank image.");
-                yield output.close_async (Priority.DEFAULT, token);
-                var info = yield temporary.query_info_async (FileAttribute.STANDARD_SIZE,
-                    FileQueryInfoFlags.NOFOLLOW_SYMLINKS, Priority.DEFAULT, token);
-                if ((uint64) info.get_size () != bytes)
+                if (descriptor == null) throw new IOError.FAILED ("Could not identify the blank image.");
+                var verified = ImagePublication.flush (descriptor.get_fd ());
+                if ((uint64) verified.st_size != bytes)
                     throw new IOError.INVALID_DATA ("The new image has an unexpected size.");
+                yield output.close_async (Priority.DEFAULT, token);
                 if (token != null) token.set_error_if_cancelled ();
-                if (rename_without_replacement (CURRENT_DIRECTORY, temporary.get_path (), CURRENT_DIRECTORY,
-                    path, NO_REPLACEMENT) != 0)
-                    throw new IOError.FAILED ("Could not publish the blank image: " + Posix.strerror (Posix.errno));
+                publication.publish (temporary.get_path (), verified);
                 published = true;
+            } catch (Error error) {
+                uncertain = ImagePublication.was_published (error);
+                published = uncertain;
+                if (uncertain) recovery?.retain_publication (error);
+                throw error;
             } finally {
+                bool cleaned = published;
                 if (!published) {
-                    try { yield temporary.delete_async (Priority.DEFAULT, null); }
+                    if (!output.is_closed ()) {
+                        try { yield output.close_async (Priority.DEFAULT, null); }
+                        catch (Error error) { warning ("Could not close incomplete image: %s", error.message); }
+                    }
+                    try {
+                        yield temporary.delete_async (Priority.DEFAULT, null);
+                        cleaned = true;
+                    }
                     catch (Error error) { warning ("Could not delete incomplete image: %s", error.message); }
                 }
+                if (cleaned && !uncertain) recovery?.remove ();
             }
         }
 
@@ -593,6 +805,4 @@ namespace MajorisDisks {
     [CCode (cname = "RENAME_NOREPLACE", cheader_filename = "stdio.h")]
     internal extern const uint NO_REPLACEMENT;
 
-    [CCode (cname = "AT_FDCWD", cheader_filename = "fcntl.h")]
-    internal extern const int CURRENT_DIRECTORY;
 }

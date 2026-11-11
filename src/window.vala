@@ -1731,7 +1731,7 @@ namespace MajorisDisks {
                 if (attach) attach_image (destination, true, outcome.summary);
                 else notifications.add_toast (new Adw.Toast (outcome.summary));
             } catch (Error error) {
-                outcome.fail ("Could not convert the image", error);
+                ImagePublication.describe_failure (outcome, "Could not convert the image", error);
                 show_check_message (outcome.summary, error.message);
             } finally { backend.jobs.finish (job, outcome); }
         }
@@ -1864,7 +1864,7 @@ namespace MajorisDisks {
                         else attach_virtual (destination, true, outcome.summary);
                     }
                 } catch (Error error) {
-                    outcome.fail ("Could not write the virtual image", error);
+                    ImagePublication.describe_failure (outcome, "Could not write the virtual image", error);
                     show_check_message (outcome.summary, error.message);
                 }
                 backend.jobs.finish (job, outcome);
@@ -1891,7 +1891,10 @@ namespace MajorisDisks {
                             DiskImageCopy.create_blank.end (outcome);
                             notifications.add_toast (new Adw.Toast ("Blank disk image created"));
                             if (attach) attach_image (file, false, "Blank image created");
-                        } catch (Error error) { show_check_message ("Could not create blank image", error.message); }
+                        } catch (Error error) {
+                            show_check_message (ImagePublication.was_published (error) ?
+                                "Image publication requires attention" : "Could not create blank image", error.message);
+                        }
                     });
                 });
             });
@@ -4144,7 +4147,8 @@ namespace MajorisDisks {
             if (disk == null) throw new IOError.NOT_SUPPORTED ("The parent partition table is unavailable.");
             maximum = PartitionLayoutService.maximum_resize (disk, block);
             sector = disk.logical_sector_size;
-            current_row.subtitle = format_size (block.size);
+            uint64 current_size = PartitionLayoutService.partition_length (block);
+            current_row.subtitle = format_size (current_size);
             bool container = block.partition?.container == true;
             heading = container ? "Resize Extended Partition" : "Resize Volume";
             filesystem_type_row.title = container ? "Contents" : "Filesystem";
@@ -4154,7 +4158,7 @@ namespace MajorisDisks {
             range_row.subtitle = "Awaiting filesystem safety information";
             size_row.adjustment.lower = double.max (1, (double) disk.logical_sector_size / MIB);
             size_row.adjustment.upper = double.max (size_row.adjustment.lower, (double) maximum / MIB);
-            size_row.value = (double) block.size / MIB;
+            size_row.value = (double) current_size / MIB;
             filesystem_row.visible = block.filesystem != null && !container;
             filesystem_row.active = block.filesystem != null;
             size_row.notify["value"].connect (validate);
@@ -4197,7 +4201,8 @@ namespace MajorisDisks {
             }
         }
         private void validate () {
-            bool changed = new_size != block.size && new_size > 0 && new_size <= maximum;
+            bool changed = new_size != PartitionLayoutService.partition_length (block) &&
+                new_size > 0 && new_size <= maximum;
             set_response_enabled ("resize", false);
             uint generation = ++validation_generation;
             if (!changed) {

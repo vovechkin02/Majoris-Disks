@@ -470,3 +470,58 @@ sudo env MAJORIS_DISKS_RUN_IMAGING_TESTS=1 XDG_RUNTIME_DIR=/run/user/0 \
 
 Classify every result as **Passed**, **Failed**, **Skipped** or **Not executed**.
 An unexpected failure after a fixture starts is a failure.
+
+### Cross-subsystem release gate reruns
+
+Run block-device scenarios only in the disposable Debian 13 QEMU guest.
+Install the configured helpers, enable the UDisks Btrfs and LVM2 modules,
+and verify that Polkit, loop, device mapper, and NBD with partition support
+are available. Run the destructive cases serially. The test binary and
+scripts must be readable and executable by the fixture account.
+
+```sh
+meson setup build
+meson compile -C build
+sudo meson install -C build --no-rebuild
+meson test -C build --print-errorlogs
+
+sudo env MAJORIS_DISKS_RUN_LOOP_TESTS=1 MAJORIS_DISKS_RUN_IMAGING_TESTS=1 \
+  XDG_RUNTIME_DIR=/run/user/0 meson test -C build --no-rebuild --print-errorlogs \
+  --num-processes 1 disposable-loop-integration 'disposable-*-restore*' \
+  'disposable-*-imaging-integration' disposable-xz-integration \
+  disposable-partition-image-integration disposable-partition-xz-integration \
+  'disposable-interrupted-*-backup' disposable-nbd-integration \
+  'disposable-nbd-*-termination' disposable-nbd-restore-target-loss \
+  image-publication-directory-sync image-partition-discovery-delay \
+  interrupted-virtual-image-conversion virtual-image-conversion-crash-recovery
+
+sudo env MAJORIS_TEST_LUKS=1 MAJORIS_TEST_LUKS_RESIZE=1 MAJORIS_TEST_LUKS_RESTORATION=1 \
+  meson test -C build --no-rebuild --print-errorlogs --num-processes 1 \
+  --timeout-multiplier 3 luks-header-integration luks-resize-integration \
+  luks-partition-resize-integration luks-mapping-restoration-integration
+
+sudo env MAJORIS_DISKS_RUN_BTRFS_PROFILE_TESTS=1 \
+  meson test -C build --no-rebuild --print-errorlogs --num-processes 1 \
+  'btrfs-profile-conversion-*'
+```
+
+- For the partition baseline, preserve the original 90 MiB request and its
+  80 MiB backend limit in the test record. The revised fixture checks kernel
+  starts and lengths and hashes the MBR partition prefixes before and after
+  supported growth. Check the planner's rejection tests in `storage-model`.
+- During RAW/XZ restore cancellation, the fixture reads the backing file
+  independently before cancelling and checks the original tail after the
+  backend stops. The source-disappearance case moves the source path after
+  the first observed write. A lost rescan reply must leave one dispatch and
+  a recovery record even when written bytes match.
+- In the directory-sync fault test, compare final inode contents and verify
+  that an existing destination survives. In the crash test, inspect the
+  printed state and work directory before cleaning the owned fixture.
+- Exporter interruption pins the fixture process by PID descriptor before
+  termination. The target-loss case reads the first written bytes through
+  the block device before terminating the exporter. The client-termination test requires an active foreground
+  client. An established netlink mapping can have an exited setup process.
+- For remaining live cases, capture the kernel disk sequence, backing
+  inode, UDisks owner and object paths, attachment token, mount state,
+  outcome and readback before releasing owned resources. Keep resources
+  and evidence when their ownership or terminal state is uncertain.

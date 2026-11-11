@@ -712,3 +712,66 @@ requires native member metadata, expected roles and final kernel health.
 The default Debian 13 suite passes with opt-in skips. The live bitmap result
 applies to the tested portable version 4 internal bitmap. The mdraid definitions
 use MDRAID-01 through MDRAID-05 without renumbering established STOR entries.
+
+### Cross-subsystem release gates — 12 November 2026
+
+The acceptance guest was a temporary snapshot of the dedicated
+`majoris-mdraid-test` Debian 13.7 QEMU guest with kernel
+`6.12.115+deb13.1-amd64`, UDisks 2.10.1 and btrfs-progs 6.14. UDisks and
+Polkit were active. The Btrfs module needed to be enabled after boot.
+The GNOME Disks archive was consulted for resize, dependency preparation,
+loop setup, imaging cancellation and restore rescan. The changes use
+Majoris' existing service, job, journal and helper paths.
+
+| Area | Classification | Gate and evidence |
+|---|---|---|
+| GPT/MBR resize | Implemented and execution-tested | The original `disposable-loop-integration` returned 1. It asked UDisks to grow a populated MBR extended partition to 94,371,840 bytes and received an 83,886,080-byte maximum. The 128 MiB fixture used 512-byte sectors, an extended entry starting at sector 49,152 with length 163,840, and a logical child starting at 53,248. Majoris now distinguishes table length from block-device capacity, applies the populated-container cap, and verifies post-resize identity and geometry. The corrected backend fixture returned 0 for GPT ext4 growth/shrink, MBR primary growth and logical growth within the container. Starts, capacities, ext4 checks and the original MBR partition prefixes were checked. The populated-container growth restriction is intentional on the tested backend. |
+| LUKS header restore and dependencies | Implemented and execution-tested | The historical failure remains recorded as a busy-device/dependent-storage refusal. An exclusive open on an intentionally busy fixture was a correct rejection. The exact historical service dependency was not captured. The new baseline reached service restore and timed out at 300 s. The fixture now checks both kernel holders and UDisks' cleartext path before service restore. The header, mapping resize, partition-backed resize and mapping restoration targets passed with the longer QEMU timeout. |
+| Btrfs profile conversion | Implemented and execution-tested | The earlier protected-member refusal is preserved. A fresh baseline without the Btrfs module failed because the volume interface was missing. Enabling the module let the unmodified data test pass. The updated fixture waits for the exact filesystem UUID and non-system hint for each owned member, then verifies the resulting profiles and payload checksum. All 16 profile targets passed, including the protected-member refusal. The earlier protected-member diagnostic did not reproduce in the prepared guest, so its exact dependency cause remains unresolved. |
+| Loop and NBD discovery | Implemented and execution-tested | Bounded content probing supplies expected partition numbers, starts and lengths. The app reconciles those with kernel children, UDisks parentage and device identity, independently of filesystem recognition. Live RAW, GPT, MBR, blank QCOW2 and partitioned NBD lifecycle fixtures passed. The model test exercises delayed kernel and UDisks publication, wrong parent, mismatched device number and a disappearing child. Delays and reuse during live discovery remain unverified. |
+| Image publication | Implemented and execution-tested | RAW, XZ, sparse and QEMU output use the shared descriptor-based publication path. It flushes the file, verifies the source entry, uses a no-replacement rename, synchronizes the destination and work directories, and checks the final inode. Injected directory-sync failure leaves the published file in place and reports that durability requires attention. The test also verifies preservation of an existing destination. |
+| Partial block restore | Implemented and execution-tested | RAW and XZ cancellation tests observed actual writes. Readback confirmed the new head and original tail, and the recovery record survived the failed operation. Moving the RAW source path after an observed target write preserved the verified bytes and produced an attention result. Killing an owned NBD exporter after independent readback of the first target bytes produced a partial restore. The lost-rescan fixture let the real rescan execute, dropped its reply, checked exactly one dispatch and read back the restored data. |
+| Interrupted output and restart | Partially implemented | Live RAW and XZ backup interruption left no published output. QEMU conversion cancellation and abrupt application exit before publication were exercised. A new process recovered the conversion record. Power loss, crash after rename, and the full write/flush/verification failure matrix remain unverified. |
+| Interrupted NBD and UDisks restart | Partially implemented | The verified exporter termination fixture produced a real read error and confirmed safe teardown or an empty kernel device. NBD attach/detach reply-loss paths reconcile ownership evidence without replaying requests. A live foreground-client kill needs an ioctl-mode client. UDisks daemon restart during image discovery and lost loop replies remain unverified. |
+
+The geometry, publication and interruption cases are described in
+[the manual test register](../tests/MANUAL-TESTING.md#cross-subsystem-release-gate-reruns).
+Backend semantics are documented in the
+[UDisks partition API](https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Partition.html)
+and [Linux fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html).
+
+The original QEMU baseline used `meson test -C build --no-rebuild
+--print-errorlogs --num-processes 1 disposable-loop-integration
+luks-header-integration btrfs-profile-conversion-data` with the repository's
+three opt-in variables enabled. The raw original output and subsequent
+diagnostics are in `build/release-gates-baseline.log`,
+`build/release-gates-enabled-baseline.log`, and
+`build/release-gates-original-partition.log`.
+
+| QEMU opt-in execution | Passed | Failed | Skipped | Notes |
+|---|---:|---:|---:|---|
+| Partition fixture, final repeated rerun | 3 | 0 | 0 | An intermediate run lost the extended partition's UDisks object after deleting the logical child. The fixture now waits for the expected parent and partition object before the next deletion. |
+| LUKS header, resize and mapping restoration | 4 | 0 | 0 | Header target took 305.95 s with a longer QEMU timeout. The previous 300 s timeout remains in the baseline record. |
+| Btrfs profile conversion, replacement, traditional quota and scrub | 19 | 0 | 0 | Includes profile restart, continuation, protected members and fault injection. |
+| Filesystem capacity, storage model, GtkBuilder and mdraid | 5 | 0 | 0 | Includes RAID1 reconstruction and bitmap-assisted member re-addition. |
+| LVM recovery | 1 | 1 | 0 | The combined run followed the UDisks restart case and lacked the keeper LV's UDisks properties. The same fixture passed in isolation after re-enabling the LVM2 module. |
+| Native QEMU imaging and partition Meson matrix | 26 | 0 | 1 | Includes a lost rescan reply, both cancelled physical restores, interruption and crash evidence, and NBD exporter faults during attachment use and after a target write. The active Debian netlink mapping had no foreground NBD client to terminate. |
+| Native QEMU build and default Meson suite | 17 | 0 | 110 | Debian 13.7 with QEMU 10.0.13, GLib 2.84.4, GTK 4.18.6, libadwaita 1.7.6, Meson 1.7.0, Vala 0.56.18 and Polkit 126. The default suite leaves the destructive opt-ins disabled. |
+| Final QEMU conversion and attachment rerun | 6 | 0 | 0 | Native rebuild and retest after moving conversion source identity revalidation immediately before publication. |
+
+The tested publication and discovery gates are resolved for the exercised
+paths. The historical LUKS and Btrfs diagnostics lack a complete dependency
+snapshot. Remaining unexecuted gates include loss of a loop setup/delete
+reply, live kernel-number reuse during discovery, daemon restart during
+imaging, and crash durability after an actual guest power loss.
+
+Production changes are in `src/blkid.vapi`, `src/device.vala`,
+`src/layout.vala`, `src/filesystem-resize.vala`,
+`src/udisks-service.vala`, `src/disk-image-copy.vala`,
+`src/virtual-disk.vala`, `src/virtual-disk-attachment.vala` and
+`src/window.vala`. Test changes are in `meson.build`,
+`tests/disposable-loop-integration.sh`, `tests/luks-header-integration.sh`,
+`tests/btrfs-profile-conversion-integration.sh`,
+`tests/image-device-test.vala`, `tests/mdraid-dbus-faults.c` and
+`tests/storage-model-test.vala`. The existing restricted helpers, Polkit
+rules, GtkBuilder templates and theme continue to govern these workflows.

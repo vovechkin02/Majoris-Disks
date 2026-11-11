@@ -253,6 +253,7 @@ namespace MajorisDisks {
                 part.uuid = property (object_proxy, "Partition", "UUID")?.get_string () ?? "";
                 part.number = property (object_proxy, "Partition", "Number")?.get_uint32 () ?? 0;
                 part.offset = property (object_proxy, "Partition", "Offset")?.get_uint64 () ?? 0;
+                part.table_size = property (object_proxy, "Partition", "Size")?.get_uint64 () ?? 0;
                 part.flags = property (object_proxy, "Partition", "Flags")?.get_uint64 () ?? 0;
                 part.container = property (object_proxy, "Partition", "IsContainer")?.get_boolean () ?? false;
                 part.logical = property (object_proxy, "Partition", "IsContained")?.get_boolean () ?? false;
@@ -821,7 +822,8 @@ namespace MajorisDisks {
             }
         }
 
-        private async int open_block (StorageBlock block, string mode, int flags, Cancellable token) throws Error {
+        private async int open_block (StorageBlock block, string mode, int flags, Cancellable token,
+            VirtualAttachment? discovery = null) throws Error {
             uint64 number = block.number;
             string identity = modification_identity (block);
             var proxy = require_volume (block, "Block");
@@ -851,7 +853,9 @@ namespace MajorisDisks {
                 if ((flags & DIRECT_IO) != 0 && (access & DIRECT_IO) == 0)
                     throw new IOError.NOT_SUPPORTED ("UDisks did not provide a direct-I/O descriptor. Use Buffered I/O for this device.");
                 synchronize ();
-                if (require_volume (block, "Block") != proxy || modification_identity (block) != identity)
+                if (require_volume (block, "Block") != proxy ||
+                    (discovery == null ? modification_identity (block) != identity :
+                        VirtualDiskAttachment.lookup (block.device)?.token != discovery.token))
                     throw new IOError.NOT_FOUND ("The selected block device changed.");
                 return fd;
             } catch (Error error) { Posix.close (fd); throw error; }
@@ -902,6 +906,7 @@ namespace MajorisDisks {
             verify |= compress;
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The image source changed after confirmation.");
+            var publication = new ImagePublication (path);
             string work = Path.build_filename (directory.get_path (), ".majoris-" + Uuid.string_random ());
             string temporary = Path.build_filename (work, "disk");
             locks.acquire (block, snapshot.dependencies);
@@ -914,6 +919,7 @@ namespace MajorisDisks {
             ImageOperationJournal? recovery = null;
             bool work_created = false;
             bool temporary_created = false;
+            bool published_uncertain = false;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Checking the destination");
                 var token = job.cancellable;
@@ -991,18 +997,23 @@ namespace MajorisDisks {
                 int input_closed = Posix.close (input);
                 input = -1;
                 if (input_closed != 0) throw new IOError.FAILED ("Could not close the source device.");
+                var verified_output = ImagePublication.flush (output);
                 int close_status = Posix.close (output);
                 output = -1;
                 if (close_status != 0) throw new IOError.FAILED ("Could not close the image.");
                 token.set_error_if_cancelled ();
-                if (rename_without_replacement (CURRENT_DIRECTORY, temporary, CURRENT_DIRECTORY, path, NO_REPLACEMENT) != 0)
-                    throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));
+                publication.publish (temporary, verified_output);
                 temporary_created = false;
                 outcome.successful = true;
                 outcome.summary = verify ? "Disk image created and verified" : "Disk image created without readback verification";
                 jobs.finish (job, outcome);
             } catch (Error error) {
-                outcome.fail ("Disk image was not created", error);
+                published_uncertain = ImagePublication.was_published (error);
+                if (published_uncertain) {
+                    temporary_created = false;
+                    recovery?.retain_publication (error);
+                }
+                ImagePublication.describe_failure (outcome, "Disk image was not created", error);
                 jobs.finish (job, outcome);
                 throw error;
             } finally {
@@ -1011,7 +1022,9 @@ namespace MajorisDisks {
                 if (temporary_created && FileUtils.unlink (temporary) != 0)
                     warning ("Could not remove incomplete image %s", temporary);
                 if (work_created) {
-                    if (DirUtils.remove (work) == 0) recovery?.remove ();
+                    if (DirUtils.remove (work) == 0) {
+                        if (!published_uncertain) recovery?.remove ();
+                    }
                     else warning ("Could not remove the private image work directory %s", work);
                 }
                 lifetime.disconnect (disconnected);
@@ -1154,6 +1167,10 @@ namespace MajorisDisks {
                 }
                 target = yield open_block (block, "rw", Posix.O_EXCL | Posix.O_CLOEXEC | Posix.O_SYNC, token);
                 token.set_error_if_cancelled ();
+                string target_sector;
+                string target_disk = MdRaidKernelState.physical_device (block, out target_sector);
+                uint64 target_number = block.number;
+                if (target_disk == "") throw new IOError.NOT_FOUND ("The target disk sequence could not be verified.");
                 int current_source = VirtualDisk.open_image (source);
                 bool source_matches = source_identity == image_identity (input) &&
                     source_identity == image_identity (current_source);
@@ -1180,6 +1197,14 @@ namespace MajorisDisks {
                 target = -1;
                 if (closed != 0) throw new IOError.FAILED ("Could not close the target device.");
                 state.descriptor_closed = true;
+                state.phase = ImageWritePhase.RECONCILING;
+                current_source = VirtualDisk.open_image (source);
+                source_matches = source_identity == image_identity (input) &&
+                    source_identity == image_identity (current_source);
+                Posix.close (current_source);
+                if (!source_matches) throw new IOError.INVALID_DATA ("The source image changed while writing the target.");
+                synchronize ();
+                require_restored_target (block, target_number, target_disk, capacity);
                 state.phase = ImageWritePhase.RESCANNING;
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.FINALIZING, "Refreshing target storage metadata");
@@ -1187,6 +1212,7 @@ namespace MajorisDisks {
                 yield state.rescan (proxy, lifetime);
                 synchronize ();
                 require_volume (block, "Block");
+                require_restored_target (block, target_number, target_disk, capacity);
                 state.model_refreshed = true;
                 state.phase = ImageWritePhase.COMPLETED;
                 result.successful = true;
@@ -1214,6 +1240,15 @@ namespace MajorisDisks {
                 jobs.finish (job, result);
             }
             return result;
+        }
+
+        private void require_restored_target (StorageBlock block, uint64 number, string disk_identity, uint64 capacity)
+            throws Error {
+            string sector;
+            if (snapshot.blocks.lookup (block.path) != block || !block.available || block.number != number ||
+                MdRaidKernelState.physical_device (block, out sector) != disk_identity ||
+                KernelStorageSafety.block_capacity (block) != capacity)
+                throw new IOError.NOT_FOUND ("The original target device could not be verified.");
         }
 
         internal void require_detached_image (int fd) throws Error {
@@ -1256,6 +1291,10 @@ namespace MajorisDisks {
                 if (!Posix.S_ISREG (info.st_mode) || info.st_size < 512)
                     throw new IOError.INVALID_DATA ("The selected image is not a usable regular file.");
                 require_raw_image (fd, (uint64) info.st_size);
+                string? reviewed_image = image_identity (fd);
+                var layout = yield ImagePartitionLayout.inspect_async (fd, (uint64) info.st_size, lifetime);
+                if (reviewed_image == null || image_identity (fd) != reviewed_image)
+                    throw new IOError.INVALID_DATA ("The image changed during partition inspection.");
                 string backing = FileUtils.read_link ("/proc/self/fd/%d".printf (fd));
                 synchronize ();
                 foreach (var existing in snapshot.blocks.get_values ()) {
@@ -1281,6 +1320,7 @@ namespace MajorisDisks {
                 if (!reply.is_of_type (new VariantType ("(o)")))
                     throw new IOError.INVALID_DATA ("UDisks did not return a loop object.");
                 string attached = reply.get_child_value (0).get_string ();
+                string diagnostic = "UDisks did not expose the verified loop device.";
                 for (int attempt = 0; attempt < 50; attempt++) {
                     synchronize ();
                     var block = snapshot.blocks.lookup (attached);
@@ -1289,21 +1329,25 @@ namespace MajorisDisks {
                         string kernel_backing;
                         FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (block.number) +
                             "/loop/backing_file", out kernel_backing);
-                        string diagnostic;
+                        Posix.Stat current_source = {};
+                        if (Posix.lstat (backing, out current_source) != 0 || current_source.st_dev != info.st_dev ||
+                            current_source.st_ino != info.st_ino || image_identity (fd) != reviewed_image)
+                            throw new IOError.INVALID_DATA ("The original loop image changed during discovery.");
                         if (kernel_backing != backing + "\n" || block.loop.sequence == "" ||
-                            !image_partitions_discovered (block, out diagnostic)) {
-                            yield settle_delay (lifetime);
+                            !image_partitions_discovered (block, layout, out diagnostic)) {
+                            yield image_discovery_delay (lifetime);
                             continue;
                         }
                         block.loop.verified_sequence = block.loop.sequence;
                         outcome.successful = true;
-                        outcome.summary = "Disk image attached";
+                        outcome.summary = layout.has_table ? "Disk image attached" : "Unpartitioned disk image attached";
                         jobs.finish (job, outcome);
                         return attached;
                     }
-                    yield settle_delay (lifetime);
+                    yield image_discovery_delay (lifetime);
                 }
-                throw new IOError.TIMED_OUT ("The image may be attached, but the loop object could not be verified. Refresh before retrying.");
+                throw new IOError.TIMED_OUT ("The image may be attached, but discovery is incomplete. %s Refresh before retrying."
+                    .printf (diagnostic));
             } catch (Error error) {
                 outcome.fail ("Could not verify attachment", error);
                 string? remote = DBusError.get_remote_error (error);
@@ -1321,6 +1365,7 @@ namespace MajorisDisks {
             var outcome = new StorageOperationResult ();
             VirtualAttachment? record = null;
             try {
+                var lifetime = backend_lifetime;
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.RUNNING, "Inspecting and authorizing the virtual disk");
                 record = yield VirtualDiskAttachment.attach (source, read_only, job.cancellable);
@@ -1328,6 +1373,8 @@ namespace MajorisDisks {
                 jobs.phase (job, StorageJobState.FINALIZING, "Waiting for UDisks discovery");
                 string path = "/org/freedesktop/UDisks2/block_devices/nbd%u".printf (record.index);
                 string discovery = "UDisks did not expose the verified NBD block device.";
+                ImagePartitionLayout? layout = null;
+                string? probed_identity = null;
                 for (int attempt = 0; attempt < 75; attempt++) {
                     synchronize ();
                     var block = snapshot.blocks.lookup (path);
@@ -1337,36 +1384,71 @@ namespace MajorisDisks {
                         if (Posix.stat (block.device, out device_info) != 0 || !Posix.S_ISBLK (device_info.st_mode) ||
                             (uint64) device_info.st_rdev != block.number)
                             throw new IOError.INVALID_DATA ("The UDisks object does not match the connected NBD device.");
-                        if (image_partitions_discovered (block, out discovery)) {
+                        string sequence;
+                        FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (block.number) +
+                            "/diskseq", out sequence);
+                        if (sequence.strip () == "")
+                            throw new IOError.INVALID_DATA ("The NBD disk sequence could not be verified.");
+                        string identity = "%s:%s:%s".printf (block.number.to_string (), sequence.strip (), record.token);
+                        if (layout == null) {
+                            int fd = yield open_block (block, "r", Posix.O_CLOEXEC | Posix.O_NONBLOCK, lifetime, record);
+                            try { layout = yield ImagePartitionLayout.inspect_async (fd, record.capacity, lifetime); }
+                            finally { Posix.close (fd); }
+                            probed_identity = identity;
+                            continue;
+                        }
+                        if (identity != probed_identity)
+                            throw new IOError.INVALID_DATA ("The NBD block identity changed during partition discovery.");
+                        if (image_partitions_discovered (block, layout, out discovery)) {
+                            if (!VirtualDiskAttachment.exporter_running (record))
+                                throw new IOError.FAILED ("The QEMU exporter exited during partition discovery.");
                             outcome.successful = true;
-                            outcome.summary = "Virtual disk attached";
+                            outcome.summary = layout.has_table ? "Virtual disk attached" : "Unpartitioned virtual disk attached";
                             jobs.finish (job, outcome);
                             return path;
                         }
                     }
-                    yield settle_delay (backend_lifetime);
+                    yield image_discovery_delay (lifetime);
                 }
                 throw new IOError.TIMED_OUT ("The managed kernel mapping was retained. %s Refresh before retrying."
                     .printf (discovery));
             } catch (Error error) {
                 outcome.fail ("Virtual attachment did not complete", error);
-                if (record != null || error is VirtualAttachmentError.UNCERTAIN)
+                if (record != null || error is VirtualAttachmentError.UNCERTAIN) {
                     outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    outcome.actual_state = error.message;
+                }
                 jobs.finish (job, outcome);
                 throw error;
             }
         }
 
-        private bool image_partitions_discovered (StorageBlock disk, out string diagnostic) throws Error {
+        private async void image_discovery_delay (Cancellable token) throws Error {
+            var timeout = new TimeoutSource (200);
+            var ready = new IdleSource ();
+            ulong update = changed.connect (() => {
+                if (ready.get_context () == null) ready.attach (MainContext.ref_thread_default ());
+            });
+            ready.set_callback (image_discovery_delay.callback);
+            timeout.set_callback (image_discovery_delay.callback);
+            timeout.attach (MainContext.ref_thread_default ());
+            yield;
+            disconnect (update);
+            timeout.destroy ();
+            ready.destroy ();
+            token.set_error_if_cancelled ();
+        }
+
+        private bool image_partitions_discovered (StorageBlock disk, ImagePartitionLayout layout, out string diagnostic)
+            throws Error {
             var kernel = KernelStorageSafety.partition_numbers (KernelStorageSafety.device_number (disk.number));
             var model = disk.table?.partitions ?? new StorageBlock[0];
-            diagnostic = "Kernel partitions on %s: [%s]. UDisks partition count: %d.".printf (
-                disk.device, string.joinv (",", kernel), model.length);
-            if (kernel.length != model.length) return false;
+            diagnostic = "Expected %d partitions on %s. Kernel: [%s]. UDisks count: %d.".printf (
+                layout.partitions.length, disk.device, string.joinv (",", kernel), model.length);
+            if (!layout.matches_discovery (disk, kernel)) return false;
             foreach (var part in model) {
-                if (!part.available || part.partition?.table_path != disk.path ||
-                    !(KernelStorageSafety.device_number (part.number) in kernel))
-                    return false;
+                try { KernelStorageSafety.require_partition_geometry (part, disk); }
+                catch (Error error) { diagnostic = error.message; return false; }
             }
             return true;
         }
@@ -7096,7 +7178,7 @@ namespace MajorisDisks {
             if (!eligibility.allowed || eligibility.requires_preparation &&
                 StorageSafetyService.assess (block, snapshot.dependencies).active_dependents)
                 throw new IOError.BUSY (eligibility.reason);
-            bool shrinking = new_size < block.size;
+            bool shrinking = new_size < PartitionLayoutService.partition_length (block);
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The volume changed after confirmation.");
             var result = new StorageOperationResult ();
@@ -7110,6 +7192,9 @@ namespace MajorisDisks {
                 string partition_uuid = part.uuid;
                 uint64 partition_offset = part.offset;
                 uint64 device_number = block.number;
+                string resize_sector;
+                string resize_disk_identity = MdRaidKernelState.physical_device (disk, out resize_sector);
+                string resize_scheme = disk.table.scheme;
                 DBusProxy? filesystem = null;
                 FilesystemCapacityMeasurement? offline_measurement = null;
                 Error? offline_measurement_error = null;
@@ -7194,7 +7279,8 @@ namespace MajorisDisks {
                     yield partition.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed ("Partition shrunk");
-                    yield wait_for_size (block, new_size, token);
+                    yield wait_for_partition_resize (block, disk, new_size, partition_uuid, partition_offset,
+                        device_number, resize_disk_identity, resize_scheme, token);
                 } else {
                     validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                     if (plan.online) yield KernelStorageSafety.require_no_holders (block, token);
@@ -7204,7 +7290,8 @@ namespace MajorisDisks {
                     yield partition.call ("Resize", new Variant.tuple ({ new Variant.uint64 (new_size), options.end () }),
                         DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, token);
                     result.completed (shrinking ? "Partition shrunk" : "Partition grown");
-                    yield wait_for_size (block, new_size, token);
+                    yield wait_for_partition_resize (block, disk, new_size, partition_uuid, partition_offset,
+                        device_number, resize_disk_identity, resize_scheme, token);
                     if (resize_filesystem) {
                         validate_resize_target (block, disk, partition_uuid, partition_offset, device_number);
                         if (plan.online) yield KernelStorageSafety.require_no_holders (block, token);
@@ -7375,6 +7462,25 @@ namespace MajorisDisks {
             var safety = StorageSafetyService.assess (block, snapshot.dependencies);
             if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents)
                 throw new IOError.BUSY ("The dependency or kernel-use state changed during resizing.");
+        }
+
+        private async void wait_for_partition_resize (StorageBlock block, StorageBlock disk, uint64 expected,
+            string uuid, uint64 offset, uint64 number, string disk_identity, string scheme,
+            Cancellable token) throws Error {
+            string sector;
+            for (int attempt = 0; attempt < 50; attempt++) {
+                synchronize ();
+                validate_resize_target (block, disk, uuid, offset, number);
+                if (disk.table.scheme != scheme || MdRaidKernelState.physical_device (disk, out sector) != disk_identity)
+                    throw new IOError.NOT_FOUND ("The parent disk changed during resize verification.");
+                if (block.partition.table_size == expected && (block.partition.container || block.size == expected)) {
+                    KernelStorageSafety.require_partition_geometry (block, disk);
+                    PartitionLayoutService.validate_resize (disk, block, expected);
+                    return;
+                }
+                yield settle_delay (token);
+            }
+            throw new IOError.TIMED_OUT ("The resized partition geometry could not be verified.");
         }
 
         public async StorageOperationResult update_partition_metadata (StorageBlock block, string type,

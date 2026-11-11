@@ -34,19 +34,23 @@ g_dbus_proxy_call (GDBusProxy *proxy, const gchar *method, GVariant *parameters,
 {
     Call original = (Call) dlsym (RTLD_NEXT, "g_dbus_proxy_call");
     const char *mode = g_getenv ("MAJORIS_MDRAID_DBUS_FAULT");
-    if (!mode || strcmp (method, "AddDevice") != 0 ||
-        g_strcmp0 (g_dbus_proxy_get_interface_name (proxy), "org.freedesktop.UDisks2.MDRaid") != 0) {
+    const char *interface = g_dbus_proxy_get_interface_name (proxy);
+    gboolean image_rescan = g_getenv ("MAJORIS_IMAGE_DBUS_FAULT") != NULL &&
+        g_str_equal (method, "Rescan") && g_strcmp0 (interface, "org.freedesktop.UDisks2.Block") == 0;
+    gboolean raid_add = mode != NULL && g_str_equal (method, "AddDevice") &&
+        g_strcmp0 (interface, "org.freedesktop.UDisks2.MDRaid") == 0;
+    if (!image_rescan && !raid_add) {
         original (proxy, method, parameters, flags, timeout, cancel, callback, data);
         return;
     }
-    const char *log = g_getenv ("MAJORIS_MDRAID_DISPATCH_LOG");
+    const char *log = g_getenv (image_rescan ? "MAJORIS_IMAGE_DISPATCH_LOG" : "MAJORIS_MDRAID_DISPATCH_LOG");
     if (log) {
         FILE *file = fopen (log, "a");
-        if (file) { fputs ("AddDevice\n", file); fclose (file); }
+        if (file) { fprintf (file, "%s\n", method); fclose (file); }
     }
     GTask *task = g_task_new (proxy, cancel, callback, data);
     g_task_set_source_tag (task, &tag);
-    if (strcmp (mode, "before") == 0) {
+    if (raid_add && g_str_equal (mode, "before")) {
         g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
                                 "Injected timeout before dispatch");
         g_object_unref (task);

@@ -202,10 +202,26 @@ imaging_test = executable('image-device-test', 'tests/image-device-test.vala', s
   dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
 test('disposable-imaging-integration', imaging_test, timeout: 180)
 test('disposable-xz-integration', imaging_test, args: ['--xz'], timeout: 180)
+test('image-publication-directory-sync', imaging_test, args: ['--publication'])
+test('image-partition-discovery-delay', imaging_test, args: ['--discovery-race'])
+test('disposable-partial-raw-restore', imaging_test, args: ['--partial'], timeout: 180)
+test('disposable-partial-xz-restore', imaging_test, args: ['--partial', '--xz'], timeout: 180)
+test('disposable-image-restore-source-disappearance', imaging_test,
+  args: ['--partial', '--disappear-source'], timeout: 180)
+test('disposable-interrupted-raw-backup', imaging_test, args: ['--interrupt-backup'], timeout: 180)
+test('disposable-interrupted-xz-backup', imaging_test, args: ['--interrupt-backup', '--xz'], timeout: 180)
+test('interrupted-virtual-image-conversion', imaging_test, args: ['--interrupt-conversion'], timeout: 180)
+test('virtual-image-conversion-crash-recovery', imaging_test, args: ['--conversion-crash'], timeout: 180)
+test('disposable-image-restore-lost-rescan-reply', imaging_test, args: ['--lost-rescan'],
+  env: ['LD_PRELOAD=' + mdraid_dbus_faults.full_path(), 'MAJORIS_IMAGE_DBUS_FAULT=1'],
+  depends: mdraid_dbus_faults, timeout: 180)
 test('disposable-partition-image-integration', imaging_test, args: ['--partition'], timeout: 180)
 test('disposable-partition-xz-integration', imaging_test, args: ['--partition', '--xz'], timeout: 180)
 test('disposable-mbr-image-restore', imaging_test, args: ['--partition', '--mbr'], timeout: 180)
 test('disposable-nbd-integration', imaging_test, args: ['--nbd'], timeout: 300)
+test('disposable-nbd-exporter-termination', imaging_test, args: ['--nbd', '--kill-exporter'], timeout: 180)
+test('disposable-nbd-client-termination', imaging_test, args: ['--nbd', '--kill-client'], timeout: 180)
+test('disposable-nbd-restore-target-loss', imaging_test, args: ['--nbd', '--lose-target'], timeout: 180)
 test('virtual-image-growth', imaging_test, args: ['--grow'], timeout: 120)
 test('virtual-image-conversion', imaging_test, args: ['--convert'], timeout: 180)
 foreach format : ['qcow2', 'vhd', 'vhdx']
