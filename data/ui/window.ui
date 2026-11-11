@@ -4,6 +4,7 @@
     <item><attribute name="label">Create LVM Volume Group…</attribute><attribute name="action">win.create-vg</attribute></item>
     <item><attribute name="label">Create RAID Array…</attribute><attribute name="action">win.create-raid</attribute></item>
     <item><attribute name="label">Inspect or Convert Image…</attribute><attribute name="action">app.virtual-image</attribute></item>
+      <item><attribute name="label">Verify Disk Image…</attribute><attribute name="action">app.verify-image</attribute></item>
     <item><attribute name="label">Attach Disk Image…</attribute><attribute name="action">app.attach-image</attribute></item>
     <item><attribute name="label">Create Blank Disk Image…</attribute><attribute name="action">app.blank-image</attribute></item>
     <item><attribute name="label">Preferences</attribute><attribute name="action">app.preferences</attribute></item>

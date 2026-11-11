@@ -600,6 +600,14 @@ namespace MajorisDisks {
 
     public class StorageLoopDevice : Object {
         public string backing_file = "";
+        internal string sequence = "";
+        internal string verified_sequence = "";
+        internal uint setup_uid;
+
+        internal bool managed () {
+            return backing_file != "" && sequence != "" &&
+                (sequence == verified_sequence || (setup_uid != 0 && setup_uid == Posix.getuid ()));
+        }
     }
 
     public class StorageFreeSpace : StorageDevice {

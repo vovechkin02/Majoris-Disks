@@ -35,8 +35,12 @@ namespace MajorisDisks {
             string partitions;
             try {
                 FileUtils.get_contents ("/sys/module/nbd/parameters/max_part", out partitions);
-                if (partitions.strip () == "0") return "The NBD module has partition discovery disabled.";
-            } catch (Error error) {}
+                uint maximum;
+                if (!uint.try_parse (partitions.strip (), out maximum) || maximum == 0)
+                    return "The NBD module has partition discovery disabled.";
+            } catch (Error error) {
+                return "Could not verify partition scanning support in the loaded NBD module.";
+            }
             bool helper_installed = false;
             foreach (var data in Environment.get_system_data_dirs ()) {
                 if (FileUtils.test (Path.build_filename (data, "dbus-1", "system-services", BUS + ".service"),
@@ -208,6 +212,10 @@ namespace MajorisDisks {
                 var inspected = yield VirtualDisk.inspect_fd (fd, token);
                 if (inspected.format == "raw")
                     throw new IOError.NOT_SUPPORTED ("Attach raw images through the loop-device workflow.");
+                if (inspected.has_snapshots)
+                    throw new IOError.NOT_SUPPORTED ("Attach a self-contained image without internal snapshots.");
+                if (!read_only && inspected.format != "qcow2")
+                    throw new IOError.NOT_SUPPORTED ("Writable attachment is supported for QCOW2 images.");
                 if (original == null || original != image_identity (fd))
                     throw new IOError.INVALID_DATA ("The selected image changed during inspection.");
                 string id = Uuid.string_random ();

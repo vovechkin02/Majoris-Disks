@@ -184,7 +184,7 @@ namespace MajorisDisks {
             if (!block.available || block.ignored) return;
             var fs = block.filesystem;
             mount = fs != null && !fs.mounted;
-            var safety = StorageSafetyService.assess (block, block.dependencies);
+            var safety = StorageSafetyService.assess (block, block.dependencies, true);
             unmount = fs != null && fs.mounted && !safety.system_critical && !safety.active_dependents;
             activate_swap = block.has_swap && !block.swap_active && !block.read_only;
             deactivate_swap = block.has_swap && block.swap_active;

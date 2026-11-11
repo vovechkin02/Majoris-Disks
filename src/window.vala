@@ -250,6 +250,7 @@ namespace MajorisDisks {
                 update_advanced_jobs ();
                 jobs_button.visible = backend.jobs.jobs.get_n_items () != 0;
             });
+            ImageOperationJournal.recover (backend.jobs);
             backend.select_requested.connect ((path) => drive_view.select_identity (path));
             drive_view.check_requested.connect ((block, repair) => {
                 if (!repair) {
@@ -1639,9 +1640,13 @@ namespace MajorisDisks {
                 inspect_virtual_image (file);
                 return;
             }
+            if (DiskImageCopy.is_xz_name (name)) {
+                choose_xz_extraction (file, true);
+                return;
+            }
             bool optical = name.has_suffix (".iso");
             if (!optical && !name.has_suffix (".img") && !name.has_suffix (".raw")) {
-                show_image_open_error ("Choose a RAW, ISO, VHD, VHDX or QCOW2 image.");
+                show_image_open_error ("Choose a RAW, ISO, XZ, VHD, VHDX or QCOW2 image.");
                 return;
             }
             var confirmation = new DiskImageConfirmation () {
@@ -1688,8 +1693,81 @@ namespace MajorisDisks {
             chooser.open.begin (this, null, (object, result) => {
                 File source;
                 try { source = chooser.open.end (result); } catch (Error error) { return; }
-                inspect_virtual_image (source);
+                if (DiskImageCopy.is_xz_name (source.get_basename () ?? ""))
+                    choose_xz_extraction (source, false);
+                else
+                    inspect_virtual_image (source);
             });
+        }
+
+        private void choose_xz_extraction (File source, bool attach) {
+            var confirmation = new DiskImageConfirmation () {
+                heading = attach ? "Extract and Attach Disk Image?" : "Extract Disk Image?",
+                body = source.get_parse_name () + "\n\nMajoris will verify the decompressed data before saving a RAW copy."
+            };
+            confirmation.set_response_label ("proceed", "Choose Destination");
+            confirmation.response.connect ((response) => {
+                if (response != "proceed") return;
+                var chooser = new Gtk.FileDialog () { title = "Save Extracted Disk Image", initial_name = "Extracted.img" };
+                chooser.save.begin (this, null, (obj, saved) => {
+                    File destination;
+                    try { destination = chooser.save.end (saved); } catch (Error error) { return; }
+                    convert_xz.begin (source, destination, false, attach);
+                });
+            });
+            confirmation.present (this);
+        }
+
+        private async void convert_xz (File source, File destination, bool compress, bool attach) {
+            string operation = compress ? "Compress RAW image" : "Extract XZ image";
+            var job = backend.jobs.begin_named (operation, source.get_parse_name (), {});
+            var outcome = new StorageOperationResult ();
+            job.cancelable = true;
+            try {
+                backend.jobs.phase (job, StorageJobState.RUNNING, operation);
+                yield DiskImageCopy.transform_xz (source, destination, compress, backend.jobs, job);
+                outcome.successful = true;
+                outcome.summary = compress ? "Compressed image saved and verified" : "Extracted image saved and verified";
+                if (attach) attach_image (destination, true, outcome.summary);
+                else notifications.add_toast (new Adw.Toast (outcome.summary));
+            } catch (Error error) {
+                outcome.fail ("Could not convert the image", error);
+                show_check_message (outcome.summary, error.message);
+            } finally { backend.jobs.finish (job, outcome); }
+        }
+
+        internal void choose_verify_image () {
+            var chooser = new Gtk.FileDialog () { title = "Select a Disk Image to Verify" };
+            chooser.open.begin (this, null, (object, result) => {
+                File source;
+                try { source = chooser.open.end (result); } catch (Error error) { return; }
+                verify_image_file.begin (source, uint64.MAX, (obj, verified) => {
+                    try {
+                        var image = verify_image_file.end (verified);
+                        show_check_message ("Image Verified", "%s\n%s · %s logical · %s file length\n\nSHA-256\n%s".printf (
+                            source.get_parse_name (), image.format, format_size (image.logical_size),
+                            format_size (image.file_size), image.digest));
+                    } catch (Error error) { show_check_message ("Could not verify the image", error.message); }
+                });
+            });
+        }
+
+        private async ImageVerificationResult verify_image_file (File source, uint64 limit) throws Error {
+            var job = backend.jobs.begin_named ("Verify disk image", source.get_parse_name (), {});
+            job.cancelable = true;
+            var outcome = new StorageOperationResult ();
+            try {
+                backend.jobs.phase (job, StorageJobState.RUNNING, "Verifying logical disk data");
+                var image = yield DiskImageCopy.verify_file (source, backend.jobs, job, limit);
+                outcome.successful = true;
+                outcome.summary = "Image verified";
+                outcome.actual_state = "%s · %s logical · SHA-256 %s".printf (
+                    image.format, format_size (image.logical_size), image.digest);
+                return image;
+            } catch (Error error) {
+                outcome.fail ("Could not verify the image", error);
+                throw error;
+            } finally { backend.jobs.finish (job, outcome); }
         }
 
         private void inspect_virtual_image (File source) {
@@ -1697,14 +1775,15 @@ namespace MajorisDisks {
                 try {
                     var info = VirtualDisk.inspect.end (inspected);
                     var dialog = new VirtualImageDialog () {
-                        body = "%s\nFormat: %s\nVirtual capacity: %s\nFile size: %s\n\nRead/write access modifies the selected image. Mount only images you trust, even when attached read-only.".printf (
-                            source.get_parse_name (), info.format, format_size (info.capacity), format_size (info.file_size))
+                        body = "%s\nFormat: %s\nVirtual capacity: %s\nHost file length: %s\nAllocated host space: %s\n\nRead/write access modifies the selected image. Mount only images you trust, even when attached read-only.".printf (
+                            source.get_parse_name (), info.format == "vpc" ? "VHD" : info.format.up (),
+                            format_size (info.capacity), format_size (info.file_size), format_size (info.allocated_size))
                     };
                     string? unavailable = VirtualDiskAttachment.unavailable_reason ();
                     bool direct = info.format != "raw" && unavailable == null;
                     dialog.set_response_enabled ("attach-readonly", direct);
                     string? source_path = source.get_path ();
-                    dialog.set_response_enabled ("attach-writable", direct && source_path != null &&
+                    dialog.set_response_enabled ("attach-writable", direct && info.format == "qcow2" && source_path != null &&
                         Posix.access (source_path, Posix.W_OK) == 0);
                     dialog.set_response_enabled ("grow", !info.has_snapshots);
                     if (info.has_snapshots) dialog.body += "\n\nGrowing a copy is unavailable for images with internal snapshots.";
@@ -1727,7 +1806,10 @@ namespace MajorisDisks {
                         save.save.begin (this, null, (object, saved) => {
                             File target;
                             try { target = save.save.end (saved); } catch (Error error) { return; }
-                            write_virtual_image (source, target, format, 0, attach, null, compress);
+                            if (format == "xz")
+                                convert_xz.begin (source, target, true, false);
+                            else
+                                write_virtual_image (source, target, format, 0, attach, null, compress);
                         });
                     });
                     dialog.present (this);
@@ -1736,7 +1818,7 @@ namespace MajorisDisks {
         }
 
         private static string image_extension (string format) {
-            return format == "raw" ? ".img" : format == "vpc" ? ".vhd" : "." + format;
+            return format == "raw" ? ".img" : format == "vpc" ? ".vhd" : format == "xz" ? ".img.xz" : "." + format;
         }
 
         private void choose_grown_image (File source, VirtualDiskInfo info) {
@@ -1827,23 +1909,44 @@ namespace MajorisDisks {
 
         private void choose_backup (StorageBlock block) {
             string identity = backend.modification_identity (block);
+            bool optical = block.physical_drive?.optical == true;
+            var setup = new DiskImageConfirmation () {
+                heading = "Create Disk Image",
+                body = "%s · %s\n\nChoose a destination with at least %s free. The source must be idle.".printf (
+                    block.preferred, format_size (block.size), format_size (block.size))
+            };
+            setup.configure_backup (!optical);
+            setup.set_response_label ("proceed", "Choose Destination");
+            setup.response.connect ((response) => {
+                if (response == "proceed")
+                    save_backup (block, identity, optical, setup.compress_backup, setup.verify_backup);
+            });
+            setup.present (this);
+        }
+
+        private void save_backup (StorageBlock block, string identity, bool optical, bool compress, bool verify) {
             var chooser = new Gtk.FileDialog () {
-                title = "Save Raw Disk Image",
-                initial_name = Path.get_basename (block.preferred) + (block.physical_drive?.optical == true ? ".iso" : ".img")
+                title = compress ? "Save Compressed Disk Image" : "Save Raw Disk Image",
+                initial_name = Path.get_basename (block.preferred) + (optical ? ".iso" : compress ? ".img.xz" : ".img")
             };
             chooser.save.begin (this, null, (object, result) => {
                 File destination;
                 try { destination = chooser.save.end (result); } catch (Error error) { return; }
+                if (DiskImageCopy.is_xz_name (destination.get_basename () ?? "") != compress) {
+                    show_check_message ("Choose an image filename", compress ?
+                        "Use .img.xz or .raw.xz for XZ compression." : "Choose a RAW or ISO filename.");
+                    return;
+                }
                 var confirmation = new DiskImageConfirmation () {
                     heading = "Create Disk Image?",
-                    body = "%s · %s\n%s\n\nIf the source is in use, files can change while the image is copied.".printf (
-                        block.preferred, format_size (block.size), destination.get_parse_name ())
+                    body = "%s · %s\n%s · %s\n%s".printf (
+                        block.preferred, format_size (block.size), compress ? "RAW + XZ" : optical ? "ISO" : "RAW",
+                        verify ? "Readback verification enabled" : "Streaming copy",
+                        destination.get_parse_name ())
                 };
-                confirmation.enable_backup_verification ();
                 confirmation.set_response_label ("proceed", "Create Image");
                 confirmation.response.connect ((response) => {
                     if (response != "proceed") return;
-                    bool verify = confirmation.verify_backup;
                     backend.create_disk_image.begin (block, destination, identity, verify, (object, outcome) => {
                         try {
                             backend.create_disk_image.end (outcome);
@@ -1864,33 +1967,49 @@ namespace MajorisDisks {
             chooser.open.begin (this, null, (object, result) => {
                 File source;
                 try { source = chooser.open.end (result); } catch (Error error) { return; }
-                var details = new StringBuilder ();
-                foreach (var node in backend.snapshot.dependencies.descendants (block)) {
-                    var child = node as StorageBlock;
-                    if (child == null || child == block) continue;
-                    details.append ("\n").append (child.preferred).append (" · ").append (format_size (child.size));
-                }
-                var drive = block.physical_drive;
-                var confirmation = new DiskImageConfirmation () {
-                    heading = partition ? "Overwrite the selected partition?" : "Overwrite the selected device?",
-                    body = "%s\n\nTarget: %s · %s · %s\nSerial: %s\nWWN: %s%s\n\nRestoring this image overwrites existing data.".printf (
-                        source.get_parse_name (), block.preferred, drive?.model ?? "Storage device",
-                        format_size (block.size), drive?.serial ?? "", drive?.wwn ?? "", details.str)
-                };
-                confirmation.set_response_label ("proceed", "Restore Image");
-                confirmation.set_response_appearance ("proceed", Adw.ResponseAppearance.DESTRUCTIVE);
-                confirmation.response.connect ((response) => {
-                    if (response != "proceed") return;
-                    backend.restore_disk_image.begin (block, source, identity, (object, outcome) => {
-                        try {
-                            var restored = backend.restore_disk_image.end (outcome);
-                            if (restored.successful) notifications.add_toast (new Adw.Toast (restored.summary));
-                            else show_check_message ("Disk image restoration", operation_result_details (restored));
-                        } catch (Error error) { show_check_message ("Could not restore disk image", error.message); }
-                    });
+                verify_image_file.begin (source, block.size, (obj, verified) => {
+                    try { confirm_restore (block, source, identity, verify_image_file.end (verified)); }
+                    catch (Error error) { show_check_message ("Could not review the source image", error.message); }
                 });
-                confirmation.present (this);
             });
+        }
+
+        private void confirm_restore (StorageBlock block, File source, string identity, ImageVerificationResult image) {
+            bool partition = block.partition != null;
+            if (backend.modification_identity (block) != identity) {
+                show_check_message ("The restore target changed", "Select the current device again.");
+                return;
+            }
+            var details = new StringBuilder ();
+            foreach (var node in backend.snapshot.dependencies.descendants (block)) {
+                var child = node as StorageBlock;
+                if (child == null || child == block) continue;
+                details.append ("\n").append (child.preferred).append (" · ").append (format_size (child.size));
+            }
+            var drive = block.physical_drive;
+            var confirmation = new DiskImageConfirmation () {
+                heading = partition ? "Overwrite the selected partition?" : "Overwrite the selected device?",
+                body = "%s\n%s · %s logical\n\nTarget: %s · %s · %s\nSerial: %s\nWWN: %s%s\n\n%s".printf (
+                    source.get_parse_name (), image.format, format_size (image.logical_size),
+                    block.preferred, drive?.model ?? "Storage device", format_size (block.size),
+                    drive?.serial ?? "", drive?.wwn ?? "", details.str,
+                    image.logical_size < block.size ?
+                    "Existing data in the image range will be overwritten and verified by readback. Trailing target bytes are preserved." :
+                    "Existing data will be overwritten and verified by readback.")
+            };
+            confirmation.set_response_label ("proceed", "Restore Image");
+            confirmation.set_response_appearance ("proceed", Adw.ResponseAppearance.DESTRUCTIVE);
+            confirmation.response.connect ((response) => {
+                if (response != "proceed") return;
+                backend.restore_disk_image.begin (block, source, identity, image, (object, outcome) => {
+                    try {
+                        var restored = backend.restore_disk_image.end (outcome);
+                        if (restored.successful) notifications.add_toast (new Adw.Toast (restored.summary));
+                        else show_check_message ("Disk image restoration", operation_result_details (restored));
+                    } catch (Error error) { show_check_message ("Could not restore disk image", error.message); }
+                });
+            });
+            confirmation.present (this);
         }
 
         private void refresh () {
@@ -2503,7 +2622,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.DropDown format_choice;
         [GtkChild] private unowned Adw.SwitchRow attach;
         [GtkChild] private unowned Adw.SwitchRow compression;
-        public string format { owned get { return disk_image_format (format_choice.selected); } }
+        public string format { owned get { return format_choice.selected == 4 ? "xz" : disk_image_format (format_choice.selected); } }
         public bool attach_copy { get { return attach.sensitive && attach.active; } }
         public bool compress_copy { get { return compression.sensitive && compression.active; } }
 
@@ -2511,7 +2630,7 @@ namespace MajorisDisks {
             format_choice.notify["selected"].connect (() => {
                 compression.sensitive = format == "qcow2";
                 string? unavailable = VirtualDiskAttachment.unavailable_reason ();
-                attach.sensitive = format_choice.selected == 0 || unavailable == null;
+                attach.sensitive = format != "xz" && (format_choice.selected == 0 || unavailable == null);
                 attach.subtitle = attach.sensitive ? "" : unavailable;
             });
         }
@@ -2562,8 +2681,17 @@ namespace MajorisDisks {
     [GtkTemplate (ui = "/com/majoris/disks/ui/disk-image-confirmation.ui")]
     internal class DiskImageConfirmation : Adw.AlertDialog {
         [GtkChild] private unowned Adw.SwitchRow verify;
-        public bool verify_backup { get { return verify.active; } }
-        public void enable_backup_verification () { verify.visible = true; }
+        [GtkChild] private unowned Adw.SwitchRow compress;
+        public bool verify_backup { get { return compress.active || verify.active; } }
+        public bool compress_backup { get { return compress.active; } }
+        public void configure_backup (bool allow_compression) {
+            verify.visible = true;
+            compress.visible = allow_compression;
+            compress.notify["active"].connect (() => {
+                if (compress.active) verify.active = true;
+                verify.sensitive = !compress.active;
+            });
+        }
     }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/unlock-volume-dialog.ui")]

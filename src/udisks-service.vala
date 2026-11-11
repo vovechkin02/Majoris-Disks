@@ -282,6 +282,13 @@ namespace MajorisDisks {
             if (has (object_proxy, "Loop")) {
                 var loop = block.loop ?? new StorageLoopDevice ();
                 loop.backing_file = property (object_proxy, "Loop", "BackingFile")?.get_bytestring () ?? "";
+                loop.setup_uid = property (object_proxy, "Loop", "SetupByUID")?.get_uint32 () ?? 0;
+                string sequence = "";
+                try {
+                    FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (block.number) +
+                        "/diskseq", out sequence);
+                } catch (FileError error) {}
+                loop.sequence = sequence.strip ();
                 block.loop = loop;
             } else block.loop = null;
             block.virtual_attachment = VirtualDiskAttachment.lookup (block.device);
@@ -889,9 +896,14 @@ namespace MajorisDisks {
             var directory = destination.get_parent ();
             if (path == null || directory == null || block.size == 0)
                 throw new IOError.INVALID_ARGUMENT ("Choose a local destination for a source with known capacity.");
+            bool compress = DiskImageCopy.is_xz_name (path);
+            if (path.down ().has_suffix (".xz") && !compress)
+                throw new IOError.INVALID_ARGUMENT ("Use .img.xz or .raw.xz for a compressed disk image.");
+            verify |= compress;
             if (modification_identity (block) != confirmed_identity)
                 throw new IOError.NOT_FOUND ("The image source changed after confirmation.");
-            string temporary = Path.build_filename (directory.get_path (), ".majoris-" + Uuid.string_random ());
+            string work = Path.build_filename (directory.get_path (), ".majoris-" + Uuid.string_random ());
+            string temporary = Path.build_filename (work, "disk");
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("Create disk image", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
@@ -899,6 +911,8 @@ namespace MajorisDisks {
             ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
             int input = -1;
             int output = -1;
+            ImageOperationJournal? recovery = null;
+            bool work_created = false;
             bool temporary_created = false;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Checking the destination");
@@ -920,6 +934,11 @@ namespace MajorisDisks {
                 }
                 if (destination.query_exists (token))
                     throw new IOError.EXISTS ("An image already exists at the selected destination.");
+                if (DirUtils.create (work, 0700) != 0)
+                    throw new IOError.FAILED ("Could not create a private image output directory.");
+                work_created = true;
+                recovery = new ImageOperationJournal ("Create disk image", path,
+                    "Review the destination and the private work directory " + work + ".");
                 output = Posix.open (temporary, (verify ? Posix.O_RDWR : Posix.O_WRONLY) | Posix.O_CREAT | Posix.O_EXCL | Posix.O_CLOEXEC, 0600);
                 if (output < 0) throw new IOError.FAILED ("Could not create a temporary image: " + Posix.strerror (Posix.errno));
                 temporary_created = true;
@@ -930,11 +949,35 @@ namespace MajorisDisks {
                     if (dependent != null && dependent.number == (uint64) info.st_dev)
                         throw new IOError.INVALID_ARGUMENT ("The output file is stored on the source device.");
                 }
-                input = yield open_block (block, "r", Posix.O_CLOEXEC, token);
+                synchronize ();
+                if (modification_identity (block) != confirmed_identity)
+                    throw new IOError.NOT_FOUND ("The source changed while preparing the backup.");
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                if (safety.mounted || safety.active_dependents || safety.unknown_dependencies)
+                    throw new IOError.BUSY ("The image source has active or unresolved storage dependencies.");
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var dependent = node as StorageBlock;
+                    if (dependent != null) yield KernelStorageSafety.require_idle (dependent, token);
+                }
+                input = yield open_block (block, "r", Posix.O_EXCL | Posix.O_CLOEXEC, token);
                 job.cancelable = true;
-                jobs.phase (job, StorageJobState.RUNNING, "Copying the raw image");
+                jobs.phase (job, StorageJobState.RUNNING, compress ? "Compressing the disk image" : "Copying the raw image");
                 var copy_state = new ImageWriteState ();
-                try { yield DiskImageCopy.copy (input, output, size, jobs, job, verify, copy_state); }
+                try {
+                    if (compress) {
+                        string digest = yield DiskImageCopy.write_xz (input, output, size, jobs, job);
+                        jobs.phase (job, StorageJobState.FINALIZING, "Verifying the compressed image");
+                        copy_state.phase = ImageWritePhase.VERIFYING;
+                        if (Posix.lseek (output, 0, Posix.SEEK_SET) < 0)
+                            throw new IOError.FAILED ("Could not rewind the compressed image.");
+                        var decoded = yield DiskImageCopy.decode_xz (output, null, size, token, jobs, job);
+                        if (decoded.size != size || decoded.digest != digest)
+                            throw new IOError.INVALID_DATA ("The compressed image differs from the source data.");
+                        outcome.actual_state = "%s logical · SHA-256 %s".printf (format_size (size), digest);
+                    } else {
+                        yield DiskImageCopy.copy (input, output, size, jobs, job, verify, copy_state);
+                    }
+                }
                 catch (Error error) {
                     if (verify && copy_state.phase == ImageWritePhase.VERIFYING && !(error is IOError.CANCELLED))
                         throw new IOError.INVALID_DATA ("The copy finished but failed readback verification. " + error.message);
@@ -943,11 +986,15 @@ namespace MajorisDisks {
                 synchronize ();
                 if (!block.available || snapshot.blocks.lookup (block.path) != block ||
                     modification_identity (block) != identity || Posix.fstat (output, out info) != 0 ||
-                    (uint64) info.st_size != size)
+                    (compress ? info.st_size <= 0 : (uint64) info.st_size != size))
                     throw new IOError.INVALID_DATA ("The source or resulting image size could not be verified.");
+                int input_closed = Posix.close (input);
+                input = -1;
+                if (input_closed != 0) throw new IOError.FAILED ("Could not close the source device.");
                 int close_status = Posix.close (output);
                 output = -1;
                 if (close_status != 0) throw new IOError.FAILED ("Could not close the image.");
+                token.set_error_if_cancelled ();
                 if (rename_without_replacement (CURRENT_DIRECTORY, temporary, CURRENT_DIRECTORY, path, NO_REPLACEMENT) != 0)
                     throw new IOError.FAILED ("Could not publish the image: " + Posix.strerror (Posix.errno));
                 temporary_created = false;
@@ -963,6 +1010,10 @@ namespace MajorisDisks {
                 if (output >= 0) Posix.close (output);
                 if (temporary_created && FileUtils.unlink (temporary) != 0)
                     warning ("Could not remove incomplete image %s", temporary);
+                if (work_created) {
+                    if (DirUtils.remove (work) == 0) recovery?.remove ();
+                    else warning ("Could not remove the private image work directory %s", work);
+                }
                 lifetime.disconnect (disconnected);
                 locks.release (block);
             }
@@ -986,11 +1037,15 @@ namespace MajorisDisks {
         }
 
         internal async StorageOperationResult restore_disk_image (StorageBlock block, File source,
-            string confirmed_identity) throws Error {
+            string confirmed_identity, ImageVerificationResult? reviewed_image = null) throws Error {
             string? path = source.get_path ();
-            if (path == null || !(path.has_suffix (".img") || path.has_suffix (".raw") ||
-                path.has_suffix (".iso") || path.has_suffix (".img.xz")))
-                throw new IOError.INVALID_ARGUMENT ("Choose a local .img, .raw, .iso or .img.xz file.");
+            string name = (source.get_basename () ?? "").down ();
+            bool compressed = DiskImageCopy.is_xz_name (name);
+            string? virtual_format = name.has_suffix (".qcow2") ? "qcow2" :
+                name.has_suffix (".vhdx") ? "vhdx" : name.has_suffix (".vhd") ? "vpc" : null;
+            if (path == null || !(name.has_suffix (".img") || name.has_suffix (".raw") ||
+                name.has_suffix (".iso") || compressed || virtual_format != null))
+                throw new IOError.INVALID_ARGUMENT ("Choose a local RAW, ISO, XZ, QCOW2, VHD or VHDX image.");
             if (block.partition?.container == true)
                 throw new IOError.INVALID_ARGUMENT ("An extended partition container cannot be restored as a volume.");
             if (modification_identity (block) != confirmed_identity)
@@ -1004,6 +1059,9 @@ namespace MajorisDisks {
             ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
             StoragePreparationJournal? preparation = null;
             int input = -1;
+            int logical_input = -1;
+            string? staging = null;
+            ImageOperationJournal? recovery = null;
             int target = -1;
             var state = new ImageWriteState ();
             XzImage? preflight = null;
@@ -1022,15 +1080,46 @@ namespace MajorisDisks {
                 uint64 bytes = (uint64) info.st_size;
                 string? source_identity = image_identity (input);
                 if (source_identity == null) throw new IOError.FAILED ("Could not record the source identity.");
-                if (path.has_suffix (".img.xz")) {
+                if (reviewed_image != null && source_identity != reviewed_image.source_identity)
+                    throw new IOError.INVALID_DATA ("The source image changed after review.");
+                if (compressed) {
                     jobs.phase (job, StorageJobState.RUNNING, "Validating the compressed image stream");
                     preflight = yield DiskImageCopy.decode_xz (input, null, capacity, token, jobs, job);
                     bytes = preflight.size;
                     if (source_identity != image_identity (input) || Posix.lseek (input, 0, Posix.SEEK_SET) < 0)
                         throw new IOError.INVALID_DATA ("The compressed image changed during preflight.");
+                } else if (virtual_format != null) {
+                    var image = yield VirtualDisk.inspect_fd (input, token);
+                    if (image.format != virtual_format || image.identity != source_identity)
+                        throw new IOError.INVALID_DATA ("The virtual image format or identity did not match the selection.");
+                    bytes = image.capacity;
+                    if (bytes > capacity)
+                        throw new IOError.NO_SPACE ("The virtual disk's logical capacity exceeds the target capacity.");
+                    staging = DirUtils.make_tmp ("majoris-restore-XXXXXX");
+                    Posix.Stat staging_info = {};
+                    if (Posix.stat (staging, out staging_info) != 0)
+                        throw new IOError.FAILED ("Could not identify the restore staging filesystem.");
+                    check_image_filesystem (block, staging_info);
+                    jobs.phase (job, StorageJobState.RUNNING, "Extracting and comparing guest-visible disk data");
+                    logical_input = yield VirtualDisk.materialize_raw (input, image, staging, token,
+                        (fraction) => jobs.progress (job, "Extracting logical disk data", fraction, true));
+                } else {
+                    require_raw_image (input, bytes);
                 }
                 if (bytes == 0 || bytes > capacity)
                     throw new IOError.NO_SPACE ("The image does not fit the selected device.");
+                int logical_fd = logical_input >= 0 ? logical_input : input;
+                string expected_digest;
+                if (preflight != null) {
+                    expected_digest = preflight.digest;
+                } else {
+                    expected_digest = yield DiskImageCopy.hash_image (logical_fd, bytes, jobs, job);
+                    if (Posix.lseek (logical_fd, 0, Posix.SEEK_SET) < 0)
+                        throw new IOError.FAILED ("Could not rewind the verified image.");
+                }
+                if (reviewed_image != null && (bytes != reviewed_image.logical_size ||
+                    expected_digest != reviewed_image.digest))
+                    throw new IOError.INVALID_DATA ("The logical image contents changed after review.");
 
                 synchronize ();
                 if (modification_identity (block) != confirmed_identity)
@@ -1040,7 +1129,7 @@ namespace MajorisDisks {
                 state.phase = ImageWritePhase.PREPARING;
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.PREPARING, "Preparing the target device");
-                preparation = yield prepare_for_modification (block, lifetime, job);
+                preparation = yield prepare_for_modification (block, lifetime, job, true);
                 synchronize ();
                 if (modification_identity (block) != confirmed_identity)
                     throw new IOError.NOT_FOUND ("The target device changed during preparation.");
@@ -1053,10 +1142,28 @@ namespace MajorisDisks {
                 }
                 if (modification_identity (block) != confirmed_identity)
                     throw new IOError.NOT_FOUND ("The target device changed before opening it for restore.");
+                if (block.partition != null) {
+                    var parent = snapshot.blocks.lookup (block.partition.table_path);
+                    if (parent == null || !parent.available)
+                        throw new IOError.NOT_FOUND ("The partition's parent disk is unavailable.");
+                    KernelStorageSafety.require_partition_geometry (block, parent);
+                } else {
+                    foreach (var partition in KernelStorageSafety.partition_numbers (
+                        KernelStorageSafety.device_number (block.number)))
+                        yield KernelStorageSafety.require_idle_number (partition, token);
+                }
                 target = yield open_block (block, "rw", Posix.O_EXCL | Posix.O_CLOEXEC | Posix.O_SYNC, token);
                 token.set_error_if_cancelled ();
-                if (source_identity != image_identity (input))
+                int current_source = VirtualDisk.open_image (source);
+                bool source_matches = source_identity == image_identity (input) &&
+                    source_identity == image_identity (current_source);
+                Posix.close (current_source);
+                if (!source_matches)
                     throw new IOError.INVALID_DATA ("The source image changed before writing could begin.");
+                recovery = new ImageOperationJournal ("Restore disk image", block.device,
+                    "The target may contain an interrupted write. Reviewed source %s, logical bytes %s, SHA-256 %s.\n%s%s"
+                        .printf (source.get_parse_name (), bytes.to_string (), expected_digest, confirmed_identity,
+                            staging == null ? "" : "Private staging directory " + staging + "."));
                 preparation.backend_invoked = true;
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.RUNNING, "Writing the verified image");
@@ -1065,9 +1172,10 @@ namespace MajorisDisks {
                     var decoded = yield DiskImageCopy.decode_xz (input, output, bytes, token, jobs, job, state);
                     yield DiskImageCopy.verify_streamed_write (target, decoded, preflight, jobs, job, state);
                 } else {
-                    yield DiskImageCopy.copy (input, target, bytes, jobs, job, true, state);
+                    yield DiskImageCopy.copy (logical_fd, target, bytes, jobs, job, true, state, expected_digest);
                 }
                 result.completed ("%s written, flushed, and verified by readback".printf (format_size (bytes)));
+                result.actual_state = "SHA-256 %s".printf (expected_digest);
                 int closed = Posix.close (target);
                 target = -1;
                 if (closed != 0) throw new IOError.FAILED ("Could not close the target device.");
@@ -1092,7 +1200,15 @@ namespace MajorisDisks {
                 }
             } finally {
                 if (input >= 0) Posix.close (input);
+                if (logical_input >= 0) Posix.close (logical_input);
+                if (staging != null) {
+                    FileUtils.unlink (Path.build_filename (staging, "disk"));
+                    if (DirUtils.remove (staging) != 0)
+                        warning ("Could not remove the private restore directory %s", staging);
+                }
                 if (target >= 0) Posix.close (target);
+                if (state.phase < ImageWritePhase.WRITING || state.phase == ImageWritePhase.COMPLETED)
+                    recovery?.remove ();
                 lifetime.disconnect (disconnected);
                 locks.release (block);
                 jobs.finish (job, result);
@@ -1129,6 +1245,7 @@ namespace MajorisDisks {
             var job = jobs.begin_named ("Attach disk image", source.get_parse_name (), {});
             var outcome = new StorageOperationResult ();
             int fd = -1;
+            bool dispatched = false;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Opening the image");
                 fd = Posix.open (path, (read_only ? Posix.O_RDONLY : Posix.O_RDWR) |
@@ -1138,6 +1255,7 @@ namespace MajorisDisks {
                     throw new IOError.FAILED ("Could not open the selected image.");
                 if (!Posix.S_ISREG (info.st_mode) || info.st_size < 512)
                     throw new IOError.INVALID_DATA ("The selected image is not a usable regular file.");
+                require_raw_image (fd, (uint64) info.st_size);
                 string backing = FileUtils.read_link ("/proc/self/fd/%d".printf (fd));
                 synchronize ();
                 foreach (var existing in snapshot.blocks.get_values ()) {
@@ -1156,6 +1274,7 @@ namespace MajorisDisks {
                 options.add ("{sv}", "read-only", new Variant.boolean (read_only));
                 jobs.phase (job, StorageJobState.RUNNING, "Attaching the image");
                 UnixFDList? returned;
+                dispatched = true;
                 var reply = yield manager_proxy.call_with_unix_fd_list ("LoopSetup",
                     new Variant ("(h@a{sv})", handle, options.end ()), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
                     int.MAX, descriptors, lifetime, out returned);
@@ -1165,7 +1284,18 @@ namespace MajorisDisks {
                 for (int attempt = 0; attempt < 50; attempt++) {
                     synchronize ();
                     var block = snapshot.blocks.lookup (attached);
-                    if (block?.loop != null && block.loop.backing_file == backing && block.read_only == read_only) {
+                    if (block?.loop != null && block.loop.backing_file == backing && block.read_only == read_only &&
+                        block.size == (uint64) info.st_size / 512 * 512) {
+                        string kernel_backing;
+                        FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (block.number) +
+                            "/loop/backing_file", out kernel_backing);
+                        string diagnostic;
+                        if (kernel_backing != backing + "\n" || block.loop.sequence == "" ||
+                            !image_partitions_discovered (block, out diagnostic)) {
+                            yield settle_delay (lifetime);
+                            continue;
+                        }
+                        block.loop.verified_sequence = block.loop.sequence;
                         outcome.successful = true;
                         outcome.summary = "Disk image attached";
                         jobs.finish (job, outcome);
@@ -1176,6 +1306,11 @@ namespace MajorisDisks {
                 throw new IOError.TIMED_OUT ("The image may be attached, but the loop object could not be verified. Refresh before retrying.");
             } catch (Error error) {
                 outcome.fail ("Could not verify attachment", error);
+                string? remote = DBusError.get_remote_error (error);
+                if (dispatched && !(error is DBusError.ACCESS_DENIED) && remote?.contains ("NotAuthorized") != true) {
+                    outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                    outcome.actual_state = "The attachment may exist. Refresh the device list before retrying.";
+                }
                 jobs.finish (job, outcome);
                 throw error;
             } finally { if (fd >= 0) Posix.close (fd); }
@@ -1192,6 +1327,7 @@ namespace MajorisDisks {
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.FINALIZING, "Waiting for UDisks discovery");
                 string path = "/org/freedesktop/UDisks2/block_devices/nbd%u".printf (record.index);
+                string discovery = "UDisks did not expose the verified NBD block device.";
                 for (int attempt = 0; attempt < 75; attempt++) {
                     synchronize ();
                     var block = snapshot.blocks.lookup (path);
@@ -1201,14 +1337,17 @@ namespace MajorisDisks {
                         if (Posix.stat (block.device, out device_info) != 0 || !Posix.S_ISBLK (device_info.st_mode) ||
                             (uint64) device_info.st_rdev != block.number)
                             throw new IOError.INVALID_DATA ("The UDisks object does not match the connected NBD device.");
-                        outcome.successful = true;
-                        outcome.summary = "Virtual disk attached";
-                        jobs.finish (job, outcome);
-                        return path;
+                        if (image_partitions_discovered (block, out discovery)) {
+                            outcome.successful = true;
+                            outcome.summary = "Virtual disk attached";
+                            jobs.finish (job, outcome);
+                            return path;
+                        }
                     }
                     yield settle_delay (backend_lifetime);
                 }
-                throw new IOError.TIMED_OUT ("The kernel mapping was created but UDisks did not verify it. Refresh before retrying.");
+                throw new IOError.TIMED_OUT ("The managed kernel mapping was retained. %s Refresh before retrying."
+                    .printf (discovery));
             } catch (Error error) {
                 outcome.fail ("Virtual attachment did not complete", error);
                 if (record != null || error is VirtualAttachmentError.UNCERTAIN)
@@ -1218,6 +1357,20 @@ namespace MajorisDisks {
             }
         }
 
+        private bool image_partitions_discovered (StorageBlock disk, out string diagnostic) throws Error {
+            var kernel = KernelStorageSafety.partition_numbers (KernelStorageSafety.device_number (disk.number));
+            var model = disk.table?.partitions ?? new StorageBlock[0];
+            diagnostic = "Kernel partitions on %s: [%s]. UDisks partition count: %d.".printf (
+                disk.device, string.joinv (",", kernel), model.length);
+            if (kernel.length != model.length) return false;
+            foreach (var part in model) {
+                if (!part.available || part.partition?.table_path != disk.path ||
+                    !(KernelStorageSafety.device_number (part.number) in kernel))
+                    return false;
+            }
+            return true;
+        }
+
         private async void detach_virtual_image (StorageBlock block, VirtualAttachment record) throws Error {
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("Detach virtual disk", block, snapshot.dependencies);
@@ -1225,22 +1378,38 @@ namespace MajorisDisks {
             bool disconnect_started = false;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Checking virtual-disk dependencies");
-                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
-                if (safety.unknown_dependencies || safety.active_dependents || safety.mounted)
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies, true);
+                if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || safety.mounted)
                     throw new IOError.BUSY ("Unmount virtual volumes and close their unlocked mappings before detaching.");
                 foreach (var node in snapshot.dependencies.descendants (block)) {
                     var dependent = node as StorageBlock;
                     if (dependent != null) yield KernelStorageSafety.require_idle (dependent, backend_lifetime);
                 }
+                var partitions = KernelStorageSafety.partition_numbers (KernelStorageSafety.device_number (block.number));
+                foreach (var partition in partitions)
+                    yield KernelStorageSafety.require_idle_number (partition, backend_lifetime);
                 synchronize ();
                 if (snapshot.blocks.lookup (block.path) != block || block.virtual_attachment?.token != record.token)
                     throw new IOError.NOT_FOUND ("The selected virtual attachment changed.");
                 jobs.phase (job, StorageJobState.RUNNING, "Disconnecting the managed NBD device");
                 disconnect_started = true;
                 yield VirtualDiskAttachment.detach (record);
-                synchronize ();
-                outcome.successful = true;
-                outcome.summary = "Virtual disk detached";
+                jobs.phase (job, StorageJobState.FINALIZING, "Confirming virtual disk removal");
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    synchronize ();
+                    var current = snapshot.blocks.lookup (block.path);
+                    bool old_children = false;
+                    foreach (var partition in partitions)
+                        old_children |= FileUtils.test ("/sys/dev/block/" + partition, FileTest.EXISTS);
+                    if (!old_children && (current == null || !current.available ||
+                        (current.virtual_attachment != null && current.virtual_attachment.token != record.token))) {
+                        outcome.successful = true;
+                        outcome.summary = "Virtual disk detached";
+                        return;
+                    }
+                    yield settle_delay (backend_lifetime);
+                }
+                throw new IOError.TIMED_OUT ("The kernel mapping was released, but UDisks did not confirm removal.");
             } catch (Error error) {
                 outcome.fail (disconnect_started ? "Virtual disk detach requires attention" : "Virtual disk was not detached", error);
                 if (disconnect_started) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
@@ -1264,26 +1433,85 @@ namespace MajorisDisks {
             var job = jobs.begin ("Detach disk image", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
             string backing = block.loop.backing_file;
+            string requested_sequence = block.loop.sequence;
+            string number = KernelStorageSafety.device_number (block.number);
+            string sysfs = "/sys/dev/block/" + number;
             var lifetime = backend_lifetime;
+            bool dispatched = false;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Checking active image volumes");
-                var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                synchronize ();
+                if (snapshot.blocks.lookup (block.path) != block || block.loop?.backing_file != backing)
+                    throw new IOError.NOT_FOUND ("The selected loop attachment changed.");
+                string sequence, kernel_backing, autoclear;
+                FileUtils.get_contents (sysfs + "/diskseq", out sequence);
+                FileUtils.get_contents (sysfs + "/loop/backing_file", out kernel_backing);
+                FileUtils.get_contents (sysfs + "/loop/autoclear", out autoclear);
+                if (requested_sequence == "" || sequence.strip () != requested_sequence ||
+                    kernel_backing != backing + "\n")
+                    throw new IOError.NOT_FOUND ("The kernel loop backing file differs from the selected attachment.");
+                var partitions = KernelStorageSafety.partition_numbers (number);
+                var safety = StorageSafetyService.assess (block, snapshot.dependencies, true);
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var child = node as StorageBlock;
+                    debug ("Loop dependency %s: %s, mounts=%s, unresolved=%s", block.path, node.path,
+                        child?.filesystem == null ? "" : string.joinv (",", child.filesystem.mounts),
+                        snapshot.dependencies.unknown (node).to_string ());
+                }
+                debug ("Loop detach %s (%s) backing=%s diskseq=%s autoclear=%s partitions=%s",
+                    block.path, number, backing, sequence.strip (), autoclear.strip (), string.joinv (",", partitions));
                 if (safety.system_critical || safety.unknown_dependencies || safety.active_dependents || safety.mounted)
-                    throw new IOError.BUSY ("Unmount image volumes and close unlocked mappings before detaching.");
+                    throw new IOError.BUSY ("Cannot detach %s (%s, backing %s): %s.".printf (
+                        block.path, KernelStorageSafety.device_number (block.number), backing,
+                        string.joinv ("; ", safety.reasons)));
                 foreach (var node in snapshot.dependencies.descendants (block)) {
                     var dependent = node as StorageBlock;
                     if (dependent != null) yield KernelStorageSafety.require_idle (dependent, lifetime);
                 }
+                foreach (var partition in partitions)
+                    yield KernelStorageSafety.require_idle_number (partition, lifetime);
+                int probe = yield open_block (block, "r", Posix.O_EXCL | Posix.O_CLOEXEC, lifetime);
+                try {
+                    match_loop_backing (probe, backing);
+                    debug ("Loop %s passed the exclusive-open and backing inode checks", block.path);
+                } finally { Posix.close (probe); }
                 synchronize ();
-                if (block.loop?.backing_file != backing)
+                string current_sequence, current_backing;
+                FileUtils.get_contents (sysfs + "/diskseq", out current_sequence);
+                FileUtils.get_contents (sysfs + "/loop/backing_file", out current_backing);
+                if (snapshot.blocks.lookup (block.path) != block || block.loop?.backing_file != backing ||
+                    current_sequence != sequence || current_backing != kernel_backing)
                     throw new IOError.NOT_FOUND ("The backing image changed.");
                 var proxy = require_volume (block, "Loop");
                 jobs.phase (job, StorageJobState.RUNNING, "Detaching the image");
-                yield proxy.call ("Delete", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
-                    DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, int.MAX, lifetime);
+                dispatched = true;
+                Error? delete_error = null;
+                try {
+                    debug ("Calling Loop.Delete for %s with diskseq %s", block.path, sequence.strip ());
+                    yield proxy.call ("Delete", new Variant ("(@a{sv})", new Variant ("a{sv}", null)),
+                        DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 120000, lifetime);
+                } catch (Error error) {
+                    string? remote = DBusError.get_remote_error (error);
+                    if (error is DBusError.ACCESS_DENIED || remote?.contains ("NotAuthorized") == true) {
+                        dispatched = false;
+                        throw error;
+                    }
+                    delete_error = error;
+                }
                 for (int attempt = 0; attempt < 50; attempt++) {
                     synchronize ();
-                    if (snapshot.blocks.lookup (block.path) != block || block.loop == null || block.loop.backing_file == "") {
+                    var current = snapshot.blocks.lookup (block.path);
+                    bool old_object = current?.loop?.backing_file == backing;
+                    bool kernel_released = false;
+                    try {
+                        FileUtils.get_contents (sysfs + "/diskseq", out current_sequence);
+                        if (current_sequence != sequence) kernel_released = true;
+                        else FileUtils.get_contents (sysfs + "/loop/backing_file", out current_backing);
+                    } catch (FileError.NOENT error) { kernel_released = true; }
+                    bool old_children = false;
+                    foreach (var partition in partitions)
+                        old_children |= FileUtils.test ("/sys/dev/block/" + partition, FileTest.EXISTS);
+                    if (kernel_released && !old_object && !old_children && owner != null) {
                         outcome.successful = true;
                         outcome.summary = "Disk image detached";
                         jobs.finish (job, outcome);
@@ -1291,9 +1519,11 @@ namespace MajorisDisks {
                     }
                     yield settle_delay (lifetime);
                 }
-                throw new IOError.TIMED_OUT ("The loop object is still present. Refresh before retrying.");
+                throw new IOError.TIMED_OUT ("Loop detachment could not be verified. Refresh before retrying. %s"
+                    .printf (delete_error?.message ?? ""));
             } catch (Error error) {
                 outcome.fail ("Could not detach the image", error);
+                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                 jobs.finish (job, outcome);
                 throw error;
             } finally { locks.release (block); }
@@ -5706,17 +5936,23 @@ namespace MajorisDisks {
                 var drive = child.physical_drive;
                 uint64 partition_offset = partition != null ? partition.offset : 0;
                 uint partition_number = partition != null ? partition.number : 0;
+                string sector;
+                string kernel_identity = MdRaidKernelState.physical_device (child, out sector);
+                uint64 logical_sector;
+                if (!uint64.try_parse (sector, out logical_sector))
+                    logical_sector = child.logical_sector_size;
                 records.add (new Variant ("(ssssssssssttttu)", child.path, child.device,
                     child.parent?.path ?? "", child.drive_path, drive?.serial ?? "", drive?.wwn ?? "",
                     child.uuid, partition?.uuid ?? "", partition?.table_path ?? "",
                     child.table?.scheme ?? "", child.number, child.size, partition_offset,
-                    child.logical_sector_size, partition_number).print (false));
-                string sector;
-                string kernel_identity = MdRaidKernelState.physical_device (child, out sector);
+                    logical_sector, partition_number).print (false));
                 if (kernel_identity != "")
                     records.add (new Variant ("(ss)", "kernel-device-identity", kernel_identity).print (false));
                 if (child.loop != null)
                     records.add (new Variant.string (child.loop.backing_file).print (true));
+                var parent = child.partition == null ? child : snapshot.blocks.lookup (child.partition.table_path);
+                if (parent?.virtual_attachment != null)
+                    records.add (new Variant ("(ss)", "virtual-image-token", parent.virtual_attachment.token).print (false));
             }
             records.sort ((left, right) => strcmp (left, right));
             var identity = new StringBuilder ();
@@ -6070,7 +6306,7 @@ namespace MajorisDisks {
         }
 
         private async StoragePreparationJournal prepare_for_modification (StorageBlock target, Cancellable token,
-            StorageJob job) throws Error {
+            StorageJob job, bool image_restore = false) throws Error {
             var journal = new StoragePreparationJournal ();
             journal.capture (target);
             var nodes = snapshot.dependencies.descendants (target);
@@ -6079,7 +6315,7 @@ namespace MajorisDisks {
                 for (int index = nodes.length - 1; index >= 0; index--) {
                     var block = nodes[index] as StorageBlock;
                     if (block == null) continue;
-                    var safety = StorageSafetyService.assess (block, snapshot.dependencies);
+                    var safety = StorageSafetyService.assess (block, snapshot.dependencies, image_restore);
                     if (safety.system_critical || safety.unknown_dependencies)
                         throw new IOError.BUSY ("Protected or unresolved storage cannot be prepared automatically.");
                     if (block.filesystem != null && (block.number != 0 || block.filesystem.mounted)) {

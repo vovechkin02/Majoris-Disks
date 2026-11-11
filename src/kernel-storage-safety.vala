@@ -54,24 +54,51 @@ namespace MajorisDisks {
         }
 
         public static async void require_idle (StorageBlock block, Cancellable token) throws Error {
-            yield require_no_holders (block, token);
-            string identity = device_number (block.number);
+            if (block.number == 0)
+                throw new IOError.NOT_SUPPORTED ("The kernel device identity is unavailable.");
+            yield require_idle_number (device_number (block.number), token);
+        }
+
+        internal static async void require_idle_number (string identity, Cancellable token) throws Error {
+            yield require_no_holders_number (identity, token);
             uint8[] contents;
             yield File.new_for_path ("/proc/self/mountinfo").load_contents_async (token, out contents, null);
             if (has_mount ((string) contents, identity))
-                throw new IOError.BUSY ("The kernel reports an active mount for this volume.");
+                throw new IOError.BUSY ("The kernel reports an active mount for %s.".printf (identity));
         }
 
         public static async void require_no_holders (StorageBlock block, Cancellable token) throws Error {
             if (block.number == 0)
                 throw new IOError.NOT_SUPPORTED ("The kernel device identity is unavailable.");
-            string identity = device_number (block.number);
+            yield require_no_holders_number (device_number (block.number), token);
+        }
+
+        private static async void require_no_holders_number (string identity, Cancellable token) throws Error {
             var device = File.new_for_path ("/sys/dev/block/" + identity);
             var holders = yield device.get_child ("holders").enumerate_children_async (
                 FileAttribute.STANDARD_NAME, FileQueryInfoFlags.NONE, Priority.DEFAULT, token);
             var entries = yield holders.next_files_async (1, Priority.DEFAULT, token);
             if (entries != null)
-                throw new IOError.BUSY ("Another kernel storage device depends on this volume.");
+                throw new IOError.BUSY ("Kernel holder %s depends on %s.".printf (entries.data.get_name (), identity));
+        }
+
+        internal static string[] partition_numbers (string identity) throws Error {
+            string root = "/sys/dev/block/" + identity;
+            var children = Dir.open (root);
+            string[] numbers = {};
+            string? name;
+            while ((name = children.read_name ()) != null) {
+                string child = Path.build_filename (root, name);
+                if (!FileUtils.test (Path.build_filename (child, "partition"), FileTest.IS_REGULAR))
+                    continue;
+                string number;
+                FileUtils.get_contents (Path.build_filename (child, "dev"), out number);
+                number = number.strip ();
+                if (!Regex.match_simple ("^[0-9]+:[0-9]+$", number))
+                    throw new IOError.INVALID_DATA ("A kernel partition has an invalid device number.");
+                numbers += number;
+            }
+            return numbers;
         }
 
         internal static async void require_sole_dm_dependency (StorageBlock backing, StorageBlock mapping,
@@ -89,6 +116,24 @@ namespace MajorisDisks {
             if (!uint64.try_parse (sectors.strip (), out count) || count == 0 || count > uint64.MAX / 512)
                 throw new IOError.INVALID_DATA ("The kernel reported an invalid storage capacity.");
             return count * 512;
+        }
+
+        internal static void require_partition_geometry (StorageBlock block, StorageBlock parent) throws Error {
+            var partition = block.partition;
+            if (partition == null)
+                throw new IOError.INVALID_ARGUMENT ("Expected a partition target.");
+            string path = "/sys/dev/block/" + device_number (block.number);
+            string parent_device, start, number;
+            FileUtils.get_contents (path + "/../dev", out parent_device);
+            FileUtils.get_contents (path + "/start", out start);
+            FileUtils.get_contents (path + "/partition", out number);
+            uint64 first_sector = 0;
+            uint partition_number = 0;
+            if (parent_device.strip () != device_number (parent.number) ||
+                !uint64.try_parse (start.strip (), out first_sector) || first_sector > uint64.MAX / 512 ||
+                !uint.try_parse (number.strip (), out partition_number) || partition_number != partition.number ||
+                first_sector * 512 != partition.offset || block_capacity (block) != block.size)
+                throw new IOError.INVALID_DATA ("The kernel partition geometry differs from the reviewed target.");
         }
 
         private static async void require_single_link (string device, string directory, string expected,

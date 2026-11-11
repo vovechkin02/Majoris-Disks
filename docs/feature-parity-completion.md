@@ -164,17 +164,17 @@ On Debian 13.5, `meson setup build/config-recovery`, `meson compile -C build/con
 
 | ID | Feature | Existing implementation | Required behaviour | Reference | Applicability | Implementation status | Verification | Final result |
 |---|---|---|---|---|---|---|---|---|
-| IMG-01 | Restore image directly to selected partition | DriveView, Window.choose_restore, UDisksService.restore_disk_image, DiskImageCopy | Restore RAW or XZ to the confirmed partition only and verify readback and metadata refresh. | GNOME restore_partition_image_cb and restore_disk_image_dialog.rs, UDisks Block | Linux feature | Implemented in source | disposable-partition-image-integration, disposable-partition-xz-integration, ui-templates | Runtime results recorded below. |
-| IMG-02 | Attach/detach VHD/VHDX | VirtualDisk, DiskImageCopy, VirtualDiskAttachment, nbd-helper.c | NBD service + policy + helper | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux feature | Implemented in source, untested | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
-| IMG-03 | Direct QCOW2 attachment | VirtualDisk, DiskImageCopy, VirtualDiskAttachment, nbd-helper.c | QEMU NBD, read-only default | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux feature | Implemented in source, untested | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
-| IMG-04 | Change disk-image virtual size | VirtualDisk.write_image, UDisksService.require_detached_image, VirtualImageDialog | Grow a detached, self-contained RAW, VHD, VHDX or QCOW2 image. Verify the new capacity and copied data before publishing. | QEMU image tools and UDisks Block | Linux feature | Implemented as grow-to-copy | virtual-image-growth and ui-templates | See the growth and compression results below. Live attachment exclusion and interactive use remain open. |
-| IMG-05 | Create image from folder/file selection | VirtualDisk, DiskImageCopy, VirtualDiskAttachment, nbd-helper.c | Apple preserves files without free-space sectors | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux feature | Missing | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
-| IMG-06 | Encrypted image creation | VirtualDisk, DiskImageCopy, VirtualDiskAttachment, nbd-helper.c | DMG-type parity, platform specific | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux analogue | Missing | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
-| IMG-07 | Sparsebundle/sparse-image workflows | VirtualDisk, DiskImageCopy, VirtualDiskAttachment, nbd-helper.c | DMG format support not required; Linux equivalent useful | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux analogue | Partial (sparse raw only) | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
-| IMG-08 | Image convert read-only/compressed/encrypted | VirtualDisk.write_image, VirtualImageDialog, VirtualDiskAttachment | Convert to compressed QCOW2 and keep the existing read-only attachment option. Track encrypted output separately. | QEMU image tools and UDisks Block | Linux feature | Partial | virtual-image-growth and ui-templates | QCOW2 compression implemented. Read-only attachment is distinct from a host-level read-only output file. Encrypted conversion remains open. |
-| IMG-09 | Create/convert ISO/CD-master/hybrid | VirtualDisk, DiskImageCopy, VirtualDiskAttachment, nbd-helper.c | Image-authoring feature, not core partition management | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux feature | Missing | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
-| IMG-10 | Restore disk image with native filesystem-aware replication | Window.choose_restore, UDisksService.restore_disk_image, DiskImageCopy | Distinct from raw byte restore | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux analogue | Missing (raw bytes only) | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
-| IMG-11 | Optical image mounting standalone launcher | VirtualDisk, DiskImageCopy, VirtualDiskAttachment, nbd-helper.c | Majoris image attachment from application | GNOME restore_disk_image_dialog.rs, UDisks Block and QEMU image tools | Linux feature | Partial | disposable-imaging-integration, disposable-xz-integration or disposable-nbd-integration plus feature-specific fixture | Open. Acceptance case pending. |
+| IMG-01 | Restore image directly to selected partition | DriveView, Window.choose_restore, UDisksService.restore_disk_image, DiskImageCopy | Restore only the reviewed partition range and verify readback and metadata refresh | GNOME restore_disk_image_dialog.rs, UDisks Block | Linux feature | Implemented and execution-tested for RAW and XZ | disposable-partition-image-integration, disposable-partition-xz-integration, disposable-mbr-image-restore | Runtime evidence below. |
+| IMG-02 | Attach/detach VHD/VHDX | VirtualDisk, VirtualDiskAttachment, nbd-helper.c | Restricted, read-only NBD attachment with verified partition discovery | UDisks Block and QEMU image tools | Linux feature | Implemented and execution-tested read-only | disposable-nbd-integration | Partition, ext4 payload, busy-detach refusal and normal removal passed. |
+| IMG-03 | Direct QCOW2 attachment | VirtualDisk, VirtualDiskAttachment, nbd-helper.c | Read-only default and explicit writable QCOW2 | UDisks Block and QEMU image tools | Linux feature | Implemented and execution-tested for self-contained images | disposable-nbd-integration | Read-only QCOW2, compressed QCOW2 and persistent writable QCOW2 changes passed. |
+| IMG-04 | Change disk-image virtual size | VirtualDisk.write_image, UDisksService.require_detached_image, VirtualImageDialog | Grow a detached, self-contained RAW, VHD, VHDX or QCOW2 image. Verify the new capacity and copied data before publishing. | QEMU image tools and UDisks Block | Linux feature | Implemented and execution-tested as grow-to-copy | virtual-image-growth and ui-templates | The file fixture verified growth for all four formats. Interactive use and live attached-source exclusion remain open. |
+| IMG-05 | Create image from folder/file selection | Separate filesystem image authoring | Populate an image from selected files | Scope review | Linux feature | Unsupported | Not executed | Open. |
+| IMG-06 | Encrypted image creation | Separate encrypted image authoring | Create an encrypted image container | Scope review | Linux analogue | Unsupported | Not executed | Open. |
+| IMG-07 | Sparsebundle/sparse-image workflows | DiskImageCopy.create_blank, VirtualDisk.write_image | Sparse RAW creation and conversion | GNOME gdu-create-disk-image-dialog.c and QEMU image tools | Linux analogue | Partially implemented | virtual-image-conversion, virtual-image-growth | Sparse RAW supported. Proprietary DMG and sparsebundle remain unsupported. |
+| IMG-08 | Image conversion and compression | VirtualDisk.write_image, DiskImageCopy, VirtualImageDialog | Compare logical data before publication | QEMU image tools and liblzma | Linux feature | Implemented and execution-tested for supported pairs | virtual-image-conversion, virtual-image-growth, native-xz | RAW, VHD, VHDX, QCOW2, compressed QCOW2 and RAW + XZ workflows. Encrypted conversion is unsupported. |
+| IMG-09 | Create/convert ISO/CD-master/hybrid | Separate optical authoring | Author ISO/CD-master/hybrid filesystems | Scope review | Linux feature | Unsupported | Not executed | Read-only inspection and attachment of existing ISO files are available. |
+| IMG-10 | Filesystem-aware replication | Separate filesystem replication | Preserve files while omitting unused sectors | Scope review | Linux analogue | Unsupported | Not executed | Sector-based restore is covered under IMG-01. |
+| IMG-11 | Standalone image attachment | Application.open, Window.confirm_attach_image, UDisksService | Open a local image and attach through UDisks or managed NBD | GNOME gdu-attach-disk-image-dialog.c and gdu-manager.c | Linux feature | Partially execution-tested | disposable-imaging-integration, disposable-nbd-integration, ui-templates | Backend attachment tested. Desktop launcher and optical-specific smoke testing remain open. |
 ## 7. Multi-disk, RAID, thin provisioning and filesystems
 
 | ID | Feature | Existing implementation | Required behaviour | Reference | Applicability | Implementation status | Verification | Final result |
@@ -266,6 +266,101 @@ The **Grow a Copy…** action uses the existing Bubblewrap-isolated QEMU backend
 The **Compress QCOW2 data** switch passes QEMU's compression option when converting to QCOW2 and verifies guest-visible sectors before publishing. No new GNOME functions were copied or adapted in this pass. The changes use the existing optional `qemu-utils` and Bubblewrap dependencies.
 
 On Debian 13.5, `meson compile -C build/feature-closure` and a staged `meson install` passed. `meson test -C build/feature-closure --no-rebuild --print-errorlogs` passed seven tests and skipped eight opt-in live cases. The passing cases were `native-xz`, `btrfs-default-helper`, `nbd-helper`, `filesystem-capacity-integration`, `storage-model`, `ui-templates` and `virtual-image-growth`. QEMU 10.0.13 was available inside a temporary mount namespace for this run. The new file-based fixture grew each of the four formats from 64 MiB to 128 MiB with known payload data, verified copy and progress, rejected shrink requests and a simulated attached-source failure, and exercised external backing files, internal snapshots and compressed QCOW2 output. Live UDisks attachment exclusion, interactive dialog use, hardware testing and the other open release gates remain pending.
+
+## Advanced imaging follow-up
+
+The four previous RAW, XZ and partition imaging failures remain recorded in
+`mdraid-release-hardening-2026-11-11.md`. A fresh Debian 13.7 QEMU guest
+reproduced all four refusals. On the first failed fixture, UDisks reported
+`HintSystem=true`, read-only access, no filesystem, no drive, and no crypto or
+RAID dependency. The kernel still showed the expected backing inode and
+autoclear off. The safety refusal occurred before `Loop.Delete`.
+
+For verified image attachments, imaging now distinguishes the UDisks
+authorization hint from evidence of running system use. Loop detachment
+checks UDisks dependencies, kernel partitions, mounts, holders, the backing
+inode and disk sequence. It sends `Loop.Delete` once and checks both kernel
+and UDisks state before reporting success.
+
+The earlier NBD fixture returned before UDisks had exposed the partition
+and filesystem. Attachment now waits for UDisks children to match the
+partition device numbers exposed by the kernel. The intermediate rerun
+reached the filesystem check and then found an independent identity
+problem during backup. The identity check now reads the logical sector size
+from the kernel, so an asynchronous UI cache update cannot change the
+reviewed identity. The NBD fixture also mounts the partition and checks a
+known file before testing busy-detach refusal and normal unmount.
+
+The supplied GNOME Disk Utility archive informed the sequencing of
+`gdu-create-disk-image-dialog.c` and `restore_disk_image_dialog.rs` for
+dependency checks and restricted descriptors, `gdu-manager.c` and
+`gdu-attach-disk-image-dialog.c` for descriptor-based loop attachment,
+and `gdu-job-manager.c` for observable work. The implementation uses
+Majoris Vala and its existing job model. No GNOME source was copied.
+
+Backup compression uses the liblzma stream encoder with CRC64 and checks
+decoded size and SHA-256 before publication. Virtual restoration pins the
+source descriptor, converts to private sparse RAW, compares guest-visible
+data, and applies the same block-target readback verification as RAW.
+QEMU runs under Bubblewrap using `info`, `check` for QCOW2, `measure`,
+`create`, `convert` and `compare`. Attachment uses a private Unix socket
+and the existing authorized NBD helper. Writable attachment is restricted
+to QCOW2. Restore records the reviewed target and logical digest before
+writing. Interrupted file operations retain a private-work-directory record
+for review. Reopening the UI reports orphaned operation records in the job
+list.
+
+### Debian 13.7 QEMU execution
+
+Kernel 6.12.115+deb13.1-amd64 reported NBD `max_part=31`. Installed packages
+included UDisks 2.10.1-12.1+deb13u2, QEMU 10.0.13, nbd-client 3.26.1,
+Bubblewrap 0.12.0, util-linux 2.41.5, liblzma 5.8.1, GTK 4.18.6,
+libadwaita 1.7.6, GLib 2.84.4, Meson 1.7.0, Vala 0.56.18 and Polkit 126.
+
+| Command or fixture | Result |
+|---|---|
+| `meson setup build --prefix=/usr`, `meson setup --reconfigure build`, `meson compile -C build -j 6`, and `meson install -C build --no-rebuild` | Passed in the guest. |
+| `meson test -C build --no-rebuild --print-errorlogs` | 11 passed, 98 skipped, zero failures. The guest's default user path omitted the partition or filesystem tools needed by the conversion fixture. The root opt-in run executed it. |
+| `MAJORIS_DISKS_RUN_IMAGING_TESTS=1` with the 13 focused Meson targets listed in `tests/MANUAL-TESTING.md` | 13 passed, zero skipped and zero failures. |
+| Four original RAW, XZ and partition imaging cases plus the MBR case | Passed. Tests rejected stale confirmation, oversized input, destination reuse and source replacement after review. Byte comparisons covered the restored range and bytes outside it, including sibling partitions and trailing sectors. |
+| QCOW2, VHD and VHDX restore and conversion | Passed. Logical comparison and SHA-256 covered conversions through all three containers, compressed QCOW2, QCOW2/VHDX cross-conversion and RAW + XZ extraction. |
+| NBD attachment | Passed. VHD, VHDX, QCOW2 and compressed QCOW2 each exposed an ext4 partition with the known file. The test checked the wrong token, duplicate attachment, a fresh service instance, mounted-volume refusal, detachment and writable QCOW2 persistence. |
+| Backup process killed before publication | Passed. The final destination stayed absent. The recovery record and private work directory survived. Cleanup released the fixture loop after verifying its backing path and inode. |
+
+The default suite also passed in Debian WSL with 13 passes, 101 skips and
+zero failures. A subsequent application rebuild and `ui-templates` run
+passed after the capacity-label updates.
+
+The broader guest run passed live filesystem capacity, LVM recovery,
+Btrfs device replacement, scrub and traditional quotas, mdraid RAID1
+recovery and bitmap-assisted re-addition, the storage model and GtkBuilder
+checks. Traditional quota and bitmap re-addition passed after installing
+the guest's missing `pkexec` and allowing the fixture's unprivileged test
+user to traverse its build directory. The direct LUKS resize fixture
+passed with both binaries after the Meson runs reported intermittent
+failures in discovery and `resize2fs`.
+
+Three broader cases still failed. The generic GPT/MBR loop fixture
+again requested a 90 MiB partition where UDisks reported an 80 MiB maximum.
+The LUKS header fixture reproduced the prior busy-device and dependent
+storage refusal. The Btrfs profile fixture gave the same protected-member
+refusal with both the pre-imaging and current binaries in this guest.
+These failures are release gates for those workflows.
+
+Remaining execution gaps include interactive desktop use,
+physical media, full process and service restart permutations, deliberately
+lost D-Bus replies, device disappearance during a write, and injected
+partial block restores. The earlier storage release blockers remain
+tracked separately.
+
+Modified files
+
+| Area | Files |
+|---|---|
+| Imaging and verification | `src/disk-image-copy.vala`, `src/xz-stream.c`, `src/xz-stream.h`, `src/virtual-disk.vala` |
+| Attachment, storage jobs and safety | `src/udisks-service.vala`, `src/virtual-disk-attachment.vala`, `src/kernel-storage-safety.vala`, `src/device.vala`, `src/safety.vala`, `src/hierarchy.vala` |
+| GTK4 and libadwaita | `src/main.vala`, `src/window.vala`, `data/ui/window.ui`, `data/ui/disk-image-confirmation.ui`, `data/ui/virtual-image-dialog.ui`, `data/ui/create-blank-image-dialog.ui` |
+| Test registration, fixtures and documentation | `meson.build`, `tests/image-device-test.vala`, `tests/xz-stream-test.c`, `tests/MANUAL-TESTING.md`, `docs/feature-parity-completion.md` |
 
 ## Platform scope
 

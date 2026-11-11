@@ -3,6 +3,7 @@ namespace MajorisDisks {
         public string format;
         public uint64 capacity;
         public uint64 file_size;
+        public uint64 allocated_size;
         public string identity = "";
         public bool has_snapshots;
     }
@@ -107,6 +108,9 @@ namespace MajorisDisks {
             if (root.has_member ("backing-filename") || root.has_member ("full-backing-filename") ||
                 (details != null && (details.has_member ("data-file") || details.has_member ("backing-file"))))
                 throw new IOError.NOT_SUPPORTED ("Images with external backing or data files are unsupported.");
+            if ((root.has_member ("encrypted") && root.get_boolean_member ("encrypted")) ||
+                details?.has_member ("encrypt") == true)
+                throw new IOError.NOT_SUPPORTED ("Encrypted virtual disk containers are unsupported.");
             string format = root.get_string_member ("format");
             int64 capacity = root.get_int_member ("virtual-size");
             if (!supported (format) || capacity <= 0)
@@ -115,9 +119,12 @@ namespace MajorisDisks {
             result.format = format;
             result.capacity = (uint64) capacity;
             result.file_size = (uint64) file.st_size;
+            result.allocated_size = (uint64) file.st_blocks * 512;
             result.identity = identity;
             result.has_snapshots = root.has_member ("snapshots") &&
                 root.get_array_member ("snapshots").get_length () > 0;
+            if (format == "qcow2")
+                yield run (input, null, { "check", "-f", format, "/source" }, token);
             if (identity != image_identity (input))
                 throw new IOError.INVALID_DATA ("The image changed during inspection.");
             return result;
@@ -142,7 +149,7 @@ namespace MajorisDisks {
                 throw new IOError.NO_SPACE ("QEMU estimates that the converted image needs more free space than is available.");
         }
 
-        private static int open_image (File file) throws Error {
+        internal static int open_image (File file) throws Error {
             string? path = file.get_path ();
             if (path == null) throw new IOError.INVALID_ARGUMENT ("Choose a local disk image.");
             int fd = Posix.open (path, Posix.O_RDONLY | Posix.O_CLOEXEC | Posix.O_NOFOLLOW | Posix.O_NONBLOCK);
@@ -154,6 +161,26 @@ namespace MajorisDisks {
             int fd = open_image (file);
             try { return yield inspect_fd (fd, token); }
             finally { Posix.close (fd); }
+        }
+
+        internal static async int materialize_raw (int source, VirtualDiskInfo info, string directory,
+            Cancellable token, ConversionProgress? progress = null) throws Error {
+            if (info.has_snapshots || info.format == "raw")
+                throw new IOError.NOT_SUPPORTED ("Choose a self-contained virtual disk without internal snapshots.");
+            var output = File.new_for_path (Path.build_filename (directory, "disk"));
+            yield check_conversion_space (source, info.format, "raw", output, token);
+            yield run (source, directory, { "convert", "-p", "-f", info.format, "-O", "raw",
+                "/source", "/output/disk" }, token, progress);
+            yield run (source, directory, { "compare", "-f", info.format, "-F", "raw",
+                "/source", "/output/disk" }, token);
+            int fd = open_image (output);
+            Posix.Stat stat = {};
+            if (image_identity (source) != info.identity || Posix.fstat (fd, out stat) != 0 ||
+                !Posix.S_ISREG (stat.st_mode) || (uint64) stat.st_size != info.capacity) {
+                Posix.close (fd);
+                throw new IOError.INVALID_DATA ("The source identity or staged logical image size changed.");
+            }
+            return fd;
         }
 
         public static async void write_image (File? source, File destination, string format, uint64 capacity,
@@ -172,7 +199,10 @@ namespace MajorisDisks {
                 throw new IOError.FAILED ("Could not create a private conversion directory.");
             string temporary = Path.build_filename (directory, "disk");
             int fd = -1;
+            ImageOperationJournal? recovery = null;
             try {
+                recovery = new ImageOperationJournal (grow != null ? "Grow disk image copy" : "Write disk image", path,
+                    "Review the destination and the private work directory " + directory + ".");
                 if (grow != null && (source == null || format != grow.format || capacity <= grow.capacity))
                     throw new IOError.INVALID_ARGUMENT ("Choose a larger capacity in the same image format.");
                 if (source == null || grow != null) {
@@ -207,30 +237,34 @@ namespace MajorisDisks {
                     if (grow != null) convert += "-n";
                     else if (format == "vpc") { convert += "-o"; convert += "force_size=on"; }
                     if (compress) convert += "-c";
+                    if (format == "raw") { convert += "-S"; convert += "4k"; }
                     convert += "/source";
                     convert += "/output/disk";
                     ConversionProgress? copy_progress = null;
-                    bool verify_contents = grow != null || compress;
                     if (progress != null) {
-                        if (verify_contents) copy_progress = (fraction) => progress (fraction * 0.8);
-                        else copy_progress = (fraction) => progress (fraction);
+                        copy_progress = (fraction) => progress (fraction * 0.8);
                     }
                     yield run (fd, directory, convert, token, copy_progress);
-                    if (verify_contents) {
-                        // Non-strict comparison accepts extra sectors only if they read back as zero.
-                        ConversionProgress? verify_progress = null;
-                        if (progress != null) verify_progress = (fraction) => progress (0.8 + fraction * 0.2);
-                        yield run (fd, directory, { "compare", "-p", "-f", information.format, "-F", format,
-                            "/source", "/output/disk" }, token, verify_progress);
-                    }
+                    // Non-strict comparison accepts extra sectors only if they read back as zero.
+                    ConversionProgress? verify_progress = null;
+                    if (progress != null) verify_progress = (fraction) => progress (0.8 + fraction * 0.2);
+                    yield run (fd, directory, { "compare", "-p", "-f", information.format, "-F", format,
+                        "/source", "/output/disk" }, token, verify_progress);
                     if (original != image_identity (fd))
                         throw new IOError.INVALID_DATA ("The source image changed during conversion.");
+                    int current_source = open_image (source);
+                    bool same_source = original == image_identity (current_source);
+                    Posix.close (current_source);
+                    if (!same_source)
+                        throw new IOError.INVALID_DATA ("The selected image path changed during conversion.");
                 }
                 int output = open_image (File.new_for_path (temporary));
                 try {
                     var verified = yield inspect_fd (output, token);
                     if (verified.format != format || verified.capacity != capacity)
                         throw new IOError.INVALID_DATA ("The output format or virtual capacity did not match the request.");
+                    if (Posix.fchmod (output, 0600) != 0 || Posix.fsync (output) != 0)
+                        throw new IOError.FAILED ("Could not flush the verified image: " + Posix.strerror (Posix.errno));
                 } finally { Posix.close (output); }
                 if (grow != null) {
                     if (grow.identity != image_identity (fd))
@@ -243,7 +277,8 @@ namespace MajorisDisks {
             } finally {
                 if (fd >= 0) Posix.close (fd);
                 if (FileUtils.test (temporary, FileTest.EXISTS)) FileUtils.unlink (temporary);
-                if (DirUtils.remove (directory) != 0) warning ("Could not remove image work directory %s", directory);
+                if (DirUtils.remove (directory) == 0) recovery?.remove ();
+                else warning ("Could not remove image work directory %s", directory);
             }
         }
     }

@@ -14,6 +14,9 @@ namespace MajorisDisks {
             virtual_image.set_enabled (VirtualDisk.available ());
             virtual_image.activate.connect (() => (active_window as DisksWindow)?.choose_virtual_image ());
             add_action (virtual_image);
+            var verify_image = new SimpleAction ("verify-image", null);
+            verify_image.activate.connect (() => (active_window as DisksWindow)?.choose_verify_image ());
+            add_action (verify_image);
             var blank = new SimpleAction ("blank-image", null);
             blank.activate.connect (() => (active_window as DisksWindow)?.choose_blank_image ());
             add_action (blank);

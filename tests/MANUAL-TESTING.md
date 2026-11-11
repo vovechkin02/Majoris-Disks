@@ -421,3 +421,52 @@ the active reconstruction and terminal messages separately.
 The ordinary bitmap fixture restarts UDisks in both enabled and disabled states;
 verify the UI also rediscovers each. External/unknown bitmap states stay
 inspection-only and must not be rewritten after restart.
+
+## Disk imaging
+
+Use an isolated Debian 13 QEMU guest with owned disposable images. Install
+UDisks, QEMU tools, Bubblewrap, nbd-client, fdisk, e2fsprogs and the installed
+Majoris NBD helper and policy. Check that the guest's NBD module has
+`max_part` greater than zero and that the test user has a systemd-managed
+runtime directory. Module settings apply to the guest.
+
+```sh
+meson setup build
+meson compile -C build
+meson test -C build --print-errorlogs
+sudo env MAJORIS_DISKS_RUN_IMAGING_TESTS=1 XDG_RUNTIME_DIR=/run/user/0 \
+  meson test -C build --no-rebuild --print-errorlogs --num-processes 1 \
+  disposable-imaging-integration disposable-xz-integration \
+  disposable-partition-image-integration disposable-partition-xz-integration \
+  disposable-mbr-image-restore disposable-qcow2-restore disposable-vhd-restore \
+  disposable-vhdx-restore disposable-nbd-integration virtual-image-conversion \
+  virtual-image-growth native-xz nbd-helper
+```
+
+- Create a RAW backup and a RAW + XZ backup of an idle fixture. Check the
+  logical size and SHA-256 with **Verify Disk Image**. Check that an existing
+  destination survives a rejected backup and that cancellation before
+  publication leaves the selected destination untouched.
+- Restore to an owned larger disk and to one of two partitions. Compare the
+  restored range, sibling partition, partition table and trailing bytes with
+  the saved fixture. Repeat with XZ and virtual containers. A renamed virtual
+  container presented as RAW must be rejected before the target is opened.
+- Attach RAW through UDisks. Inspect `G_MESSAGES_DEBUG=all` for loop device
+  number, disk sequence, autoclear, dependencies and the exclusive-open check.
+  Verify mounted or held descendants block detachment, then unmount normally
+  and verify the old loop generation disappears from the kernel and UDisks.
+- Open XZ through **Attach Disk Image**, choose a new RAW destination and
+  verify it attaches read-only after extraction. Compare logical SHA-256
+  across the original XZ and the extracted RAW image.
+- Attach VHD, VHDX, QCOW2 and compressed QCOW2 read-only. Verify the partition
+  and filesystem and read a known file. Verify writable QCOW2 separately and
+  confirm its change survives detachment and read-only reattachment.
+- Interrupt a backup, conversion and disposable block restore after writing
+  begins. Reopen Majoris and inspect the job's recovery record in
+  `${XDG_STATE_HOME:-$HOME/.local/state}/majoris-disks/imaging`. For a block
+  restore, compare the target with the saved fixture before authorizing a
+  new restore. Review the named private work directory and destination for
+  interrupted file publication.
+
+Classify every result as **Passed**, **Failed**, **Skipped** or **Not executed**.
+An unexpected failure after a fixture starts is a failure.

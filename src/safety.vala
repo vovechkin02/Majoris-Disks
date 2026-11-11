@@ -158,7 +158,15 @@ namespace MajorisDisks {
     }
 
     public class StorageSafetyService {
-        public static StorageSafetyAssessment assess (StorageDevice device, StorageDependencyService? graph = null) {
+        private static bool managed_image_volume (StorageBlock volume) {
+            var image = volume;
+            while (image.partition != null && image.parent is StorageBlock)
+                image = (StorageBlock) image.parent;
+            return image.loop?.managed () == true || image.virtual_attachment != null;
+        }
+
+        public static StorageSafetyAssessment assess (StorageDevice device, StorageDependencyService? graph = null,
+            bool distinguish_managed_image_hint = false) {
             var result = new StorageSafetyAssessment (device);
             var drive = device as StorageDrive;
             var block = device as StorageBlock;
@@ -172,7 +180,10 @@ namespace MajorisDisks {
                 if (graph != null && graph.unknown (node)) result.unknown_dependencies = true;
                 if (lv?.active == true || (node != device && node is StorageRaid)) result.active_dependents = true;
                 if (volume == null) continue;
-                if (volume.system_hint) result.system_critical = true;
+                // UDisks uses HintSystem for authorization on ordinary image devices too.
+                // Live system mount paths, dependencies and kernel checks still apply.
+                if (volume.system_hint && (!distinguish_managed_image_hint || !managed_image_volume (volume)))
+                    result.system_critical = true;
                 if (volume.swap_active || volume.encrypted?.mapping != null ||
                     (volume != block && volume.filesystem?.mounted == true))
                     result.active_dependents = true;
@@ -197,7 +208,7 @@ namespace MajorisDisks {
         public static StorageOperationEligibility assess_operation (StorageOperationKind operation,
             StorageDevice device, StorageDependencyService? graph) {
             var eligibility = new StorageOperationEligibility ();
-            var assessment = assess (device, graph);
+            var assessment = assess (device, graph, operation == StorageOperationKind.IMAGE_RESTORE);
             StorageDevice[] nodes = graph == null ? new StorageDevice[] { device } : graph.descendants (device);
             string[] affected = {};
             foreach (var node in nodes) affected += node.path;

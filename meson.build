@@ -204,8 +204,13 @@ test('disposable-imaging-integration', imaging_test, timeout: 180)
 test('disposable-xz-integration', imaging_test, args: ['--xz'], timeout: 180)
 test('disposable-partition-image-integration', imaging_test, args: ['--partition'], timeout: 180)
 test('disposable-partition-xz-integration', imaging_test, args: ['--partition', '--xz'], timeout: 180)
+test('disposable-mbr-image-restore', imaging_test, args: ['--partition', '--mbr'], timeout: 180)
 test('disposable-nbd-integration', imaging_test, args: ['--nbd'], timeout: 300)
 test('virtual-image-growth', imaging_test, args: ['--grow'], timeout: 120)
+test('virtual-image-conversion', imaging_test, args: ['--convert'], timeout: 180)
+foreach format : ['qcow2', 'vhd', 'vhdx']
+  test('disposable-' + format + '-restore', imaging_test, args: ['--' + format], timeout: 180)
+endforeach
 if cryptsetup_dep.found()
   restoration_test_args = []
   if mount_dep.found()

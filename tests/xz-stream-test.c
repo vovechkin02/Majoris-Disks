@@ -100,6 +100,46 @@ test_cancel_after_write (void)
     g_assert_null (digest);
 }
 
+static void
+test_encode (void)
+{
+    const gsize size = 200000;
+    g_autofree guint8 *payload = g_malloc (size);
+    g_autoptr(GRand) random = g_rand_new_with_seed (37);
+    for (gsize i = 0; i < size; i++)
+        payload[i] = g_rand_int (random) & 0xff;
+
+    g_autoptr(GInputStream) source = g_memory_input_stream_new_from_data (payload, size, NULL);
+    g_autoptr(GOutputStream) output = g_memory_output_stream_new_resizable ();
+    g_autoptr(GError) error = NULL;
+    g_autofree char *encoded_digest = NULL;
+    g_assert_true (majoris_xz_encode (source, output, size, NULL, NULL, NULL, &encoded_digest, &error));
+    g_assert_no_error (error);
+    g_assert_true (g_output_stream_close (output, NULL, &error));
+    g_autoptr(GBytes) compressed = g_memory_output_stream_steal_as_bytes (G_MEMORY_OUTPUT_STREAM (output));
+    g_autoptr(GInputStream) input = g_memory_input_stream_new_from_bytes (compressed);
+    g_autofree char *decoded_digest = NULL;
+    guint64 decoded_size = 0;
+    g_assert_true (majoris_xz_decode (input, NULL, size, NULL, NULL, NULL, &decoded_size, &decoded_digest, &error));
+    g_assert_no_error (error);
+    g_assert_cmpuint (decoded_size, ==, size);
+    g_autofree char *expected = g_compute_checksum_for_data (G_CHECKSUM_SHA256, payload, size);
+    g_assert_cmpstr (encoded_digest, ==, expected);
+    g_assert_cmpstr (decoded_digest, ==, expected);
+
+    g_autoptr(GOutputStream) incomplete = g_memory_output_stream_new_resizable ();
+    g_autofree char *failed_digest = NULL;
+    g_assert_false (majoris_xz_encode (source, incomplete, size, NULL, NULL, NULL, &failed_digest, &error));
+    g_assert_error (error, G_IO_ERROR, G_IO_ERROR_PARTIAL_INPUT);
+    g_assert_null (failed_digest);
+    g_clear_error (&error);
+    g_autoptr(GCancellable) token = g_cancellable_new ();
+    g_cancellable_cancel (token);
+    g_assert_false (majoris_xz_encode (source, incomplete, size, token, NULL, NULL, &failed_digest, &error));
+    g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+    g_assert_null (failed_digest);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -107,5 +147,6 @@ main (int argc, char **argv)
     g_test_add_func ("/native-xz/valid", test_valid);
     g_test_add_func ("/native-xz/errors", test_errors);
     g_test_add_func ("/native-xz/cancel-after-write", test_cancel_after_write);
+    g_test_add_func ("/native-xz/encode", test_encode);
     return g_test_run ();
 }
