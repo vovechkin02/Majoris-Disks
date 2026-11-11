@@ -236,3 +236,161 @@ a writable mount the read-only confirmation should describe internal writes.
 On the repair fixture, verify that a recovered read-only copy and a corrected
 repair result have different messages. Check real-drive SMART/NVMe indications
 separately from the fixture's Btrfs lifetime counters.
+
+## Advanced mdraid release acceptance (11 November 2026)
+
+Use only an isolated Debian 13 QEMU guest named `majoris-mdraid-test`. Install
+the built application, restricted helper and generated MDRaid Polkit policy at
+their configured paths. Do not substitute a root or SSH session for the desktop
+tests. Record **Passed**, **Failed**, **Skipped** or **Not executed** separately
+for each case. An unexpected error after fixture creation is a failure.
+
+### Desktop authorization and dialog lifecycle
+
+Log into GNOME as an ordinary administrator with an active authentication
+agent and session D-Bus. Create an owned disposable two-member RAID1 using the
+opt-in fixture. Record its UUID, each member UUID and slot, event counters,
+disk sequences, `mdadm --detail --export`, `mdadm --examine --export`, sysfs
+`array_state`, `sync_action`, `degraded` and the known payload checksum.
+Open Advanced Storage → RAID Management and review fault marking of one
+eligible member. Cancel the confirmation first: no helper invocation, changed
+metadata, new successful job or remaining modification lock is permitted.
+
+Repeat the review and approve the actual Polkit dialog. Verify the action is
+`com.majoris.disks.mdraid-member-state` and the configured helper is invoked.
+The resulting member must be faulty at the recorded slot, exactly one other
+member must remain synchronized, degraded must equal one, and payload must
+remain readable. Restore a fresh fixture for every destructive case.
+
+Repeat with denial and prompt cancellation. Compare the recorded kernel state,
+superblocks, slots and checksum. No mutation or successful job is permitted.
+Close and reopen the dialog; a new review must be possible without a stuck
+progress window or lock. Repeat after a fresh login (the policy uses
+`auth_admin`, not permanent cached authorization). Invoke the same reviewed
+helper request from an unauthenticated noninteractive normal-user session;
+Polkit must refuse it. Record that separately from graphical acceptance.
+
+While authorization is pending, separately remove the selected member, change
+the array identity using a fresh disposable fixture, or start another operation
+on the same dependency graph. Approving the old prompt must not modify a
+substituted member or array. The helper must reject the stale UUID, slot, event
+or disk sequence. Verify the actual kernel outcome if dispatch may have occurred;
+only a definitively blocked request may say authorization changed nothing.
+
+With the dialog open, stop/restart UDisks, then close/reopen the dialog. Observe
+the same unique array UUID and current member rows, bitmap and sync action.
+A missing/ambiguous array or changed kernel identity must disable all writes.
+Exercise healthy, degraded, missing-slot and unknown-member presentations.
+Check each replacement review and confirmation cancellation. A partially
+recovered RAID6 must retain a degraded warning, and an unverifiable outcome
+must never receive an unconditional completion message.
+
+### Live recovery, layouts and device identity
+
+```sh
+export MAJORIS_DISKS_RUN_MDRAID_TESTS=1
+sudo -E meson test -C build --no-rebuild --print-errorlogs \
+  'mdraid-recovery-*' mdraid-member-bitmap-readd
+```
+
+For RAID4, execute `mdraid-recovery-raid4` explicitly. Require the same UUID,
+intended replacement slot, in_sync states, idle synchronization, zero degraded
+count and original checksum. RAID5 coverage is not RAID4 evidence. The model
+test additionally refuses RAID4 with two missing slots and RAID10 with both
+copies of a near-two pair missing. Run the near3, far2, offset2 and odd-count
+RAID10 fixtures; record the actual sysfs layout and ensure automated replacement
+is unavailable and the original payload is intact. Unknown layout metadata is
+covered by the model; never reinterpret it as layout 258.
+
+The disappearance/reuse fixtures capture a review, detach its owned empty
+target, and optionally bind a new backing image to the exact same loop number.
+The disk sequence must change and the old review must fail before AddDevice.
+Check that the target has no md slot, degraded remains one and checksum matches.
+Repeat manually while Polkit is pending and after accepted AddDevice; for the
+latter record running/degraded/unknown state rather than claiming no dispatch.
+Also remove a survivor, the md block object, and an array from the dialog in
+separate throwaway fixtures. No stale controls or automatic retry are allowed.
+
+### Reboot during active reconstruction
+
+These explicit phases run inside the designated guest. Save the exact printed
+directory. Prepare alone is not a passed reboot test. The record is root-owned,
+private data, never executable shell. Do not edit it or reuse a different guest.
+
+```sh
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-reboot-integration.sh \
+  build/mdraid-service-test prepare
+# Substitute the printed directory for "$fixture" in each following command.
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-reboot-integration.sh \
+  build/mdraid-service-test reboot "$fixture"
+# Reconnect after the guest boots.
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-reboot-integration.sh \
+  build/mdraid-service-test verify "$fixture"
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-reboot-integration.sh \
+  build/mdraid-service-test cleanup "$fixture"
+```
+
+Prepare independently requires `sync_action=recover` and the replacement in
+slot zero. Verify requires a different boot ID, identical backing inodes and
+member UUIDs, safe ordinary assembly, fresh read-only Majoris rediscovery,
+both expected slots synchronized, idle state, zero degraded and SHA-256 match.
+It accepts a rebuild completed during startup. The observer issues no AddDevice.
+An identity mismatch stops the phase and retains evidence; inspect it before
+any cleanup. Verification does not automatically delete persistent resources.
+Meson can run verify only when `MAJORIS_MDRAID_REBOOT_MANIFEST` names a prepared,
+already-rebooted fixture; otherwise the phased test is skipped.
+
+### Stopped dirty/degraded parity refusal
+
+Use the dedicated throwaway QEMU overlay. The following `crash` phase triggers
+an abrupt reset of that guest, so finish other fixtures first. Repeat separately
+for RAID5 and RAID6. Do not use normal mdadm stop as proof of dirty metadata.
+
+```sh
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-dirty-stopped-integration.sh \
+  build/mdraid-service-test prepare raid5
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-dirty-stopped-integration.sh \
+  build/mdraid-service-test crash "$fixture"
+# After reconnecting:
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-dirty-stopped-integration.sh \
+  build/mdraid-service-test verify "$fixture"
+sudo env MAJORIS_DISKS_RUN_MDRAID_TESTS=1 sh tests/mdraid-dirty-stopped-integration.sh \
+  build/mdraid-service-test cleanup "$fixture"
+```
+
+Require dirty native metadata after reboot, absence of an assembled array,
+service refusal and byte-identical backing images around the refused request.
+No force assembly, event rewriting or `start_dirty_degraded` change is allowed.
+Use clean degraded RAID1/5 start tests as positive controls. Unknown cleanliness,
+event disagreement and missing parity membership must fail closed; capture
+native metadata and the reason for each separately. If the crash fixture cannot
+retain dirty metadata, mark it failed or not executed with the environmental
+reason; never replace its evidence with the running dirty RAID5 case.
+
+### Timeouts, helper interruption and final-state evidence
+
+Run `mdraid-recovery-udisks-timeout` and `mdraid-recovery-helper-interruption`.
+Their preload modules run only in the fixture client and are never installed.
+Timeout coverage suppresses dispatch, then loses the reply after a real accepted
+AddDevice. Both must produce needs-attention, one invocation and no automatic
+retry. Independently inspect the absent target in the first case and synchronized
+slot, zero degraded and checksum in the second. Helper cases inject pre-dispatch
+rejection, cancel, deny, unknown exit and real SIGKILL immediately before/after
+the restricted fault-marking ioctl. Cancellation/denial simulation is not
+desktop Polkit evidence. Repeat D-Bus disconnection in disposable fixtures;
+record accepted/running/completed/degraded/unknown from kernel evidence.
+
+Run `mdraid-recovery-false-completion` for slot, faulty-member, UUID, unknown
+action, read-only and degraded-state negatives. The full native reconstruction
+test must additionally reconcile sysfs and UDisks; percent complete alone is
+never sufficient. Healthy current state without matching historical member
+identity may be displayed but cannot attribute an interrupted operation.
+
+Run `mdraid-member-bitmap-readd`. It writes a controlled degraded payload and
+measures sectors actually written to the former member between re-add and idle.
+Record that count and component size. Report partial writes only when the count
+is smaller; a full rebuild is a valid measured result, not evidence of bitmap
+acceleration. Require expected slot, in_sync, zero degraded and payload checksum.
+The ordinary bitmap fixture restarts UDisks in both enabled and disabled states;
+verify the UI also rediscovers each. External/unknown bitmap states stay
+inspection-only and must not be rewritten after restart.

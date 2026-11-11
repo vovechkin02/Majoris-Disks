@@ -5,6 +5,7 @@ mdraid_require_guest
 service=$1
 case "$2" in
     raid1) count=2; level=1; losses=1 ;;
+    raid4) count=3; level=4; losses=1 ;;
     raid5) count=3; level=5; losses=1 ;;
     raid6) count=4; level=6; losses=1 ;;
     raid6-double) count=4; level=6; losses=2 ;;

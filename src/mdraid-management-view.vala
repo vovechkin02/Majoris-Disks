@@ -14,8 +14,9 @@ namespace MajorisDisks {
         private Adw.ActionRow[] member_rows = {};
         private UDisksService backend;
         private StorageBlock context;
-        private string path;
         private string uuid;
+        private string kernel_identity;
+        public StorageBlock current_context { get { return context; } }
         private ulong observer;
 
         public signal void replace_requested ();
@@ -29,8 +30,8 @@ namespace MajorisDisks {
         public MdRaidManagementView (UDisksService backend, StorageBlock context, StorageRaid array) {
             this.backend = backend;
             this.context = context;
-            path = array.path;
             uuid = array.uuid;
+            kernel_identity = array.kernel?.identity ?? "";
             replacement.activated.connect (() => replace_requested ());
             spare.activated.connect (() => spare_requested ());
             check.activated.connect (() => check_requested ());
@@ -48,7 +49,25 @@ namespace MajorisDisks {
         }
 
         private void refresh () {
-            var array = backend.snapshot.advanced.lookup (path) as StorageRaid;
+            StorageRaid? array = null;
+            int matches = 0;
+            foreach (var entry in backend.snapshot.advanced.get_values ()) {
+                var candidate = entry as StorageRaid;
+                if (candidate?.uuid != uuid) continue;
+                matches++;
+                array = candidate;
+            }
+            if (uuid == "" || matches != 1 || (kernel_identity != "" && array?.running == true &&
+                array.kernel?.identity != kernel_identity)) array = null;
+            bool live = false;
+            if (array != null) {
+                foreach (var block in backend.snapshot.blocks.get_values ()) {
+                    if (!block.available || block.raid != array) continue;
+                    context = block;
+                    live = true;
+                    break;
+                }
+            }
             foreach (var row in member_rows) members.remove (row);
             member_rows = {};
             if (array == null || array.uuid != uuid) {
@@ -59,12 +78,17 @@ namespace MajorisDisks {
             }
             var kernel = array.kernel;
             var topology = array.topology;
-            string condition = !array.running ? "Stopped" : kernel == null ? "Kernel state unavailable" :
-                kernel.state == "readonly" || kernel.state == "read-auto" ? "Read-only" :
-                topology == null || kernel.degraded != array.degraded.to_string () ||
-                    !kernel.verify_members (topology) ? "Health unverified" :
-                array.degraded > 0 ? "%u unavailable slots".printf (array.degraded) :
-                topology.missing_slots.length == 0 ? "All required slots synchronized" : "Health unverified";
+            // Keep formatted text in its own branch: Vala can free the owned
+            // string early when a nested conditional mixes it with literals.
+            string condition;
+            if (!array.running) condition = "Stopped";
+            else if (kernel == null) condition = "Kernel state unavailable";
+            else if (kernel.state == "readonly" || kernel.state == "read-auto") condition = "Read-only";
+            else if (topology == null || kernel.degraded != array.degraded.to_string () ||
+                !kernel.verify_members (topology)) condition = "Health unverified";
+            else if (array.degraded > 0) condition = "%u unavailable slots".printf (array.degraded);
+            else condition = topology.synchronized_slots (array.expected_members) ?
+                "All required slots synchronized" : "Health unverified";
             health.subtitle = array.uuid + "\n" + condition;
             geometry.subtitle = "%s · %u slots · %s".printf (array.level, array.expected_members, format_size (array.size));
             if (kernel != null)
@@ -86,7 +110,6 @@ namespace MajorisDisks {
                 synchronization.subtitle += "\nMismatch sectors: " + kernel.mismatch_count;
             string kind = MdRaidKernelState.bitmap_kind (kernel?.bitmap ?? array.bitmap_location);
             bitmap.subtitle = "%s · Policy: %s".printf (kind, kernel?.policy ?? "unknown");
-            bool live = context.raid == array;
             replacement.sensitive = live && backend.can_replace_missing_raid_member (context);
             replacement.subtitle = replacement.sensitive ? "Select a device and review the reconstruction plan" :
                 "No verified reconstruction plan for this array state";
@@ -119,11 +142,11 @@ namespace MajorisDisks {
                 };
                 if (!member.known_states ()) row.subtitle += "\nKernel flags " + string.joinv (", ", member.states);
                 if (member.metadata_uuid != "") row.subtitle += "\nMember UUID " + member.metadata_uuid;
-                if (block != null && backend.can_remove_inactive_raid_member (block)) {
+                if (live && block != null && backend.can_remove_inactive_raid_member (block)) {
                     row.activatable = true;
                     row.subtitle += " · Activate to review removal";
                     row.activated.connect (() => remove_requested (block));
-                } else if (block != null && backend.can_change_raid_member_state (context, block, false)) {
+                } else if (live && block != null && backend.can_change_raid_member_state (context, block, false)) {
                     row.activatable = true;
                     row.subtitle += " · Activate to review fault marking";
                     row.activated.connect (() => member_state_requested (block, false));
@@ -132,7 +155,7 @@ namespace MajorisDisks {
                 member_rows += row;
             }
             foreach (var block in backend.snapshot.blocks.get_values ()) {
-                if (!backend.can_change_raid_member_state (context, block, true)) continue;
+                if (!live || !backend.can_change_raid_member_state (context, block, true)) continue;
                 var row = new Adw.ActionRow () {
                     title = block.preferred,
                     subtitle = "Former member · Activate to review re-addition",

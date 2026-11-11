@@ -151,6 +151,34 @@ namespace MajorisDisks {
             return recoverable_slots (level, layout, expected, missing_slots);
         }
 
+        internal bool synchronized_slots (uint expected) {
+            if (expected == 0 || missing_slots.length != 0 || synchronized_count != expected)
+                return false;
+            foreach (var member in members)
+                if (!member.known_states () || "faulty" in member.states || "blocked" in member.states ||
+                    (member.slot >= 0 && !member.synchronized_member ()))
+                    return false;
+            return true;
+        }
+
+        // Used only to attribute an observed operation, never to authorize a write.
+        internal string member_evidence () {
+            var records = new GenericArray<string> ();
+            var uuids = new HashTable<string, string> (str_hash, str_equal);
+            var devices = new HashTable<string, string> (str_hash, str_equal);
+            foreach (var member in members) {
+                if (member.slot < 0 || member.metadata_uuid == "" || member.kernel_identity == "" ||
+                    member.array_uuid == "" || uuids.contains (member.metadata_uuid) ||
+                    devices.contains (member.kernel_identity)) return "";
+                uuids.insert (member.metadata_uuid, member.metadata_uuid);
+                devices.insert (member.kernel_identity, member.kernel_identity);
+                records.add ("%d %s %s %s".printf (member.slot, member.array_uuid,
+                    member.metadata_uuid, member.kernel_identity));
+            }
+            records.sort ((a, b) => strcmp (a, b));
+            return string.joinv ("\n", records.data);
+        }
+
         internal static bool recoverable_slots (string level, string layout, uint expected, int[] missing_slots) {
             if (missing_slots.length == 0 || missing_slots.length >= expected) return false;
             switch (level) {
@@ -241,8 +269,17 @@ namespace MajorisDisks {
         }
 
         internal bool matches_uuid (string expected) {
-            string compact = expected.down ().replace (":", "").replace ("-", "");
-            return compact.length == 32 && uuid.down ().replace (":", "").replace ("-", "") == compact;
+            return same_uuid (uuid, expected);
+        }
+
+        internal static bool same_uuid (string left, string right) {
+            string compact = right.down ().replace (":", "").replace ("-", "");
+            return compact.length == 32 && left.down ().replace (":", "").replace ("-", "") == compact;
+        }
+
+        internal bool terminal_health (string array_uuid, string array_level, uint members) {
+            return matches_uuid (array_uuid) && level == array_level && expected == members &&
+                writable () && action == "idle" && degraded == "0";
         }
 
         internal static string physical_device (StorageBlock block, out string sector_size) {

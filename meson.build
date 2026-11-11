@@ -22,6 +22,10 @@ crypttab_inspector_test = executable('crypttab-inspector-test', 'tests/crypttab-
   dependencies: dependency('gio-2.0'))
 test('crypttab-inspector', crypttab_inspector_test)
 sh = find_program('sh')
+python = find_program('python3')
+test('feature-identifiers', python,
+  args: [meson.current_source_dir() / 'tests/feature-id-test.py',
+    meson.current_source_dir() / 'docs/feature-parity-completion.md'])
 test('lvm-fixture', sh, args: [meson.current_source_dir() / 'tests/lvm-fixture-test.sh'])
 native_xz_test = executable('native-xz-test', 'tests/xz-stream-test.c', 'src/xz-stream.c',
   include_directories: xz_include, dependencies: [dependency('gio-2.0'), xz_dep])
@@ -105,7 +109,37 @@ mdraid_service_test = executable('mdraid-service-test', 'tests/mdraid-service-te
   storage_model_sources, 'src/udisks-service.vala', include_directories: xz_include,
   dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
 test('mdraid-model', mdraid_service_test)
-foreach scenario : ['raid1', 'raid5', 'raid6', 'raid6-double', 'raid10', 'start-raid1', 'start-raid5', 'dirty-raid5', 'restart-raid1']
+test('mdraid-recovery-false-completion', mdraid_service_test)
+test('mdraid-recovery-reboot', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-reboot-integration.sh', mdraid_service_test, 'meson'],
+  timeout: 360, is_parallel: false)
+test('mdraid-recovery-dirty-stopped-parity', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-dirty-stopped-integration.sh', mdraid_service_test, 'meson'],
+  timeout: 180, is_parallel: false)
+mdraid_dbus_faults = shared_module('mdraid-dbus-faults', 'tests/mdraid-dbus-faults.c',
+  dependencies: [dependency('gio-2.0'), meson.get_compiler('c').find_library('dl')])
+test('mdraid-recovery-udisks-timeout', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-timeout-integration.sh', mdraid_service_test, mdraid_dbus_faults],
+  timeout: 300, is_parallel: false)
+mdraid_helper_faults = shared_module('mdraid-helper-faults', 'tests/mdraid-helper-faults.c',
+  dependencies: [dependency('gio-2.0'), meson.get_compiler('c').find_library('dl')])
+test('mdraid-recovery-helper-interruption', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-helper-interruption-integration.sh', mdraid_service_test, mdraid_helper_faults],
+  timeout: 300, is_parallel: false)
+foreach scenario : ['near3', 'far2', 'offset2', 'odd']
+  test('mdraid-recovery-raid10-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/mdraid-layout-integration.sh', mdraid_service_test, scenario],
+    timeout: 300, is_parallel: false)
+endforeach
+test('mdraid-member-bitmap-readd', sh,
+  args: [meson.current_source_dir() / 'tests/mdraid-bitmap-readd-integration.sh', mdraid_service_test, mdraid_helper],
+  timeout: 300, is_parallel: false)
+foreach scenario : ['disappearance', 'reuse']
+  test('mdraid-recovery-device-' + scenario, sh,
+    args: [meson.current_source_dir() / 'tests/mdraid-identity-integration.sh', mdraid_service_test, scenario],
+    timeout: 300, is_parallel: false)
+endforeach
+foreach scenario : ['raid1', 'raid4', 'raid5', 'raid6', 'raid6-double', 'raid10', 'start-raid1', 'start-raid5', 'dirty-raid5', 'restart-raid1']
   test('mdraid-recovery-' + scenario, sh,
     args: [meson.current_source_dir() / 'tests/mdraid-recovery-integration.sh', mdraid_service_test, scenario],
     timeout: 300, is_parallel: false)

@@ -23,6 +23,59 @@ private void test_topology () throws Error {
     assert (MdRaidKernelState.bitmap_kind ("+8") == "internal");
     assert (MdRaidKernelState.bitmap_kind ("file") == "external");
     assert (MdRaidKernelState.bitmap_kind ("") == "unknown");
+    var complete = topology (2, "[('/a', 0, ['in_sync'], 0, {}), ('/b', 1, ['in_sync'], 0, {})]");
+    assert (complete.synchronized_slots (2));
+    foreach (string state in new string[] { "faulty", "blocked", "spare", "replacement", "unknown" }) {
+        var incomplete = topology (2, "[('/a', 0, ['in_sync'], 0, {}), ('/b', 1, ['%s'], 0, {})]".printf (state));
+        assert (!incomplete.synchronized_slots (2));
+    }
+    assert (!spare.synchronized_slots (2));
+    assert (!complete.synchronized_slots (3));
+    assert (complete.member_evidence () == "");
+    foreach (var member in complete.members) {
+        member.array_uuid = "array";
+        member.metadata_uuid = member.path;
+        member.kernel_identity = member.path + ":1";
+    }
+    string evidence = complete.member_evidence ();
+    complete.members[0].metadata_uuid = "substituted";
+    assert (complete.member_evidence () != evidence);
+    var kernel = new MdRaidKernelState ();
+    string uuid = "12345678:12345678:12345678:12345678";
+    kernel.uuid = uuid; kernel.level = "raid1"; kernel.expected = 2;
+    kernel.state = "clean"; kernel.action = "idle"; kernel.degraded = "0";
+    assert (kernel.terminal_health (uuid, "raid1", 2));
+    assert (!kernel.terminal_health ("87654321:12345678:12345678:12345678", "raid1", 2));
+    assert (!kernel.terminal_health (uuid, "raid5", 2));
+    assert (!kernel.terminal_health (uuid, "raid1", 3));
+    foreach (string action in new string[] { "recover", "resync", "frozen", "unknown", "" }) {
+        kernel.action = action;
+        assert (!kernel.terminal_health (uuid, "raid1", 2));
+    }
+    kernel.action = "idle";
+    foreach (string state in new string[] { "readonly", "inactive", "clear", "" }) {
+        kernel.state = state;
+        assert (!kernel.terminal_health (uuid, "raid1", 2));
+    }
+    kernel.state = "clean"; kernel.degraded = "1";
+    assert (!kernel.terminal_health (uuid, "raid1", 2));
+    foreach (string layout in new string[] { "259", "514", "far", "66050", "0", "", "unknown" })
+        assert (!parity.can_reconstruct ("raid10", layout, 4));
+    assert (!MdRaidTopology.recoverable_slots ("raid10", "258", 5, { 0 }));
+    assert (!MdRaidTopology.recoverable_slots ("raid10", "258", 4, { 0, 1 }));
+    assert (!MdRaidTopology.recoverable_slots ("raid4", "0", 3, { 0, 1 }));
+    var metadata = new MdRaidSuperblock ();
+    metadata.slot = 0; metadata.expected = 3; metadata.component_sectors = 1024;
+    metadata.events = 10; metadata.member_uuid = "member"; metadata.resync_offset = uint64.MAX;
+    assert (metadata.usable ());
+    metadata.resync_offset = 0;
+    assert (!metadata.usable ());
+    metadata.resync_offset = uint64.MAX; metadata.events = 0;
+    assert (!metadata.usable ());
+    metadata.events = 10; metadata.features = 2;
+    assert (!metadata.usable ());
+    metadata.features = 0; metadata.slot = 3;
+    assert (!metadata.usable ());
 }
 
 private bool owned_loop (StorageBlock block, string fixture) {
@@ -38,14 +91,14 @@ private async void exercise (string[] args) throws Error {
     string fixture = args[2];
     Posix.Stat stat;
     int stat_result = Posix.lstat (fixture, out stat);
-    if (!fixture.has_prefix ("/tmp/majoris-mdraid.") || stat_result != 0 ||
+    if ((!fixture.has_prefix ("/tmp/majoris-mdraid.") && !fixture.has_prefix ("/var/tmp/majoris-mdraid.")) || stat_result != 0 ||
         !Posix.S_ISDIR (stat.st_mode) || stat.st_uid != 0 || (stat.st_mode & 077) != 0)
         throw new IOError.PERMISSION_DENIED ("The fixture directory must be private and owned by root.");
     var backend = new UDisksService ();
     StorageBlock? anchor = null;
     StorageBlock? target = null;
     string action = args[1];
-    if (action == "start-degraded") {
+    if (action == "start-degraded" || action == "refuse-start") {
         for (int i = 0; i < 40 && anchor == null; i++) {
             yield backend.refresh ();
             foreach (var candidate in backend.snapshot.blocks.get_values ()) {
@@ -70,7 +123,15 @@ private async void exercise (string[] args) throws Error {
         foreach (var member in backend.snapshot.blocks.get_values ())
             if (member.raid_membership == anchor.raid_membership && !owned_loop (member, fixture))
                 throw new IOError.PERMISSION_DENIED ("The stopped array has a member outside the fixture.");
-        yield backend.set_raid_running (anchor, true, backend.storage_membership_identity (anchor, true), true);
+        if (action == "refuse-start") {
+            bool refused = false;
+            try {
+                yield backend.set_raid_running (anchor, true, backend.storage_membership_identity (anchor, true), true);
+            } catch (IOError.NOT_SUPPORTED error) { refused = true; }
+            assert (refused);
+            print ("unsafe-stopped-array-refused\n");
+        } else
+            yield backend.set_raid_running (anchor, true, backend.storage_membership_identity (anchor, true), true);
         return;
     }
     for (int i = 0; i < 40; i++) {
@@ -81,15 +142,15 @@ private async void exercise (string[] args) throws Error {
         }
         if (anchor?.raid?.kernel != null && anchor.raid.topology != null && anchor.logical_sector_size > 0 &&
             (args[5] == "-" || (target != null && target.logical_sector_size > 0)) &&
-            anchor.raid.degraded.to_string () == args[6] &&
-            (action == "observe" || (anchor.raid.kernel.action == "idle" && anchor.raid.state == "idle")) &&
+            (action == "observe-terminal" || anchor.raid.degraded.to_string () == args[6]) &&
+            (action == "observe" || action == "observe-terminal" || (anchor.raid.kernel.action == "idle" && anchor.raid.state == "idle")) &&
             (action != "replace" || backend.can_replace_missing_raid_member (anchor)))
             break;
         Timeout.add (250, exercise.callback);
         yield;
     }
     if (anchor?.raid?.topology == null || anchor.raid.kernel == null ||
-        anchor.raid.degraded.to_string () != args[6] || anchor.raid.topology.members.length == 0)
+        (action != "observe-terminal" && anchor.raid.degraded.to_string () != args[6]) || anchor.raid.topology.members.length == 0)
         throw new IOError.NOT_FOUND ("The fixture array and its topology were not verified.");
     foreach (var row in anchor.raid.topology.members)
         if (row.block == null || !owned_loop (row.block, fixture))
@@ -97,10 +158,91 @@ private async void exercise (string[] args) throws Error {
     if (args[5] != "-" && target == null)
         throw new IOError.NOT_FOUND ("The fixture target was not found.");
     string review = backend.raid_review_identity (anchor);
+    string target_identity = target != null ? backend.modification_identity (target) : "";
     print ("%s %s: kernel=%s layout=%s policy=%s bitmap=%s degraded=%u\n", action, anchor.raid.level,
         anchor.raid.kernel.state, anchor.raid.kernel.layout, anchor.raid.kernel.policy,
         anchor.raid.kernel.bitmap, anchor.raid.degraded);
     switch (action) {
+    case "expect-helper-failure":
+        if (target == null) throw new IOError.INVALID_ARGUMENT ("A fixture member is required.");
+        bool helper_failed = false;
+        try {
+            yield backend.change_raid_member_state (anchor, target, false, review, target_identity);
+        } catch (Error error) {
+            helper_failed = true;
+            string mode = Environment.get_variable ("MAJORIS_MDRAID_HELPER_FAULT") ?? "";
+            if (mode == "cancel") assert (error is IOError.CANCELLED);
+            else if (mode == "deny") assert (error is IOError.PERMISSION_DENIED);
+            else assert (error is IOError.FAILED);
+        }
+        assert (helper_failed);
+        bool classified = false;
+        for (uint n = 0; n < backend.jobs.jobs.get_n_items (); n++) {
+            var job = backend.jobs.jobs.get_item (n) as StorageJob;
+            if (job.operation != "Mark RAID member faulty") continue;
+            assert (job.result != null && !job.result.successful);
+            string mode = Environment.get_variable ("MAJORIS_MDRAID_HELPER_FAULT") ?? "";
+            bool unknown = mode == "unknown" || mode == "after" || mode.has_prefix ("kill-");
+            assert ((job.result.status == StorageOperationStatus.NEEDS_ATTENTION) == unknown);
+            classified = true;
+        }
+        assert (classified);
+        print ("helper-result-classified\n");
+        break;
+    case "expect-timeout":
+        if (target == null) throw new IOError.INVALID_ARGUMENT ("A fixture target is required.");
+        bool timed_out = false;
+        try {
+            yield backend.change_raid_member (anchor, target, true, backend.modification_identity (anchor),
+                target_identity, true, review);
+        } catch (IOError.TIMED_OUT error) { timed_out = true; }
+        assert (timed_out);
+        bool uncertain = false;
+        for (uint n = 0; n < backend.jobs.jobs.get_n_items (); n++) {
+            var job = backend.jobs.jobs.get_item (n) as StorageJob;
+            if (job.operation != "Replace missing RAID member") continue;
+            assert (job.result != null && !job.result.successful);
+            uncertain = job.result.status == StorageOperationStatus.NEEDS_ATTENTION;
+        }
+        assert (uncertain);
+        print ("uncertain-dispatch-not-retried\n");
+        break;
+    case "reject-target-disappearance":
+    case "reject-target-reuse":
+        if (target == null) throw new IOError.INVALID_ARGUMENT ("A fixture target is required.");
+        string anchor_identity = backend.modification_identity (anchor);
+        string churn_script = Environment.get_variable ("MAJORIS_MDRAID_CHURN_SCRIPT") ?? "";
+        if (churn_script == "") throw new IOError.INVALID_ARGUMENT ("The fixture churn script is required.");
+        var churn = new Subprocess.newv ({ "/bin/sh", churn_script, fixture, target.device, action }, SubprocessFlags.NONE);
+        yield churn.wait_check_async ();
+        yield backend.refresh ();
+        bool rejected = false;
+        try {
+            yield backend.change_raid_member (anchor, target, true, anchor_identity, target_identity, true, review);
+        } catch (IOError.NOT_FOUND error) { rejected = true;
+        } catch (IOError.NOT_SUPPORTED error) { rejected = true;
+        } catch (IOError.BUSY error) { rejected = true; }
+        assert (rejected);
+        print ("stale-target-rejected\n");
+        break;
+    case "observe-terminal":
+        // Read-only rediscovery after a reboot may miss the entire active rebuild.
+        for (int i = 0; i < 1200; i++) {
+            yield backend.refresh ();
+            foreach (var candidate in backend.snapshot.blocks.get_values ()) {
+                var raid = candidate.raid;
+                if (raid?.uuid != args[3] || raid.kernel == null || raid.topology == null) continue;
+                if (raid.degraded == 0 && raid.state == "idle" &&
+                    raid.kernel.terminal_health (raid.uuid, raid.level, raid.expected_members) &&
+                    raid.topology.synchronized_slots (raid.expected_members) && raid.kernel.verify_members (raid.topology)) {
+                    print ("terminal-health-verified\n");
+                    return;
+                }
+            }
+            Timeout.add (250, exercise.callback);
+            yield;
+        }
+        throw new IOError.TIMED_OUT ("Post-reboot health was not verified.");
     case "observe":
         bool observed = false;
         for (int i = 0; i < 400; i++) {

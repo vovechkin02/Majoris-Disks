@@ -103,13 +103,13 @@ namespace MajorisDisks {
                 var array = advanced_device as StorageRaid;
                 if (context == null || array == null) return;
                 var dialog = new MdRaidManagementView (backend, context, array);
-                dialog.replace_requested.connect (() => manage_raid_member (context, true, true));
-                dialog.spare_requested.connect (() => manage_raid_member (context, true));
+                dialog.replace_requested.connect (() => manage_raid_member (dialog.current_context, true, true));
+                dialog.spare_requested.connect (() => manage_raid_member (dialog.current_context, true));
                 dialog.remove_requested.connect ((member) => manage_raid_member (member, false));
-                dialog.member_state_requested.connect ((member, readd) => confirm_raid_member_state (context, member, readd));
-                dialog.check_requested.connect (() => start_raid_check (context));
-                dialog.repair_requested.connect (() => confirm_raid_repair (context));
-                dialog.bitmap_requested.connect ((enable) => confirm_raid_bitmap (context, enable));
+                dialog.member_state_requested.connect ((member, readd) => confirm_raid_member_state (dialog.current_context, member, readd));
+                dialog.check_requested.connect (() => start_raid_check (dialog.current_context));
+                dialog.repair_requested.connect (() => confirm_raid_repair (dialog.current_context));
+                dialog.bitmap_requested.connect ((enable) => confirm_raid_bitmap (dialog.current_context, enable));
                 dialog.present (this);
             });
             advanced_btrfs_replace.activated.connect (() => {
@@ -1591,6 +1591,8 @@ namespace MajorisDisks {
             return details.str;
         }
         private static string operation_error (Error error) {
+            if (error is IOError.CANCELLED && error.message == "Authorization was cancelled.")
+                return error.message;
             string? remote = DBusError.get_remote_error (error);
             if (error is IOError.CANCELLED) return "The storage service disconnected during the operation.";
             if (remote == null) return error.message;

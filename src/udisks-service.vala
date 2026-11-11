@@ -34,11 +34,13 @@ namespace MajorisDisks {
         public string action;
         public bool reached_end;
         public int64 terminal_deadline;
+        public string members;
 
-        public RaidMaintenanceObservation (StorageJob job, MdRaidKernelState kernel, string action) {
+        public RaidMaintenanceObservation (StorageJob job, MdRaidKernelState kernel, string action, string members) {
             this.job = job;
             this.kernel = kernel;
             this.action = action;
+            this.members = members;
         }
     }
 
@@ -501,14 +503,39 @@ namespace MajorisDisks {
 
         private static bool verified_raid_recovery (StorageRaid? raid) {
             if (raid == null || !raid.running || raid.degraded != 0 || raid.state != "idle" ||
-                raid.topology == null || raid.topology.missing_slots.length != 0 ||
-                raid.kernel == null || raid.kernel.action != "idle" || raid.kernel.degraded != "0" ||
-                raid.kernel.level != raid.level || raid.kernel.expected != raid.expected_members)
+                raid.topology == null || !raid.topology.synchronized_slots (raid.expected_members) ||
+                raid.kernel == null || !raid.kernel.terminal_health (raid.uuid, raid.level, raid.expected_members))
                 return false;
             foreach (var member in raid.topology.members)
                 if (!member.known_states () || "faulty" in member.states || "blocked" in member.states)
                     return false;
             return raid.kernel.verify_members (raid.topology);
+        }
+
+        private void reconcile_uncertain_raid (StorageOperationResult result, string uuid) {
+            // A failed reply is not evidence that the kernel rejected the write.
+            // Observe only: never redispatch from this path.
+            synchronize ();
+            StorageRaid? current = null;
+            int matches = 0;
+            foreach (var entry in snapshot.advanced.get_values ()) {
+                var raid = entry as StorageRaid;
+                if (raid?.uuid != uuid) continue;
+                current = raid;
+                matches++;
+            }
+            result.status = StorageOperationStatus.NEEDS_ATTENTION;
+            result.summary = "The request may have been accepted, but its final result could not be verified. Review the current array before continuing.";
+            if (matches != 1 || current?.kernel == null || current.topology == null ||
+                !current.kernel.matches_uuid (uuid) || !current.kernel.verify_members (current.topology)) {
+                result.actual_state = "Array or member identity unavailable";
+                return;
+            }
+            result.actual_state = "%s; %u unavailable slots".printf (current.kernel.action, current.degraded);
+            if (current.kernel.action == "recover" || current.kernel.action == "resync")
+                result.summary = "Kernel reconstruction is running. The interrupted request was not repeated.";
+            else if (verified_raid_recovery (current))
+                result.summary = "The current array is synchronized. The interrupted request's historical outcome could not be attributed.";
         }
 
         private bool has_raid_backend_job (string array_path) {
@@ -591,7 +618,8 @@ namespace MajorisDisks {
                     continue;
                 }
                 bool verified = same && action == "idle" &&
-                    (recovered || observed.reached_end) && verified_raid_recovery (raid);
+                    (recovered || observed.reached_end) && observed.members != "" &&
+                    observed.members == raid.topology?.member_evidence () && verified_raid_recovery (raid);
                 if (same && action == "idle") {
                     if (observed.terminal_deadline == 0)
                         observed.terminal_deadline = get_monotonic_time () + 5 * TimeSpan.SECOND;
@@ -607,7 +635,8 @@ namespace MajorisDisks {
                 var result = new StorageOperationResult ();
                 if (verified) {
                     result.successful = true;
-                    result.summary = "RAID maintenance completed";
+                    result.summary = recovered ? "RAID reconstruction completed. All required members are synchronized." :
+                        "RAID maintenance completed";
                 } else {
                     result.fail ("Could not verify the RAID maintenance outcome");
                     result.status = StorageOperationStatus.NEEDS_ATTENTION;
@@ -625,7 +654,7 @@ namespace MajorisDisks {
                 var observed = raid_observations.lookup (raid.uuid);
                 if (observed == null) {
                     var job = jobs.begin_named (title, raid.name != "" ? raid.name : raid.uuid, { raid.path });
-                    observed = new RaidMaintenanceObservation (job, raid.kernel, action);
+                    observed = new RaidMaintenanceObservation (job, raid.kernel, action, raid.topology?.member_evidence () ?? "");
                     raid_observations.insert (raid.uuid, observed);
                 }
                 double fraction = raid.kernel.progress;
@@ -2815,6 +2844,7 @@ namespace MajorisDisks {
                 bool parity = kernel.level == "raid4" || kernel.level == "raid5" || kernel.level == "raid6";
                 if (metadata == null || !metadata.active_member () || (parity && !metadata.usable ()) ||
                     metadata.uuid != uuid || metadata.slot != row.slot || metadata.expected != kernel.expected ||
+                    !MdRaidKernelState.same_uuid (metadata.member_uuid, row.metadata_uuid) ||
                     metadata.level != int.parse (kernel.level.substring (4)) ||
                     metadata.layout.to_string () != kernel.layout || kernel.metadata != "1.%u".printf (metadata.version) ||
                     member_uuids.contains (metadata.member_uuid) ||
@@ -2949,6 +2979,7 @@ namespace MajorisDisks {
                             foreach (var row in topology.members) {
                                 if (row.path == current.path) {
                                     verified_target = row.synchronized_member () && row.known_states () &&
+                                        row.metadata_uuid != "" && row.array_uuid == uuid && row.kernel_identity == target_disk &&
                                         row.slot in reviewed_topology.missing_slots;
                                     continue;
                                 }
@@ -2957,7 +2988,7 @@ namespace MajorisDisks {
                                     if (row.path == survivor.path && row.slot == survivor.slot &&
                                         row.block == survivor.block && row.kernel_identity != "" &&
                                         row.kernel_identity == survivor.kernel_identity &&
-                                        row.metadata_uuid == survivor.metadata_uuid &&
+                                        row.metadata_uuid != "" && row.metadata_uuid == survivor.metadata_uuid &&
                                         row.synchronized_member () && row.known_states ())
                                         verified_survivor = true;
                                 unexpected |= !verified_survivor;
@@ -2965,9 +2996,25 @@ namespace MajorisDisks {
                             if (verified_target && !unexpected &&
                                 topology.synchronized_count == reviewed_topology.synchronized_count + 1 &&
                                 (array.degraded != 0 || verified_raid_recovery (array))) {
+                                string evidence = topology.member_evidence ();
+                                if (evidence == "") break;
+                                // Re-read native identities and roles at completion; a
+                                // cached UDisks row alone cannot verify the new member.
+                                yield verify_reconstruction_metadata (uuid, kernel, topology, lifetime);
+                                synchronize ();
+                                if (array.kernel?.identity != reviewed_kernel.identity ||
+                                    array.kernel.action != "idle" || array.uuid != uuid ||
+                                    array.topology?.member_evidence () != evidence ||
+                                    !array.kernel.verify_members (array.topology) ||
+                                    array.topology.synchronized_count != reviewed_topology.synchronized_count + 1 ||
+                                    array.topology.missing_slots.length != array.degraded ||
+                                    array.degraded + 1 != reviewed_degraded ||
+                                    array.kernel.degraded != array.degraded.to_string () ||
+                                    (array.degraded == 0 && !verified_raid_recovery (array)))
+                                    break;
                                 outcome.successful = array.degraded == 0;
-                                outcome.summary = outcome.successful ? "RAID reconstruction verified" :
-                                    "Replacement synchronized. The array still has missing members.";
+                                outcome.summary = outcome.successful ? "RAID reconstruction completed. All required members are synchronized." :
+                                    "One missing member has been restored. The array remains degraded.";
                                 if (!outcome.successful) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                                 return outcome.summary;
                             }
@@ -2998,10 +3045,10 @@ namespace MajorisDisks {
                     }
                     yield settle_delay (lifetime);
                 }
-                throw new IOError.TIMED_OUT ("UDisks did not confirm the RAID member change.");
+                throw new IOError.TIMED_OUT ("The operation was accepted, but the final array state could not be verified.");
             } catch (Error error) {
                 outcome.fail ("Could not confirm the RAID member change", error);
-                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                if (dispatched) reconcile_uncertain_raid (outcome, uuid);
                 throw error;
             } finally {
                 if (replacement) local_raid_checks.remove (array.path);
@@ -3088,8 +3135,11 @@ namespace MajorisDisks {
                         int code = helper.get_exit_status ();
                         dispatched = code != 2 && code != 126 && code != 127;
                         if (code == 126) throw new IOError.CANCELLED ("Authorization was cancelled.");
+                        if (code == 127) throw new IOError.PERMISSION_DENIED (
+                            "Authorization was denied. The RAID configuration was not changed by this request.");
                     }
-                    throw new IOError.FAILED (diagnostic?.strip () ?? "The member-state helper failed.");
+                    throw new IOError.FAILED (diagnostic != null && diagnostic.strip () != "" ? diagnostic.strip () :
+                        "The member-state helper did not confirm the requested change.");
                 }
                 int64 deadline = get_monotonic_time () + 30 * TimeSpan.SECOND;
                 bool rebuilding = false;
@@ -3130,7 +3180,7 @@ namespace MajorisDisks {
                 throw new IOError.TIMED_OUT ("The final RAID member state could not be verified.");
             } catch (Error error) {
                 outcome.fail ("Could not confirm the RAID member transition", error);
-                if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
+                if (dispatched) reconcile_uncertain_raid (outcome, uuid);
                 throw error;
             } finally {
                 local_raid_checks.remove (raid.path);
@@ -5568,7 +5618,11 @@ namespace MajorisDisks {
                     child.uuid, partition?.uuid ?? "", partition?.table_path ?? "",
                     child.table?.scheme ?? "", child.number, child.size, partition_offset,
                     child.logical_sector_size, partition_number).print (false));
-                if (!include_dependents && child.loop != null)
+                string sector;
+                string kernel_identity = MdRaidKernelState.physical_device (child, out sector);
+                if (kernel_identity != "")
+                    records.add (new Variant ("(ss)", "kernel-device-identity", kernel_identity).print (false));
+                if (child.loop != null)
                     records.add (new Variant.string (child.loop.backing_file).print (true));
             }
             records.sort ((left, right) => strcmp (left, right));

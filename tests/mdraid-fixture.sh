@@ -8,7 +8,7 @@ mdraid_require_guest() {
     case "$(systemd-detect-virt --vm)" in qemu|kvm) ;; *) exit 77 ;; esac
     . /etc/os-release
     [ "$ID:$VERSION_ID" = debian:13 ] || exit 77
-    for tool in mdadm losetup udevadm busctl sha256sum; do
+    for tool in mdadm losetup udevadm busctl sha256sum findmnt stat realpath; do
         command -v "$tool" >/dev/null || exit 77
     done
     busctl --system status org.freedesktop.UDisks2 >/dev/null 2>&1 || exit 77
@@ -20,7 +20,17 @@ mdraid_uuid() {
 }
 
 mdraid_owned_loop() {
-    [ "$(losetup -n -O BACK-FILE "$1")" = "$2" ]
+    [ "$(losetup -n -O BACK-FILE "$1")" = "$2" ] || return 1
+    [ -f "$2" ] && [ ! -L "$2" ] && [ "$(realpath "$2")" = "$2" ] || return 1
+    if [ -f "$fixture/identities" ]; then
+        recorded=$(awk -v loop="$1" '$1 == loop { print $2 " " $3 }' "$fixture/identities")
+        [ "$recorded" = "$(cat "/sys/class/block/${1##*/}/diskseq") $(stat -c '%d:%i:%s' "$2")" ] || return 1
+    fi
+}
+
+mdraid_record_loop() {
+    printf '%s %s %s\n' "$1" "$(cat "/sys/class/block/${1##*/}/diskseq")" \
+        "$(stat -c '%d:%i:%s' "$2")" >> "$fixture/identities"
 }
 
 mdraid_cleanup() {
@@ -31,12 +41,29 @@ mdraid_cleanup() {
         kill "$child" 2>/dev/null
         wait "$child" 2>/dev/null
     done
+    # Validate the entire set before making even the first cleanup mutation.
+    while read -r loop image; do
+        if ! mdraid_owned_loop "$loop" "$image" || findmnt -rn -S "$loop" | grep -q .; then
+            printf 'Cleanup refused; retained evidence: %s (%s)\n' "$loop" "$fixture" >&2
+            exit 1
+        fi
+        for partition in "/sys/class/block/${loop##*/}/"*/partition; do
+            if [ -e "$partition" ]; then
+                printf 'Partitioned fixture requires inspection: %s (%s)\n' "$loop" "$fixture" >&2
+                exit 1
+            fi
+        done
+    done < "$fixture/loops"
     if [ -z "$md" ] && [ -n "$name" ] && [ -b "/dev/md/$name" ]; then
         md=$(readlink -f "/dev/md/$name")
     fi
     if [ -n "$md" ]; then
         owns=1
         if [ -b "$md" ]; then
+            if findmnt -rn -S "$md" | grep -q .; then
+                printf 'Mounted fixture requires inspection: %s\n' "$fixture" >&2
+                exit 1
+            fi
             [ -n "$array_uuid" ] && [ "$(mdraid_uuid "$md")" = "$array_uuid" ] || owns=0
             for slave in "/sys/class/block/${md##*/}/slaves/"*; do
                 [ -e "$slave" ] || continue
@@ -54,7 +81,8 @@ mdraid_cleanup() {
         fi
     fi
     while read -r loop image; do
-        if ! mdraid_owned_loop "$loop" "$image" || ! losetup -d "$loop"; then
+        if ! mdraid_owned_loop "$loop" "$image" ||
+            [ -n "$(ls -A "/sys/class/block/${loop##*/}/holders")" ] || ! losetup -d "$loop"; then
             printf 'Loop cleanup requires inspection: %s (%s)\n' "$loop" "$image" >&2
             exit 1
         fi
@@ -75,12 +103,13 @@ mdraid_setup() {
         4|5|6) modprobe raid456 ;;
         *) modprobe "raid$level" ;;
     esac
-    fixture=$(mktemp -d /tmp/majoris-mdraid.XXXXXXXX)
+    fixture=$(mktemp -d "${MDRAID_FIXTURE_PARENT:-/tmp}/majoris-mdraid.XXXXXXXX")
     md=
     name="majoris-${fixture##*.}"
     array_uuid=$(tr -d '-' < /proc/sys/kernel/random/uuid | sed 's/^\(........\)\(........\)\(........\)\(........\)$/\1:\2:\3:\4/')
     rule="/run/udev/rules.d/99-majoris-mdraid-${fixture##*.}.rules"
     touch "$fixture/loops"
+    touch "$fixture/identities"
     trap mdraid_cleanup EXIT
     trap 'exit 1' HUP INT TERM
     mkdir -p /run/udev/rules.d
@@ -96,9 +125,11 @@ mdraid_setup() {
         truncate -s 80M "$image"
         loop=$(losetup --find --show "$image")
         printf '%s %s\n' "$loop" "$image" >> "$fixture/loops"
+        mdraid_record_loop "$loop" "$image"
         if [ "$i" -lt "$count" ]; then set -- "$@" "$loop"; fi
         i=$((i + 1))
     done
+    if [ -n "${MDRAID_LAYOUT:-}" ]; then set -- "--layout=$MDRAID_LAYOUT" "$@"; fi
     mdadm --create "/dev/md/$name" --name="$name" --uuid="$array_uuid" --metadata=1.2 --level="$level" \
         --raid-devices="$count" --bitmap=none --run "$@"
     md=$(readlink -f "/dev/md/$name")
@@ -135,6 +166,8 @@ mdraid_detach_member() {
     udevadm settle
     awk -v loop="$device" '$1 != loop' "$fixture/loops" > "$fixture/remaining"
     mv "$fixture/remaining" "$fixture/loops"
+    awk -v loop="$device" '$1 != loop' "$fixture/identities" > "$fixture/remaining"
+    mv "$fixture/remaining" "$fixture/identities"
 }
 
 mdraid_refresh_loops() {

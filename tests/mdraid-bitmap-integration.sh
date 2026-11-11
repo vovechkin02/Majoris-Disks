@@ -8,7 +8,14 @@ mdraid_setup 1 2 0
 mdraid_call bitmap-enable - 0
 [ "$(cat "$kernel/bitmap/location")" != none ]
 [ "$(cat "$kernel/consistency_policy")" = bitmap ]
+systemctl restart udisks2
+mdraid_refresh
+[ "$(cat "$kernel/bitmap/location")" != none ]
+[ "$(cat "$kernel/consistency_policy")" = bitmap ]
 mdraid_call bitmap-disable - 0
+[ "$(cat "$kernel/bitmap/location")" = none ]
+systemctl restart udisks2
+mdraid_refresh
 [ "$(cat "$kernel/bitmap/location")" = none ]
 [ "$(cat "$kernel/degraded")" = 0 ]
 [ "$(mdraid_checksum)" = "$checksum" ]
