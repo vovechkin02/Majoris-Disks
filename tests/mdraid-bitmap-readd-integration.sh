@@ -17,8 +17,7 @@ md=
 mdadm --assemble --run "/dev/md/$name" "$survivor"
 md=$(readlink -f "/dev/md/$name")
 kernel="/sys/class/block/${md##*/}/md"
-[ "$(mdraid_uuid "$md")" = "$array_uuid" ]
-mdadm --readwrite "$md"
+mdraid_require_writable
 dd if=/dev/urandom of="$md" bs=1M count=1 seek=8 conv=fsync status=none
 payload=$(dd if="$md" bs=1M count=16 status=none | sha256sum)
 for attempt in $(seq 1 50); do

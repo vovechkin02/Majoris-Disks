@@ -775,3 +775,237 @@ Production changes are in `src/blkid.vapi`, `src/device.vala`,
 `tests/image-device-test.vala`, `tests/mdraid-dbus-faults.c` and
 `tests/storage-model-test.vala`. The existing restricted helpers, Polkit
 rules, GtkBuilder templates and theme continue to govern these workflows.
+
+## UDisks module readiness and restart acceptance
+
+The earlier combined LVM failure above was reproduced from the unchanged
+baseline in a fresh Debian 13 QEMU overlay. The guest ran kernel
+`6.12.115+deb13.1-amd64` and UDisks `2.10.1`. Before restart, owner `:1.34`
+exported `Manager.LVM2.VolumeGroupCreate`. After restart, owner `:1.48`
+returned an empty interface table from `busctl introspect`, with exit
+status 0. The old fixture interpreted that status as module readiness.
+LVM metadata still showed both logical volumes, while UDisks returned
+neither `keeper.Active` nor `keeper.BlockDevice`. The baseline command
+`MAJORIS_DISKS_RUN_LVM_TESTS=1 meson test -C build --no-rebuild
+--print-errorlogs --num-processes 1 lvm-recovery-integration` failed
+with exit 1.
+
+The corrected fixture checks the actual manager method on the current
+unique D-Bus owner, activates the installed module with
+`EnableModule("lvm2", true)`, and waits for the specific VG and LV.
+It compares their UUIDs with LVM metadata. For an active LV it also
+compares the device-mapper number and the UDisks backlink. For an
+inactive LV it requires `Active=false` and `BlockDevice=/`.
+The application activates LVM2 on the explicit Create Volume Group
+action and restores previously observed module capabilities on a new
+owner. Rebuilding the snapshot invalidates old block and advanced
+object references. Existing modifying requests retain their original
+backend lifetime and observation records. Btrfs fixtures activate
+their module independently and check filesystem and member identity
+before a fresh maintenance review.
+
+The first installed guest run passed LVM recovery, cache, layout and
+the post-LV restart case. Before helper installation, a separate
+post-LV attempt reached inactive VG rename and failed with
+`The protected crypttab inspector is unavailable`. That setup failure
+was resolved by installing the guest build. The installed guest also
+passed the lost `Loop.Delete` reply case with one dispatch and one
+accepted reply, and rejected a stale detach when `/dev/loop2` changed
+from disk sequence 281 to 283. The ioctl-only helper pinned a real
+foreground `nbd-client` (PID 24762, start 167469, disk sequence 285) and
+the fixture verified disruption after termination. The production
+helper still uses the client's default mode.
+
+The first lost `LoopSetup` and RAW discovery restart runs each
+recorded exactly one accepted setup. The lost reply left one mapping;
+the restart changed UDisks from `:1.946` to `:1.1071` and preserved the
+loop mapping. Both tests failed at cleanup because a fresh root
+client lacked the original session's verified loop identity. The
+fixture now independently checks backing inode, disk sequence,
+holders and mounts before releasing the exact mapping. The earlier
+mappings were released using their recorded identities and the guest
+fixture files were retained as evidence.
+
+All five corrected loop cases passed on the second guest. Lost setup
+recovered one mapping and an attention journal in a fresh client.
+Lost delete reconciled the removal after a single accepted request.
+RAW discovery survived owner `:1.13` → `:1.31` with `7:0` and disk
+sequence 24, and the partition's ext4 readback matched the backing
+image. Reuse changed the disk sequence from 26 to 28 at `7:0` and
+rejected the stale detach. The discovery substitution held the
+original inode on `7:0` with disk sequence 30 and left the replacement
+image unattached. Each faulted setup or delete dispatched exactly once.
+
+The acceptance procedure and log names are in
+[the manual test register](../tests/MANUAL-TESTING.md#udisks-restart-and-attachment-acceptance).
+GNOME Disks' object manager, job lifecycle, unused-device preparation
+and loop-mounter code informed the review. The implementation uses
+Majoris' storage model, dependency checks, journals and GtkBuilder UI.
+The optional module calls follow the
+[UDisks 2.10.1 Manager API](https://storaged.org/doc/udisks2-api/2.10.1/gdbus-org.freedesktop.UDisks2.Manager.html).
+
+### Abrupt power cuts
+
+A separate Debian 13 overlay ran the four explicit power-loss checkpoints
+with ext4 on `/dev/vda1`, a qcow2 virtio disk and QEMU `cache=none`.
+The host verified the QEMU executable and exact overlay argument before
+sending SIGKILL. Each test booted the same overlay again and required a
+different guest boot ID.
+
+| Checkpoint | Observed after reboot |
+|---|---|
+| Before rename | Original inode 131324 and 8 MiB checksum at `work/image`. |
+| After rename, before directory synchronization | Original inode 131324 and 8 MiB checksum at `work/image`. The rename was rolled back by ext4 recovery in this run. |
+| After directory synchronization | Original inode 131324 and 8 MiB checksum at `published.img`. |
+| Incomplete output | Original inode 131323 and 4 MiB checksum at `work/image`. |
+
+Each verification also checked RAW format and the protected neighboring
+image, recovered the journal into an attention result in a fresh
+client, and removed only the verified fixture files. The host driver
+returned exit 0. These are results for the tested ext4 and QEMU cache
+configuration.
+
+### Fixture order and backend observations
+
+The three LVM targets passed as a group alone, after the LVM daemon
+restart cases, after the Btrfs group and after image discovery restart.
+The four restart stages and the disabled-module case passed together.
+In the post-LV stage, a persistent client rediscovered the same LV UUID
+and rejected the pre-restart review. The before-review stage rejected
+the old UUID both while the LV was absent and after a same-name LV
+appeared.
+
+A separate guest reproduced an LVM cleanup race before RAID1 layout.
+The kernel had removed the old mapper, but UDisks could still expose
+the removed active LV. The fixture now observes removal before placing
+the mirror. A later LVM-to-Btrfs run reproduced another stale interface.
+UDisks reported `IdType=btrfs`, the expected filesystem UUID, no
+holders and `HintSystem=false` on a reused loop. The same block still
+exported `PhysicalVolume.VolumeGroup` pointing to the removed fixture
+VG. Majoris correctly refused to modify a member with that unresolved
+dependency.
+
+Cleanup now clears the labels of verified, unowned fixture PVs and
+retires a loop index only when it is unbound and UDisks still associates
+it with that fixture's removed VG. It uses the kernel's loop-control
+ioctl and checks disappearance before proceeding. The LVM-to-Btrfs
+rerun passed with no daemon reset between the two fixtures. The Btrfs
+case then restarted UDisks, rediscovered both verified members and the
+same filesystem UUID under `:1.370`, and completed a new maintenance
+review.
+
+### Serial regression and reruns
+
+The initial combined Meson run returned exit 1 with 96 passed, four
+failed, 39 skipped and no timeouts. It passed partition and filesystem
+capacity, all five LUKS targets, Btrfs discovery/replacement/profile
+conversion/scrub, LVM recovery/cache/layout and restart, and RAW/XZ
+and virtual-image conversion. The four failures were the two Btrfs
+quota service targets, writable NBD lifecycle, and stale NBD reuse.
+The guest hostname also caused the existing mdraid fixtures to skip.
+The full acceptance procedure now names the hostname those fixtures
+require and the runtime library for the Btrfs default-subvolume fallback.
+
+The dedicated mdraid selection returned exit 1 with 22 passed, 14
+failed and two phased tests skipped. All 14 failed fixtures attempted
+`mdadm --readwrite` even when the kernel had already made the array
+writable. The fixture now checks the array UUID, kernel array state
+and block read-only flag, and only requests a transition if needed.
+All 14 reruns passed. That covers bitmap-assisted re-add, full rebuild
+control, injected reply and evidence faults, churn, restart, member
+re-add and consistency maintenance. The original run passed the RAID
+1/4/5/6/10 and double-degraded RAID6 recovery cases.
+
+The NBD reuse rerun reused index 3 with the same kernel disk sequence
+859 and a distinct ownership token. The stale request was rejected
+before the detach reached the helper. The fixture verified the
+replacement payload and removed it under its own token. The NBD
+restart fixture verified the original token, exporter, GPT partition
+and ext4 payload through the owner change.
+
+The writable NBD rerun exposed `read-only 1/0` with the expected capacity.
+The ioctl client sets a block-device read-only flag in addition to the
+driver flag. Netlink sets the driver's flag when configuring the next
+connection. The ioctl test now selects a previously writable idle
+index and restores only that fixture's block-device flag after verifying
+its disk sequence and empty state. The installed helper continues to
+verify the actual access mode and leaves inherited protection in place.
+It observes readiness on the already accepted connection without
+dispatching another attach.
+
+The corrected NBD sequence returned exit 0 for the ioctl fixture
+and exit 0 for the six-case netlink selection, with five passes and
+one prerequisite skip. Writable QCOW2 reattachment, GPT restart,
+same-index reuse, exporter termination and interrupted restore all
+passed. The default netlink foreground-client test skipped because
+the setup process had exited. The dedicated ioctl run observed and
+terminated a live, PID-pinned foreground client.
+
+The secondary guest also passed the explicit mdraid phases. A RAID1
+reboot retained the original array and member identities, finished
+reconstruction and matched the payload checksum. After actual guest
+resets, dirty/degraded RAID5 and RAID6 were refused and all member
+image checksums matched. The separate Btrfs scrub reboot fixture
+verified the resumption marker and matched the payload checksum.
+Its observer retained the `unverified readonly` result classification
+for the resumed scrub.
+
+The final native `meson setup --reconfigure build --prefix=/usr`,
+`meson compile -C build -j 6` and `meson install -C build --no-rebuild`
+returned exit 0. The unprivileged default run returned exit 0 with
+15 passed, zero failed and 125 skipped. The native opt-in quota
+service and observer passed with the installed `/usr/libexec` helpers.
+An intermediate focused attempt had copied a driver compiled with a
+different prefix. Its helper-path error is retained in the run logs.
+
+### Final native matrix
+
+The final enabled run used the verified `majoris-mdraid-test` QEMU
+guest and the opt-ins in the manual register. The command
+`meson test -C build --no-rebuild --print-errorlogs --num-processes 1
+--timeout-multiplier 3 --logbase stability-combined-final` returned
+exit 0 with **136 passed, zero failed, four skipped and zero timeouts**.
+It passed all registered ordinary partition/filesystem, LUKS, LVM,
+Btrfs, mdraid, imaging, loop, NBD lifecycle, storage model, feature-ID
+and GtkBuilder checks. The four skips were the two phased mdraid
+targets, the dedicated ioctl NBD target and the netlink foreground
+client target. The mdraid phases and ioctl target passed separately.
+The installed netlink configuration has no foreground process to
+terminate. The native logs are under `build/stability-evidence/`.
+
+### Remaining coverage and restrictions
+
+| Issue | Severity and subsystem | Reproduction, expected behavior and safety | Status and next action |
+|---|---|---|---|
+| Identity change at each discovery boundary | High, imaging | Independently gate kernel partition publication, UDisks partition publication, filesystem properties, NBD export readiness and NBD detach observation. Substitute the fixture identity at each gate and verify refusal before any new modifying request. | Partial. Live loop source substitution, loop and NBD same-number reuse, and the model's delayed-partition cases cover part of this matrix. Add separate barriers for the remaining boundaries. |
+| Delayed LV publication after successful activation | High, LVM | Hold back only the fixture LV after `Manager.LVM2` has appeared. Verify the bounded readiness diagnostic and zero modifying dispatches until the original UUID and mapping appear. | The real restart and delayed rediscovery paths ran. A deterministic hold of one LV's publication remains open. |
+| Interactive authorization | Medium, desktop integration | In a GNOME session, exercise approval, denial and cancellation of the existing Polkit-protected image and storage actions. Verify uncertain status if authorization fails during observation of an already accepted setup. | The headless guests covered root authorization and unprivileged refusal. Repeat the interactive cases in a desktop guest. |
+| Fresh client during other active jobs | Medium, storage jobs | Restart the application during a Btrfs operation and during an LVM repair. Verify current observation and historical attribution independently, with no operation replay. | Loop and NBD rediscovery and image journal recovery were exercised. Dedicated active Btrfs and LVM process-restart cases remain open. |
+
+The tested NBD configuration uses partition-capable Linux NBD and the
+restricted helper for self-contained local images. The default Debian
+netlink client exits after configuring the mapping. The foreground
+termination test uses the separate ioctl-only fixture. Existing
+storage, image format and authorization restrictions apply.
+
+### Changed files
+
+- The service and UI changes are in `src/udisks-service.vala` and
+  `src/window.vala`. The loop backing descriptor check is in
+  `src/disk-image-copy.vala` and `src/xz-stream.c` and its header.
+  The NBD readiness and test-only ioctl changes are in `src/nbd-helper.c`.
+- New test files are `tests/btrfs-module-fixture.sh`,
+  `tests/loop-dbus-faults.c`, `tests/loop-fault-integration.sh`,
+  `tests/lvm-disabled-module.sh`, `tests/nbd-ioctl-integration.sh`,
+  `tests/publication-power-loss.sh` and `tests/run-stability-regression.sh`.
+- Updated test files are `tests/image-device-test.vala`,
+  `tests/lvm-device-test.vala`, `tests/lvm-fixture-test.sh`,
+  `tests/lvm-fixture.sh`, `tests/lvm-recovery-integration.sh`,
+  `tests/btrfs-profile-conversion-integration.sh`,
+  `tests/btrfs-quota-integration.sh`, `tests/btrfs-quota-service-test.vala`,
+  `tests/btrfs-scrub-integration.sh`, `tests/mdraid-fixture.sh`,
+  `tests/mdraid-bitmap-readd-integration.sh`,
+  `tests/mdraid-member-integration.sh` and
+  `tests/mdraid-maintenance-integration.sh`. Meson registration and
+  the manual acceptance procedure are in `meson.build` and
+  `tests/MANUAL-TESTING.md`.

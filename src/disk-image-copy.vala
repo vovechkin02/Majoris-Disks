@@ -72,6 +72,8 @@ namespace MajorisDisks {
 
     [CCode (cname = "majoris_image_match_loop", cheader_filename = "xz-stream.h")]
     internal extern bool match_loop_backing (int block, string backing) throws Error;
+    [CCode (cname = "majoris_image_match_loop_source", cheader_filename = "xz-stream.h")]
+    internal extern bool match_loop_source (int block, int source) throws Error;
 
     internal class XzImage : Object {
         public uint64 size;

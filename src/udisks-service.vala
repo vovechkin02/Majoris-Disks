@@ -1,4 +1,5 @@
 namespace MajorisDisks {
+    internal errordomain RawAttachmentError { UNCERTAIN }
     internal enum SelftestOperationState { REQUESTED, STARTING, START_CONFIRMED, RUNNING, STOPPING, UNCERTAIN }
     internal class SelftestOperation : Object {
         public StorageJob job;
@@ -88,6 +89,8 @@ namespace MajorisDisks {
         private uint refresh_source;
         private bool connecting;
         private StorageOperationLocks locks = new StorageOperationLocks ();
+        private HashTable<string, string> loop_setups = new HashTable<string, string> (str_hash, str_equal);
+        private HashTable<string, string> verified_loops = new HashTable<string, string> (str_hash, str_equal);
         private uint raid_reconcile_source;
         private HashTable<string, string> thin_pool_warnings = new HashTable<string, string> (str_hash, str_equal);
         private HashTable<string, RaidMaintenanceObservation> raid_observations =
@@ -104,6 +107,10 @@ namespace MajorisDisks {
             new HashTable<string, SelftestOperation> (str_hash, str_equal);
         private uint selftest_refresh_source;
         private string? owner;
+        private bool owner_changed;
+        private bool lvm_module_seen;
+        private bool btrfs_module_seen;
+        private Cancellable? lvm_activation;
         private Cancellable backend_lifetime = new Cancellable ();
         public StorageSnapshot snapshot = new StorageSnapshot ();
         public signal void changed ();
@@ -140,16 +147,22 @@ namespace MajorisDisks {
         private void update_owner () {
             string? current = manager?.get_name_owner ();
             if (current == owner) return;
-            backend_lifetime.cancel ();
+            bool disconnected = owner != null;
+            var retired = backend_lifetime;
+            owner = current;
+            owner_changed = true;
             backend_lifetime = new Cancellable ();
-            if (owner != null) {
+            lvm_activation = null;
+            btrfs_capability_owner = "";
+            if (disconnected) {
                 foreach (var operation in active_selftests.get_values ())
                     operation.await_observation ();
                 jobs.backend_disconnected ();
                 observed_jobs.remove_all ();
                 connected_jobs.remove_all ();
+                raid_checks.remove_all ();
             }
-            owner = current;
+            retired.cancel ();
         }
         private void queue_refresh () {
             if (refresh_source != 0) return;
@@ -291,6 +304,17 @@ namespace MajorisDisks {
                 } catch (FileError error) {}
                 loop.sequence = sequence.strip ();
                 block.loop = loop;
+                string? verified = verified_loops.lookup (block.path);
+                if (verified != null) {
+                    Posix.Stat backing = {};
+                    if (loop.sequence != "" && Posix.lstat (loop.backing_file, out backing) == 0 &&
+                        verified == loop_identity (block.number, loop.sequence, backing))
+                        loop.verified_sequence = loop.sequence;
+                    else {
+                        loop.verified_sequence = "";
+                        verified_loops.remove (block.path);
+                    }
+                }
             } else block.loop = null;
             block.virtual_attachment = VirtualDiskAttachment.lookup (block.device);
             var config = property (object_proxy, "Block", "Configuration");
@@ -366,12 +390,14 @@ namespace MajorisDisks {
         private void update_advanced (DBusObject item, string path, HashTable<string, StorageDevice> previous) {
             StorageDevice? device = null;
             if (has (item, "MDRaid")) {
-                var raid = (previous.lookup (path) as StorageRaid) ?? new StorageRaid (path);
+                string uuid = property (item, "MDRaid", "UUID")?.get_string () ?? "";
+                var raid = previous.lookup (path) as StorageRaid;
+                if (raid == null || raid.uuid != uuid) raid = new StorageRaid (path);
                 raid.name = property (item, "MDRaid", "Name")?.get_string () ?? "";
                 raid.level = property (item, "MDRaid", "Level")?.get_string () ?? "";
                 raid.degraded = property (item, "MDRaid", "Degraded")?.get_uint32 () ?? 0;
                 raid.state = property (item, "MDRaid", "SyncAction")?.get_string () ?? "";
-                raid.uuid = property (item, "MDRaid", "UUID")?.get_string () ?? "";
+                raid.uuid = uuid;
                 raid.running = property (item, "MDRaid", "Running")?.get_boolean () == true;
                 raid.expected_members = property (item, "MDRaid", "NumDevices")?.get_uint32 () ?? 0;
                 raid.size = property (item, "MDRaid", "Size")?.get_uint64 () ?? 0;
@@ -380,23 +406,27 @@ namespace MajorisDisks {
                 raid.kernel = null;
                 device = raid;
             } else if (has (item, "VolumeGroup")) {
-                var group = (previous.lookup (path) as StorageVolumeGroup) ?? new StorageVolumeGroup (path);
+                string uuid = LvmStructure.typed (property (item, "VolumeGroup", "UUID"), "s")?.get_string () ?? "";
+                var group = previous.lookup (path) as StorageVolumeGroup;
+                if (group == null || group.uuid != uuid) group = new StorageVolumeGroup (path);
                 group.name = property (item, "VolumeGroup", "Name")?.get_string () ?? "";
                 group.size = property (item, "VolumeGroup", "Size")?.get_uint64 () ?? 0;
                 group.free_size = property (item, "VolumeGroup", "FreeSize")?.get_uint64 () ?? 0;
                 group.extent_size = property (item, "VolumeGroup", "ExtentSize")?.get_uint64 () ?? 0;
-                group.uuid = LvmStructure.typed (property (item, "VolumeGroup", "UUID"), "s")?.get_string () ?? "";
+                group.uuid = uuid;
                 var missing = LvmStructure.typed (property (item, "VolumeGroup", "MissingPhysicalVolumes"), "as");
                 group.missing_pvs_known = missing != null;
                 group.missing_pv_uuids = missing != null ? missing.dup_strv () : new string[0];
                 group.needs_polling = LvmStructure.typed (property (item, "VolumeGroup", "NeedsPolling"), "b")?.get_boolean () ?? false;
                 device = group;
             } else if (has (item, "LogicalVolume")) {
-                var volume = (previous.lookup (path) as StorageLogicalVolume) ?? new StorageLogicalVolume (path);
+                string uuid = property (item, "LogicalVolume", "UUID")?.get_string () ?? "";
+                var volume = previous.lookup (path) as StorageLogicalVolume;
+                if (volume == null || volume.uuid != uuid) volume = new StorageLogicalVolume (path);
                 volume.name = property (item, "LogicalVolume", "Name")?.get_string () ?? "";
                 volume.group_path = property (item, "LogicalVolume", "VolumeGroup")?.get_string () ?? "/";
                 volume.active = property (item, "LogicalVolume", "Active")?.get_boolean () ?? false;
-                volume.uuid = property (item, "LogicalVolume", "UUID")?.get_string () ?? "";
+                volume.uuid = uuid;
                 volume.size = property (item, "LogicalVolume", "Size")?.get_uint64 () ?? 0;
                 volume.data_allocated_ratio = property (item, "LogicalVolume", "DataAllocatedRatio")?.get_double () ?? -1.0;
                 volume.metadata_allocated_ratio = property (item, "LogicalVolume", "MetadataAllocatedRatio")?.get_double () ?? -1.0;
@@ -415,36 +445,42 @@ namespace MajorisDisks {
         private void synchronize () {
             var previous_blocks = snapshot.blocks;
             var previous_drives = snapshot.drives;
+            var previous_advanced = snapshot.advanced;
+            bool reuse = !owner_changed;
+            owner_changed = false;
             snapshot.blocks = new HashTable<string, StorageBlock> (str_hash, str_equal);
             snapshot.drives = new HashTable<string, StorageDrive> (str_hash, str_equal);
+            snapshot.advanced = new HashTable<string, StorageDevice> (str_hash, str_equal);
             foreach (var item in previous_blocks.get_values ()) item.available = false;
             foreach (var item in previous_drives.get_values ()) item.available = false;
 
             if (available ()) {
-                var old_advanced = snapshot.advanced;
-                snapshot.advanced = new HashTable<string, StorageDevice> (str_hash, str_equal);
+                var old_advanced = reuse ? previous_advanced : snapshot.advanced;
                 foreach (var item in manager.get_objects ()) {
                     string path = item.get_object_path ();
                     update_advanced (item, path, old_advanced);
                     if (has (item, "Drive")) {
-                        var drive = previous_drives.lookup (path) ?? new StorageDrive (path);
+                        var drive = (reuse ? previous_drives.lookup (path) : null) ?? new StorageDrive (path);
                         drive.blocks = {};
                         drive.medium = null;
                         update_drive (item, drive);
                         snapshot.drives.insert (path, drive);
                     }
                     if (has (item, "Block")) {
-                        var block = previous_blocks.lookup (path) ?? new StorageBlock (path);
+                        var previous = reuse ? previous_blocks.lookup (path) : null;
+                        var block = previous;
+                        if (block == null || !same_image_mapping (item, block)) block = new StorageBlock (path);
                         block.parent = null;
                         update_block (item, block);
                         snapshot.blocks.insert (path, block);
-                        if (!previous_blocks.contains (path) && block.partition == null)
+                        if (block != previous && block.partition == null)
                             read_sector_sizes.begin (block, backend_lifetime);
                     }
                 }
             }
-            if (!available ()) snapshot.advanced.remove_all ();
-            StorageHierarchy.link (snapshot, previous_drives);
+            foreach (var old in previous_advanced.get_values ())
+                if (snapshot.advanced.lookup (old.path) != old) old.available = false;
+            StorageHierarchy.link (snapshot, reuse ? previous_drives : snapshot.drives);
             foreach (var block in snapshot.blocks.get_values ()) {
                 if (block.raid != null && block.raid.running) {
                     var kernel = MdRaidKernelState.inspect (block);
@@ -465,12 +501,40 @@ namespace MajorisDisks {
                 }
             }
             foreach (var old in previous_blocks.get_values ())
-                if (!snapshot.blocks.contains (old.path)) minimum_sizes.invalidate (old.path);
+                if (snapshot.blocks.lookup (old.path) != old) minimum_sizes.invalidate (old.path);
             synchronize_jobs ();
             synchronize_selftests ();
             synchronize_raid_maintenance ();
             synchronize_thin_pool_warnings ();
             changed ();
+            if (available ()) {
+                if (!reuse && lvm_module_seen) ensure_lvm2_available.begin ((obj, result) => {
+                    try { ensure_lvm2_available.end (result); }
+                    catch (Error error) { message ("LVM2 reconnection: %s", error.message); }
+                });
+                if (!reuse && btrfs_module_seen) load_storage_module.begin (false, backend_lifetime, (obj, result) => {
+                    try { load_storage_module.end (result); }
+                    catch (Error error) { message ("Btrfs reconnection: %s", error.message); }
+                });
+                lvm_module_seen |= storage_module_available (true);
+                btrfs_module_seen |= storage_module_available (false);
+            }
+        }
+
+        private bool same_image_mapping (DBusObject item, StorageBlock previous) {
+            if (previous.loop != null) {
+                if (previous.loop.backing_file != property (item, "Loop", "BackingFile")?.get_bytestring () ||
+                    previous.number != property (item, "Block", "DeviceNumber")?.get_uint64 ()) return false;
+                string sequence;
+                try {
+                    FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (previous.number) +
+                        "/diskseq", out sequence);
+                    return previous.loop.sequence != "" && previous.loop.sequence == sequence.strip ();
+                } catch (FileError error) { return false; }
+            }
+            if (previous.virtual_attachment != null)
+                return VirtualDiskAttachment.lookup (previous.device)?.token == previous.virtual_attachment.token;
+            return !has (item, "Loop");
         }
 
         private void synchronize_thin_pool_warnings () {
@@ -823,7 +887,7 @@ namespace MajorisDisks {
         }
 
         private async int open_block (StorageBlock block, string mode, int flags, Cancellable token,
-            VirtualAttachment? discovery = null) throws Error {
+            VirtualAttachment? discovery = null, bool loop_discovery = false) throws Error {
             uint64 number = block.number;
             string identity = modification_identity (block);
             var proxy = require_volume (block, "Block");
@@ -854,7 +918,7 @@ namespace MajorisDisks {
                     throw new IOError.NOT_SUPPORTED ("UDisks did not provide a direct-I/O descriptor. Use Buffered I/O for this device.");
                 synchronize ();
                 if (require_volume (block, "Block") != proxy ||
-                    (discovery == null ? modification_identity (block) != identity :
+                    (discovery == null ? !loop_discovery && modification_identity (block) != identity :
                         VirtualDiskAttachment.lookup (block.device)?.token != discovery.token))
                     throw new IOError.NOT_FOUND ("The selected block device changed.");
                 return fd;
@@ -1279,8 +1343,11 @@ namespace MajorisDisks {
             if (owner == null) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
             var job = jobs.begin_named ("Attach disk image", source.get_parse_name (), {});
             var outcome = new StorageOperationResult ();
+            ImageOperationJournal? recovery = null;
             int fd = -1;
             bool dispatched = false;
+            bool accepted = false;
+            string? setup_lock = null;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Opening the image");
                 fd = Posix.open (path, (read_only ? Posix.O_RDONLY : Posix.O_RDWR) |
@@ -1290,6 +1357,11 @@ namespace MajorisDisks {
                     throw new IOError.FAILED ("Could not open the selected image.");
                 if (!Posix.S_ISREG (info.st_mode) || info.st_size < 512)
                     throw new IOError.INVALID_DATA ("The selected image is not a usable regular file.");
+                string file_key = "%s:%s".printf (((uint64) info.st_dev).to_string (), ((uint64) info.st_ino).to_string ());
+                if (loop_setups.contains (file_key))
+                    throw new IOError.PENDING ("Attachment of this image is already in progress.");
+                loop_setups.insert (file_key, path);
+                setup_lock = file_key;
                 require_raw_image (fd, (uint64) info.st_size);
                 string? reviewed_image = image_identity (fd);
                 var layout = yield ImagePartitionLayout.inspect_async (fd, (uint64) info.st_size, lifetime);
@@ -1313,15 +1385,29 @@ namespace MajorisDisks {
                 options.add ("{sv}", "read-only", new Variant.boolean (read_only));
                 jobs.phase (job, StorageJobState.RUNNING, "Attaching the image");
                 UnixFDList? returned;
+                lifetime.set_error_if_cancelled ();
+                Posix.Stat current_source = {};
+                if (Posix.lstat (backing, out current_source) != 0 || current_source.st_dev != info.st_dev ||
+                    current_source.st_ino != info.st_ino || image_identity (fd) != reviewed_image)
+                    throw new IOError.INVALID_DATA ("The selected loop image changed before dispatch.");
+                recovery = new ImageOperationJournal ("Attach disk image", backing,
+                    "LoopSetup on UDisks %s. Source device %s, inode %s. The result requires observation."
+                    .printf (owner, ((uint64) info.st_dev).to_string (), ((uint64) info.st_ino).to_string ()));
                 dispatched = true;
                 var reply = yield manager_proxy.call_with_unix_fd_list ("LoopSetup",
                     new Variant ("(h@a{sv})", handle, options.end ()), DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
                     int.MAX, descriptors, lifetime, out returned);
+                accepted = true;
                 if (!reply.is_of_type (new VariantType ("(o)")))
                     throw new IOError.INVALID_DATA ("UDisks did not return a loop object.");
                 string attached = reply.get_child_value (0).get_string ();
                 string diagnostic = "UDisks did not expose the verified loop device.";
+                string? attachment_identity = null;
+                jobs.phase (job, StorageJobState.FINALIZING, "Verifying loop and partition discovery");
                 for (int attempt = 0; attempt < 50; attempt++) {
+                    if (Posix.lstat (backing, out current_source) != 0 || current_source.st_dev != info.st_dev ||
+                        current_source.st_ino != info.st_ino || image_identity (fd) != reviewed_image)
+                        throw new IOError.INVALID_DATA ("The original loop image changed during discovery.");
                     synchronize ();
                     var block = snapshot.blocks.lookup (attached);
                     if (block?.loop != null && block.loop.backing_file == backing && block.read_only == read_only &&
@@ -1329,35 +1415,72 @@ namespace MajorisDisks {
                         string kernel_backing;
                         FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (block.number) +
                             "/loop/backing_file", out kernel_backing);
-                        Posix.Stat current_source = {};
-                        if (Posix.lstat (backing, out current_source) != 0 || current_source.st_dev != info.st_dev ||
-                            current_source.st_ino != info.st_ino || image_identity (fd) != reviewed_image)
-                            throw new IOError.INVALID_DATA ("The original loop image changed during discovery.");
-                        if (kernel_backing != backing + "\n" || block.loop.sequence == "" ||
-                            !image_partitions_discovered (block, layout, out diagnostic)) {
-                            yield image_discovery_delay (lifetime);
-                            continue;
+                        string sequence = block.loop.sequence;
+                        string number = KernelStorageSafety.device_number (block.number);
+                        string identity = number + ":" + sequence;
+                        if (attachment_identity != null && attachment_identity != identity)
+                            throw new IOError.INVALID_DATA ("The loop device identity changed during discovery.");
+                        if (kernel_backing == backing + "\n" && sequence != "") {
+                            attachment_identity = identity;
+                            var discovery_lifetime = backend_lifetime;
+                            int probe;
+                            try {
+                                probe = yield open_block (block, "r", Posix.O_CLOEXEC | Posix.O_NONBLOCK,
+                                    discovery_lifetime, null, true);
+                            } catch (Error error) {
+                                if (!discovery_lifetime.is_cancelled ()) throw error;
+                                yield image_discovery_delay ();
+                                continue;
+                            }
+                            try {
+                                Posix.Stat device = {};
+                                string live_sequence;
+                                FileUtils.get_contents ("/sys/dev/block/" + number + "/diskseq", out live_sequence);
+                                if (Posix.fstat (probe, out device) != 0 || !Posix.S_ISBLK (device.st_mode) ||
+                                    device.st_rdev != block.number || live_sequence.strip () != sequence)
+                                    throw new IOError.INVALID_DATA ("The loop device identity changed during discovery.");
+                                match_loop_source (probe, fd);
+                                if (Posix.lstat (backing, out current_source) != 0 || current_source.st_dev != info.st_dev ||
+                                    current_source.st_ino != info.st_ino || image_identity (fd) != reviewed_image)
+                                    throw new IOError.INVALID_DATA ("The original loop image changed during discovery.");
+                                if (image_partitions_discovered (block, layout, out diagnostic)) {
+                                    verified_loops.insert (attached, loop_identity (block.number, sequence, info));
+                                    block.loop.verified_sequence = sequence;
+                                    outcome.successful = true;
+                                    outcome.summary = layout.has_table ? "Disk image attached" : "Unpartitioned disk image attached";
+                                    jobs.finish (job, outcome);
+                                    return attached;
+                                }
+                            } finally { Posix.close (probe); }
                         }
-                        block.loop.verified_sequence = block.loop.sequence;
-                        outcome.successful = true;
-                        outcome.summary = layout.has_table ? "Disk image attached" : "Unpartitioned disk image attached";
-                        jobs.finish (job, outcome);
-                        return attached;
                     }
-                    yield image_discovery_delay (lifetime);
+                    yield image_discovery_delay ();
                 }
                 throw new IOError.TIMED_OUT ("The image may be attached, but discovery is incomplete. %s Refresh before retrying."
                     .printf (diagnostic));
             } catch (Error error) {
                 outcome.fail ("Could not verify attachment", error);
                 string? remote = DBusError.get_remote_error (error);
-                if (dispatched && !(error is DBusError.ACCESS_DENIED) && remote?.contains ("NotAuthorized") != true) {
+                if (!accepted && (error is DBusError.ACCESS_DENIED || remote?.contains ("NotAuthorized") == true))
+                    dispatched = false;
+                if (dispatched) {
                     outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                     outcome.actual_state = "The attachment may exist. Refresh the device list before retrying.";
+                    jobs.finish (job, outcome);
+                    throw new RawAttachmentError.UNCERTAIN ("%s %s".printf (outcome.actual_state, error.message));
                 }
                 jobs.finish (job, outcome);
                 throw error;
-            } finally { if (fd >= 0) Posix.close (fd); }
+            } finally {
+                if (!dispatched || outcome.successful) recovery?.remove ();
+                if (setup_lock != null) loop_setups.remove (setup_lock);
+                if (fd >= 0) Posix.close (fd);
+            }
+        }
+
+        private static string loop_identity (uint64 number, string sequence, Posix.Stat backing) {
+            return "%s:%s:%s:%s".printf (number.to_string (), sequence,
+                ((uint64) backing.st_dev).to_string (), ((uint64) backing.st_ino).to_string ());
         }
 
         internal async string attach_virtual_image (File source, bool read_only) throws Error {
@@ -1365,7 +1488,6 @@ namespace MajorisDisks {
             var outcome = new StorageOperationResult ();
             VirtualAttachment? record = null;
             try {
-                var lifetime = backend_lifetime;
                 job.cancelable = true;
                 jobs.phase (job, StorageJobState.RUNNING, "Inspecting and authorizing the virtual disk");
                 record = yield VirtualDiskAttachment.attach (source, read_only, job.cancellable);
@@ -1377,6 +1499,7 @@ namespace MajorisDisks {
                 string? probed_identity = null;
                 for (int attempt = 0; attempt < 75; attempt++) {
                     synchronize ();
+                    var lifetime = backend_lifetime;
                     var block = snapshot.blocks.lookup (path);
                     if (block?.virtual_attachment?.token == record.token && block.read_only == read_only &&
                         block.available && block.size == record.capacity) {
@@ -1391,9 +1514,15 @@ namespace MajorisDisks {
                             throw new IOError.INVALID_DATA ("The NBD disk sequence could not be verified.");
                         string identity = "%s:%s:%s".printf (block.number.to_string (), sequence.strip (), record.token);
                         if (layout == null) {
-                            int fd = yield open_block (block, "r", Posix.O_CLOEXEC | Posix.O_NONBLOCK, lifetime, record);
-                            try { layout = yield ImagePartitionLayout.inspect_async (fd, record.capacity, lifetime); }
-                            finally { Posix.close (fd); }
+                            try {
+                                int fd = yield open_block (block, "r", Posix.O_CLOEXEC | Posix.O_NONBLOCK, lifetime, record);
+                                try { layout = yield ImagePartitionLayout.inspect_async (fd, record.capacity, lifetime); }
+                                finally { Posix.close (fd); }
+                            } catch (Error error) {
+                                if (!lifetime.is_cancelled ()) throw error;
+                                yield image_discovery_delay ();
+                                continue;
+                            }
                             probed_identity = identity;
                             continue;
                         }
@@ -1408,7 +1537,7 @@ namespace MajorisDisks {
                             return path;
                         }
                     }
-                    yield image_discovery_delay (lifetime);
+                    yield image_discovery_delay ();
                 }
                 throw new IOError.TIMED_OUT ("The managed kernel mapping was retained. %s Refresh before retrying."
                     .printf (discovery));
@@ -1423,7 +1552,7 @@ namespace MajorisDisks {
             }
         }
 
-        private async void image_discovery_delay (Cancellable token) throws Error {
+        private async void image_discovery_delay () {
             var timeout = new TimeoutSource (200);
             var ready = new IdleSource ();
             ulong update = changed.connect (() => {
@@ -1436,7 +1565,6 @@ namespace MajorisDisks {
             disconnect (update);
             timeout.destroy ();
             ready.destroy ();
-            token.set_error_if_cancelled ();
         }
 
         private bool image_partitions_discovered (StorageBlock disk, ImagePartitionLayout layout, out string diagnostic)
@@ -1454,6 +1582,9 @@ namespace MajorisDisks {
         }
 
         private async void detach_virtual_image (StorageBlock block, VirtualAttachment record) throws Error {
+            synchronize ();
+            if (snapshot.blocks.lookup (block.path) != block || block.virtual_attachment?.token != record.token)
+                throw new IOError.NOT_FOUND ("The selected virtual attachment changed.");
             locks.acquire (block, snapshot.dependencies);
             var job = jobs.begin ("Detach virtual disk", block, snapshot.dependencies);
             var outcome = new StorageOperationResult ();
@@ -1483,13 +1614,13 @@ namespace MajorisDisks {
                     bool old_children = false;
                     foreach (var partition in partitions)
                         old_children |= FileUtils.test ("/sys/dev/block/" + partition, FileTest.EXISTS);
-                    if (!old_children && (current == null || !current.available ||
+                    if (available () && !old_children && (current == null || !current.available ||
                         (current.virtual_attachment != null && current.virtual_attachment.token != record.token))) {
                         outcome.successful = true;
                         outcome.summary = "Virtual disk detached";
                         return;
                     }
-                    yield settle_delay (backend_lifetime);
+                    yield image_discovery_delay ();
                 }
                 throw new IOError.TIMED_OUT ("The kernel mapping was released, but UDisks did not confirm removal.");
             } catch (Error error) {
@@ -1516,10 +1647,12 @@ namespace MajorisDisks {
             var outcome = new StorageOperationResult ();
             string backing = block.loop.backing_file;
             string requested_sequence = block.loop.sequence;
-            string number = KernelStorageSafety.device_number (block.number);
+            uint64 requested_number = block.number;
+            string number = KernelStorageSafety.device_number (requested_number);
             string sysfs = "/sys/dev/block/" + number;
             var lifetime = backend_lifetime;
             bool dispatched = false;
+            ImageOperationJournal? recovery = null;
             try {
                 jobs.phase (job, StorageJobState.PREPARING, "Checking active image volumes");
                 synchronize ();
@@ -1553,7 +1686,10 @@ namespace MajorisDisks {
                 foreach (var partition in partitions)
                     yield KernelStorageSafety.require_idle_number (partition, lifetime);
                 int probe = yield open_block (block, "r", Posix.O_EXCL | Posix.O_CLOEXEC, lifetime);
+                Posix.Stat original_source = {};
                 try {
+                    if (Posix.lstat (backing, out original_source) != 0)
+                        throw new IOError.NOT_FOUND ("The backing file is no longer available.");
                     match_loop_backing (probe, backing);
                     debug ("Loop %s passed the exclusive-open and backing inode checks", block.path);
                 } finally { Posix.close (probe); }
@@ -1561,11 +1697,17 @@ namespace MajorisDisks {
                 string current_sequence, current_backing;
                 FileUtils.get_contents (sysfs + "/diskseq", out current_sequence);
                 FileUtils.get_contents (sysfs + "/loop/backing_file", out current_backing);
+                Posix.Stat current_source = {};
                 if (snapshot.blocks.lookup (block.path) != block || block.loop?.backing_file != backing ||
-                    current_sequence != sequence || current_backing != kernel_backing)
+                    current_sequence != sequence || current_backing != kernel_backing ||
+                    Posix.lstat (backing, out current_source) != 0 || current_source.st_dev != original_source.st_dev ||
+                    current_source.st_ino != original_source.st_ino)
                     throw new IOError.NOT_FOUND ("The backing image changed.");
                 var proxy = require_volume (block, "Loop");
                 jobs.phase (job, StorageJobState.RUNNING, "Detaching the image");
+                recovery = new ImageOperationJournal ("Detach disk image", backing,
+                    "Loop.Delete on UDisks %s. Object %s, device %s, disk sequence %s. The result requires observation."
+                    .printf (owner, block.path, number, sequence.strip ()));
                 dispatched = true;
                 Error? delete_error = null;
                 try {
@@ -1580,11 +1722,13 @@ namespace MajorisDisks {
                     }
                     delete_error = error;
                 }
+                jobs.phase (job, StorageJobState.FINALIZING, "Verifying that the original loop mapping was removed");
+                bool kernel_released = false;
                 for (int attempt = 0; attempt < 50; attempt++) {
                     synchronize ();
                     var current = snapshot.blocks.lookup (block.path);
-                    bool old_object = current?.loop?.backing_file == backing;
-                    bool kernel_released = false;
+                    bool old_object = current?.loop?.backing_file == backing &&
+                        (current.loop.sequence == "" || current.loop.sequence == sequence.strip ());
                     try {
                         FileUtils.get_contents (sysfs + "/diskseq", out current_sequence);
                         if (current_sequence != sequence) kernel_released = true;
@@ -1594,21 +1738,29 @@ namespace MajorisDisks {
                     foreach (var partition in partitions)
                         old_children |= FileUtils.test ("/sys/dev/block/" + partition, FileTest.EXISTS);
                     if (kernel_released && !old_object && !old_children && owner != null) {
+                        if (verified_loops.lookup (block.path) ==
+                            loop_identity (requested_number, requested_sequence, original_source))
+                            verified_loops.remove (block.path);
                         outcome.successful = true;
                         outcome.summary = "Disk image detached";
                         jobs.finish (job, outcome);
                         return;
                     }
-                    yield settle_delay (lifetime);
+                    yield image_discovery_delay ();
                 }
-                throw new IOError.TIMED_OUT ("Loop detachment could not be verified. Refresh before retrying. %s"
-                    .printf (delete_error?.message ?? ""));
+                string state = kernel_released ?
+                    "The original loop mapping is gone. UDisks has not finished refreshing." :
+                    "Loop detachment could not be verified. Refresh and review the current mapping.";
+                throw new IOError.TIMED_OUT ("%s %s".printf (state, delete_error?.message ?? ""));
             } catch (Error error) {
                 outcome.fail ("Could not detach the image", error);
                 if (dispatched) outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                 jobs.finish (job, outcome);
                 throw error;
-            } finally { locks.release (block); }
+            } finally {
+                if (!dispatched || outcome.successful) recovery?.remove ();
+                locks.release (block);
+            }
         }
 
         internal bool has_btrfs_subvolumes (StorageBlock block) {
@@ -3827,7 +3979,52 @@ namespace MajorisDisks {
         }
 
         internal bool can_create_storage_group (bool raid) {
-            return creation_manager (raid) != null;
+            return available () && (creation_manager (raid) != null || (!raid && creation_manager (true) != null));
+        }
+
+        internal async void ensure_lvm2_available () throws Error {
+            if (!available ()) throw new IOError.NOT_CONNECTED ("UDisks is unavailable.");
+            if (storage_module_available (true)) return;
+            var token = backend_lifetime;
+            if (lvm_activation == token)
+                throw new IOError.PENDING ("LVM2 activation is already in progress.");
+            lvm_activation = token;
+            try {
+                yield load_storage_module (true, token);
+                lvm_module_seen = true;
+            } finally {
+                if (lvm_activation == token) lvm_activation = null;
+            }
+        }
+
+        private bool storage_module_available (bool lvm) {
+            return manager?.get_interface ("/org/freedesktop/UDisks2/Manager",
+                PREFIX + (lvm ? "Manager.LVM2" : "Manager.BTRFS")) != null;
+        }
+
+        private async void load_storage_module (bool lvm, Cancellable token) throws Error {
+            token.set_error_if_cancelled ();
+            if (storage_module_available (lvm)) return;
+            string name = lvm ? "lvm2" : "btrfs";
+            var proxy = creation_manager (true);
+            string? daemon = owner;
+            if (proxy == null || daemon == null)
+                throw new IOError.NOT_CONNECTED ("The UDisks manager is unavailable.");
+            try {
+                yield proxy.get_connection ().call (daemon, proxy.get_object_path (), PREFIX + "Manager",
+                    "EnableModule", new Variant ("(sb)", name, true), new VariantType ("()"),
+                    DBusCallFlags.NONE, 30000, token);
+            } catch (Error error) {
+                token.set_error_if_cancelled ();
+                throw new IOError.FAILED ("The optional UDisks %s module could not be activated. %s"
+                    .printf (name, error.message));
+            }
+            for (int attempt = 0; attempt < 50; attempt++) {
+                token.set_error_if_cancelled ();
+                if (storage_module_available (lvm)) return;
+                yield settle_delay (token);
+            }
+            throw new IOError.TIMED_OUT ("UDisks has not published the %s manager interface.".printf (name));
         }
 
         internal bool can_use_group_member (StorageBlock block) {

@@ -421,6 +421,17 @@ private extern int fixture_pidfd_open (int pid, uint flags);
 [CCode (cname = "pidfd_send_signal", cheader_filename = "sys/pidfd.h")]
 private extern int fixture_pidfd_signal (int fd, int signal, void* info, uint flags);
 
+private string fixture_process_start (uint pid) throws Error {
+    string stat;
+    FileUtils.get_contents ("/proc/%u/stat".printf (pid), out stat);
+    int end = stat.last_index_of (") ");
+    if (end < 0) throw new IOError.INVALID_DATA ("The process start identity is unavailable.");
+    string[] fields = stat.substring (end + 2).split (" ");
+    if (fields.length < 20 || fields[0] == "Z" || fields[0] == "X")
+        throw new IOError.INVALID_DATA ("The fixture process is no longer active.");
+    return fields[19];
+}
+
 private uint find_fixture_exporter (uint pid, string token, int depth = 0) throws Error {
     if (pid == 0 || depth > 8) return 0;
     string process = "/proc/%u".printf (pid);
@@ -473,6 +484,9 @@ private async bool exercise_nbd_interruption (bool client, bool during_restore) 
         verify_nbd_journal (record);
         string sysfs = "/sys/block/nbd%u".printf (record.index);
         uint pid;
+        string client_start = "";
+        string disk_sequence;
+        FileUtils.get_contents (sysfs + "/diskseq", out disk_sequence);
         if (client) {
             string pid_text;
             FileUtils.get_contents (sysfs + "/pid", out pid_text);
@@ -490,10 +504,20 @@ private async bool exercise_nbd_interruption (bool client, bool during_restore) 
             }
             if (Path.get_basename (FileUtils.read_link ("/proc/%u/exe".printf (pid))) != "nbd-client")
                 throw new IOError.INVALID_DATA ("The recorded client process no longer owns the mapping.");
+            client_start = journal.get_string ("attachment", "client-start");
         } else pid = find_fixture_exporter (record.exporter_pid, record.token);
         int pidfd = pid > 0 && pid <= int.MAX ? fixture_pidfd_open ((int) pid, 0) : -1;
         if (pidfd < 0) throw new IOError.NOT_FOUND ("The fixture process could not be pinned.");
         try {
+            if (client) {
+                string current_sequence;
+                FileUtils.get_contents (sysfs + "/diskseq", out current_sequence);
+                if (disk_sequence.strip () == "" || current_sequence != disk_sequence ||
+                    fixture_process_start (pid) != client_start || !VirtualDiskAttachment.exporter_running (record))
+                    throw new IOError.INVALID_DATA ("The foreground client, exporter, or NBD mapping changed.");
+                stdout.printf ("Pinned NBD client %u, start %s, diskseq %s, exporter %u, token %s, index %u\n",
+                    pid, client_start, disk_sequence.strip (), record.exporter_pid, record.token, record.index);
+            }
             if (during_restore) {
                 bool stopped = false;
                 ulong update = backend.jobs.changed.connect (() => {
@@ -557,7 +581,26 @@ private async bool exercise_nbd_interruption (bool client, bool during_restore) 
     }
 }
 
-private async void exercise_nbd_devices () throws Error {
+private string fixture_udisks_owner () throws Error {
+    var bus = Bus.get_sync (BusType.SYSTEM);
+    var reply = bus.call_sync ("org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "GetNameOwner", new Variant ("(s)", "org.freedesktop.UDisks2"),
+        new VariantType ("(s)"), DBusCallFlags.NONE, 5000);
+    return reply.get_child_value (0).get_string ();
+}
+
+private VirtualAttachment fixture_nbd_record (File image) throws Error {
+    var blocks = Dir.open ("/sys/class/block");
+    string? name;
+    while ((name = blocks.read_name ()) != null) {
+        if (!Regex.match_simple ("^nbd[0-9]+$", name)) continue;
+        var record = VirtualDiskAttachment.lookup ("/dev/" + name);
+        if (record?.file == image.get_path ()) return record;
+    }
+    throw new IOError.NOT_FOUND ("The accepted NBD mapping could not be identified at the restart barrier.");
+}
+
+private async void exercise_nbd_devices (bool restart, bool reuse) throws Error {
     string directory = DirUtils.make_tmp ("majoris-nbd-tests-XXXXXX");
     var raw = File.new_for_path (Path.build_filename (directory, "source.img"));
     string payload_dir = Path.build_filename (directory, "payload");
@@ -576,7 +619,9 @@ private async void exercise_nbd_devices () throws Error {
             "-E", "offset=1048576", raw.get_path (), "4096" }, SubprocessFlags.NONE);
         yield formatter.wait_check_async ();
         var readback = File.new_for_path (Path.build_filename (directory, "readback.img"));
-        foreach (var fixture in new string[] { "vpc", "vhdx", "qcow2", "compressed-qcow2" }) {
+        string[] formats = restart || reuse ? new string[] { "qcow2" } :
+            new string[] { "vpc", "vhdx", "qcow2", "compressed-qcow2" };
+        foreach (var fixture in formats) {
             set_nbd_marker (raw, "Majoris read fixture");
             bool compress = fixture == "compressed-qcow2";
             string format = compress ? "qcow2" : fixture;
@@ -588,12 +633,49 @@ private async void exercise_nbd_devices () throws Error {
             StorageBlock? mounted = null;
             retain = true;
             try {
-                string path = yield backend.attach_virtual_image (image, true);
+                VirtualAttachment? before = null;
+                string sequence = "";
+                Error? restart_error = null;
+                ulong barrier = 0;
+                if (restart) barrier = backend.jobs.changed.connect (() => {
+                    if (before != null || restart_error != null) return;
+                    for (uint i = 0; i < backend.jobs.jobs.get_n_items (); i++) {
+                        var job = backend.jobs.jobs.get_item (i) as StorageJob;
+                        if (job?.phase != "Waiting for UDisks discovery") continue;
+                        try {
+                            before = fixture_nbd_record (image);
+                            verify_nbd_journal (before);
+                            FileUtils.get_contents ("/sys/block/nbd%u/diskseq".printf (before.index), out sequence);
+                            string previous = fixture_udisks_owner ();
+                            var systemctl = new Subprocess.newv ({ "systemctl", "restart", "udisks2" }, SubprocessFlags.NONE);
+                            systemctl.wait_check ();
+                            string current = fixture_udisks_owner ();
+                            if (current == previous) throw new IOError.FAILED ("UDisks did not acquire a new owner.");
+                            stdout.printf ("NBD token %s, index %u, diskseq %s, exporter %u, UDisks %s -> %s\n",
+                                before.token, before.index, sequence.strip (), before.exporter_pid, previous, current);
+                        } catch (Error error) { restart_error = error; }
+                        return;
+                    }
+                });
+                stdout.printf ("Attaching NBD fixture %s read-only\n", fixture);
+                string path = "";
+                try { path = yield backend.attach_virtual_image (image, true); }
+                finally { if (barrier != 0) backend.jobs.disconnect (barrier); }
                 block = backend.snapshot.blocks.lookup (path);
                 if (block == null || block.virtual_attachment?.file != image.get_path () ||
                     block.virtual_attachment.format != format || !block.read_only || block.size != 64 * 1024 * 1024)
                     throw new IOError.INVALID_DATA ("The managed virtual fixture could not be verified.");
                 verify_nbd_journal (block.virtual_attachment);
+                if (restart) {
+                    if (restart_error != null) throw restart_error;
+                    string current_sequence;
+                    var after = block.virtual_attachment;
+                    FileUtils.get_contents ("/sys/block/nbd%u/diskseq".printf (after.index), out current_sequence);
+                    if (before == null || before.token != after.token || before.index != after.index ||
+                        before.exporter_pid != after.exporter_pid || before.exporter_start != after.exporter_start ||
+                        sequence.strip () == "" || current_sequence != sequence)
+                        throw new IOError.INVALID_DATA ("The NBD mapping changed across the UDisks restart.");
+                }
                 try {
                     yield backend.attach_virtual_image (image, false);
                     assert_not_reached ();
@@ -632,13 +714,50 @@ private async void exercise_nbd_devices () throws Error {
                 yield backend.volume_action (mounted, "Unmount");
                 mounted = null;
                 var record = block.virtual_attachment;
+                var stale = block;
+                uint64 old_number = block.number;
+                string old_sequence = "";
+                if (reuse) FileUtils.get_contents ("/sys/block/nbd%u/diskseq".printf (record.index), out old_sequence);
                 yield backend.detach_disk_image (block);
                 verify_nbd_cleanup (record);
                 block = null;
                 retain = false;
 
-                if (fixture == "qcow2") {
+                if (reuse) {
+                    var replacement = File.new_for_path (Path.build_filename (directory, "replacement.qcow2"));
+                    yield VirtualDisk.write_image (raw, replacement, "qcow2", 0, new Cancellable ());
                     retain = true;
+                    string replacement_path = yield backend.attach_virtual_image (replacement, true);
+                    var current = backend.snapshot.blocks.lookup (replacement_path);
+                    var next = current?.virtual_attachment;
+                    if (next == null || next.file != replacement.get_path () || next.token == record.token)
+                        throw new IOError.INVALID_DATA ("The replacement NBD fixture identity was not established.");
+                    verify_nbd_journal (next);
+                    string next_sequence;
+                    FileUtils.get_contents ("/sys/block/nbd%u/diskseq".printf (next.index), out next_sequence);
+                    if (old_sequence.strip () == "" || next_sequence.strip () == "")
+                        throw new IOError.INVALID_DATA ("The NBD disk sequence could not be verified.");
+                    stdout.printf ("NBD %u -> %u, diskseq %s -> %s, tokens %s -> %s\n",
+                        record.index, next.index, old_sequence.strip (), next_sequence.strip (), record.token, next.token);
+                    bool reused_number = old_number == current.number && record.index == next.index;
+                    try {
+                        yield backend.detach_disk_image (stale);
+                        throw new IOError.FAILED ("A stale NBD reference was accepted.");
+                    } catch (IOError.NOT_FOUND error) {
+                        if (VirtualDiskAttachment.lookup (current.device)?.token != next.token)
+                            throw new IOError.FAILED ("The stale detach affected the replacement NBD mapping.");
+                    }
+                    yield verify_nbd_marker (backend, current, readback, "Majoris read fixture");
+                    yield backend.detach_disk_image (current);
+                    verify_nbd_cleanup (next);
+                    replacement.delete (null);
+                    retain = false;
+                    if (!reused_number)
+                        throw new IOError.NOT_SUPPORTED ("The fixture did not obtain the same NBD device number.");
+                }
+                if (fixture == "qcow2" && !restart && !reuse) {
+                    retain = true;
+                    stdout.printf ("Reattaching NBD fixture %s writable\n", fixture);
                     string writable_path = yield backend.attach_virtual_image (image, false);
                     block = backend.snapshot.blocks.lookup (writable_path);
                     if (block == null || block.virtual_attachment?.file != image.get_path () || block.read_only)
@@ -846,6 +965,33 @@ private void exercise_publication () throws Error {
     }
 }
 
+private void publication_power_loss_worker (string fixture, string checkpoint) throws Error {
+    string temporary = Path.build_filename (fixture, "work", "image");
+    string destination = Path.build_filename (fixture, "published.img");
+    var recovery = new ImageOperationJournal ("Power-loss image fixture", destination, checkpoint);
+    var publication = new ImagePublication (destination);
+    int fd = VirtualDisk.open_image (File.new_for_path (temporary));
+    Posix.Stat verified = {};
+    try { verified = ImagePublication.flush (fd); }
+    finally { Posix.close (fd); }
+    if (checkpoint == "incomplete-output") publication_power_loss_barrier (checkpoint, verified);
+    if (checkpoint == "before-rename") publication_power_loss_barrier (checkpoint, verified);
+    publication.publish (temporary, verified, (directory) => {
+        if (checkpoint == "before-directory-sync") publication_power_loss_barrier (checkpoint, verified);
+        return Posix.fsync (directory);
+    });
+    if (checkpoint == "after-directory-sync") publication_power_loss_barrier (checkpoint, verified);
+    recovery.remove ();
+    throw new IOError.INVALID_ARGUMENT ("Unknown publication checkpoint.");
+}
+
+private void publication_power_loss_barrier (string checkpoint, Posix.Stat verified) {
+    stdout.printf ("POWER-LOSS READY %s inode %s size %s\n", checkpoint,
+        ((uint64) verified.st_ino).to_string (), ((uint64) verified.st_size).to_string ());
+    stdout.flush ();
+    while (true) Posix.pause ();
+}
+
 private void exercise_discovery_race () {
     var disk = new StorageBlock ("/fixture");
     var blank = new ImagePartitionLayout ();
@@ -873,7 +1019,131 @@ private void exercise_discovery_race () {
     assert (!layout.matches_discovery (disk, { "7:1" }));
 }
 
+private async void exercise_loop_fault (string[] args) throws Error {
+    string directory = Path.get_dirname (args[3]);
+    Posix.Stat fixture = {};
+    if (!directory.has_prefix ("/var/tmp/majoris-loop-fault.") || Path.get_basename (args[3]) != "fixture.img" ||
+        Posix.lstat (directory, out fixture) != 0 || !Posix.S_ISDIR (fixture.st_mode) ||
+        fixture.st_uid != 0 || (fixture.st_mode & 077) != 0)
+        throw new IOError.PERMISSION_DENIED ("The loop fault test requires a private fixture directory.");
+    var backend = new UDisksService ();
+    yield backend.refresh ();
+    var image = File.new_for_path (args[3]);
+    string mode = args[2];
+    if (mode == "recover-setup") {
+        ImageOperationJournal.recover (backend.jobs);
+        var job = backend.jobs.jobs.get_item (0) as StorageJob;
+        if (backend.jobs.jobs.get_n_items () != 1 || job?.target != args[3] ||
+            job.result?.status != StorageOperationStatus.NEEDS_ATTENTION)
+            throw new IOError.FAILED ("A fresh client did not recover the uncertain LoopSetup record.");
+        int mappings = 0;
+        foreach (var current in backend.snapshot.blocks.get_values ()) {
+            if (current.loop?.backing_file == args[3] && current.loop.sequence != "") mappings++;
+        }
+        if (mappings != 1) throw new IOError.INVALID_DATA ("A fresh client did not rediscover exactly one fixture mapping.");
+        return;
+    }
+    string path = "";
+    try {
+        path = yield backend.attach_disk_image (image, true);
+    } catch (RawAttachmentError.UNCERTAIN error) {
+        if (!(mode == "setup" && error.message.contains ("Injected lost LoopSetup")) &&
+            !(mode == "substitute" && (error.message.contains ("image changed") ||
+                error.message.contains ("discovery is incomplete")))) throw error;
+        var job = backend.jobs.jobs.get_item (0) as StorageJob;
+        if (job?.result?.status != StorageOperationStatus.NEEDS_ATTENTION)
+            throw new IOError.FAILED ("An accepted LoopSetup with a lost reply was not classified as uncertain.");
+        return;
+    }
+    if (mode == "setup" || mode == "substitute")
+        throw new IOError.FAILED ("Expected the LoopSetup result to require observation.");
+    var block = backend.snapshot.blocks.lookup (path);
+    if (block?.loop?.backing_file != args[3] || block.loop.sequence == "")
+        throw new IOError.INVALID_DATA ("The fixture loop identity could not be verified.");
+    stdout.printf ("Loop %s device %s diskseq %s backing %s\n", path, block.number.to_string (),
+        block.loop.sequence, block.loop.backing_file);
+    if (mode == "restart") {
+        if (block.table?.partitions.length != 1)
+            throw new IOError.INVALID_DATA ("The replacement UDisks owner did not publish the fixture partition.");
+        return;
+    }
+    if (mode == "reuse") {
+        string old_sequence = block.loop.sequence;
+        string device = block.device;
+        uint64 number = block.number;
+        yield backend.detach_disk_image (block);
+        var replacement = new Subprocess.newv ({ "losetup", "--read-only", "--partscan", device, args[3] + ".replacement" },
+            SubprocessFlags.NONE);
+        yield replacement.wait_check_async ();
+        string sysfs = "/sys/dev/block/" + KernelStorageSafety.device_number (number);
+        string sequence;
+        FileUtils.get_contents (sysfs + "/diskseq", out sequence);
+        if (sequence.strip () == "" || sequence.strip () == old_sequence)
+            throw new IOError.INVALID_DATA ("The fixture could not establish a new loop disk sequence.");
+        var trigger = new Subprocess.newv ({ "udevadm", "trigger", "--action=change", "--settle", device }, SubprocessFlags.NONE);
+        yield trigger.wait_check_async ();
+        yield backend.refresh ();
+        try {
+            yield backend.detach_disk_image (block);
+            throw new IOError.FAILED ("A stale loop reference was accepted.");
+        } catch (IOError.NOT_FOUND error) {
+            stdout.printf ("Stale loop detach rejected on %s, diskseq %s -> %s\n", device, old_sequence, sequence.strip ());
+        }
+        string current_sequence;
+        FileUtils.get_contents (sysfs + "/diskseq", out current_sequence);
+        int probe = Posix.open (device, Posix.O_RDONLY | Posix.O_CLOEXEC | Posix.O_NOFOLLOW);
+        if (probe < 0 || current_sequence != sequence)
+            throw new IOError.INVALID_DATA ("Could not verify the replacement loop device for cleanup.");
+        try { match_loop_backing (probe, args[3] + ".replacement"); }
+        finally { Posix.close (probe); }
+        var cleanup = new Subprocess.newv ({ "losetup", "-d", device }, SubprocessFlags.NONE);
+        yield cleanup.wait_check_async ();
+        return;
+    }
+    yield backend.detach_disk_image (block);
+}
+
+private bool fixture_is_debian_qemu () {
+    if (Posix.getuid () != 0) return false;
+    try {
+        var guest = new Subprocess.newv ({ "systemd-detect-virt", "--vm" }, SubprocessFlags.STDOUT_PIPE);
+        string virtualization;
+        guest.communicate_utf8 (null, null, out virtualization, null);
+        string release;
+        FileUtils.get_contents ("/etc/os-release", out release);
+        return guest.get_successful () && virtualization.strip () == "qemu" &&
+            "\nID=debian\n" in release && "\nVERSION_ID=\"13\"\n" in release;
+    } catch (Error error) { return false; }
+}
+
 public static int main (string[] args) {
+    if ("--publication-power-loss-recover" in args) {
+        if (Environment.get_variable ("MAJORIS_DISKS_RUN_POWER_LOSS_TESTS") != "1" || !fixture_is_debian_qemu ())
+            return 77;
+        var jobs = new StorageJobManager ();
+        ImageOperationJournal.recover (jobs);
+        var recovered = jobs.jobs.get_item (0) as StorageJob;
+        return jobs.jobs.get_n_items () == 1 && recovered?.operation == "Power-loss image fixture" &&
+            recovered.result?.status == StorageOperationStatus.NEEDS_ATTENTION ? 0 : 1;
+    }
+    if (args.length == 4 && args[1] == "--publication-power-loss-worker") {
+        if (Environment.get_variable ("MAJORIS_DISKS_RUN_POWER_LOSS_TESTS") != "1" || !fixture_is_debian_qemu ())
+            return 77;
+        try { publication_power_loss_worker (args[2], args[3]); }
+        catch (Error error) { stderr.printf ("%s\n", error.message); return 1; }
+    }
+    if (args.length >= 4 && args[1] == "--loop-fault") {
+        if (Environment.get_variable ("MAJORIS_DISKS_RUN_LOOP_TESTS") != "1" || !fixture_is_debian_qemu ()) return 77;
+        var fixture_loop = new MainLoop ();
+        int fixture_status = 0;
+        exercise_loop_fault.begin (args, (object, result) => {
+            try { exercise_loop_fault.end (result); }
+            catch (Error error) { stderr.printf ("%s\n", error.message); fixture_status = 1; }
+            fixture_loop.quit ();
+        });
+        fixture_loop.run ();
+        return fixture_status;
+    }
     if ("--discovery-race" in args) {
         exercise_discovery_race ();
         return 0;
@@ -929,6 +1199,10 @@ public static int main (string[] args) {
         return growth_status;
     }
     bool nbd = args.length > 1 && args[1] == "--nbd";
+    bool restart_nbd = "--restart-udisks" in args;
+    bool reuse_nbd = "--reuse-device" in args;
+    if (restart_nbd && Environment.get_variable ("MAJORIS_DISKS_RUN_UDISKS_RESTART_TESTS") != "1") return 77;
+    if ((restart_nbd || reuse_nbd) && !fixture_is_debian_qemu ()) return 77;
     bool imaging_enabled = Environment.get_variable ("MAJORIS_DISKS_RUN_IMAGING_TESTS") == "1";
     bool use_xz = "--xz" in args;
     bool partition = "--partition" in args;
@@ -962,8 +1236,12 @@ public static int main (string[] args) {
             catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
             loop.quit ();
         });
-    else if (nbd) exercise_nbd_devices.begin ((object, result) => {
+    else if (nbd) exercise_nbd_devices.begin (restart_nbd, reuse_nbd, (object, result) => {
         try { exercise_nbd_devices.end (result); }
+        catch (IOError.NOT_SUPPORTED error) {
+            stderr.printf ("%s\n", error.message);
+            status = reuse_nbd && error.message == "The fixture did not obtain the same NBD device number." ? 77 : 1;
+        }
         catch (Error error) { stderr.printf ("%s\n", error.message); status = 1; }
         loop.quit ();
     });

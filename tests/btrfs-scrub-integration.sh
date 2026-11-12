@@ -21,8 +21,9 @@ scenario=$2
 if [ "$scenario" = service ] || [ "$scenario" = interruption ]; then
     client=$(realpath "$3")
     udisksctl status >/dev/null || { echo 'SKIP: UDisks is unavailable'; exit 77; }
-    busctl call org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager \
-        org.freedesktop.UDisks2.Manager EnableModule sb btrfs true
+    . "$(dirname "$0")/btrfs-module-fixture.sh"
+    require_btrfs_module_package
+    ensure_btrfs_module
 elif [ "${4:-}" != namespace ]; then
     extra=${3:-}
     if [ "$scenario" = faults ]; then extra=$(realpath "$extra"); fi
@@ -223,8 +224,7 @@ PY
             btrfs scrub status "$mnt" | grep -Eiq 'status: +running'
             "$client" "$fixture" "$uuid" watch | grep -q '^service-running$'
             systemctl restart udisks2
-            busctl call org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager \
-                org.freedesktop.UDisks2.Manager EnableModule sb btrfs true
+            ensure_btrfs_module
             "$client" "$fixture" "$uuid" watch | grep -q '^service-running$'
             owns_mount
             echo 0 >"/sys/fs/btrfs/$uuid/devinfo/1/scrub_speed_max"

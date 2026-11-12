@@ -27,6 +27,9 @@ if [ "$scenario" = service ] || [ "$scenario" = restart ]; then
     # UDisks must see the mount in the guest's mount namespace.
     command -v udisksctl >/dev/null || { echo 'SKIP: missing UDisks'; exit 77; }
     udisksctl status >/dev/null || { echo 'SKIP: UDisks is not running'; exit 77; }
+    . "$(dirname "$0")/btrfs-module-fixture.sh"
+    require_btrfs_module_package
+    ensure_btrfs_module
 elif [ "${4:-}" != namespace ]; then
     losetup -f >/dev/null || { echo 'SKIP: no loop device available'; exit 77; }
     exec unshare --mount --propagation private sh "$0" "$helper" "$scenario" "${3:-}" namespace
@@ -167,7 +170,7 @@ import os
 import sys
 
 data = os.urandom(8192)
-for index in range(8192):
+for index in range(32768):
     with open(os.path.join(sys.argv[1], str(index)), "wb") as stream:
         stream.write(data)
 PY

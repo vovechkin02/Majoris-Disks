@@ -166,7 +166,14 @@ namespace MajorisDisks {
             var create_raid = new SimpleAction ("create-raid", null);
             add_action (create_vg);
             add_action (create_raid);
-            create_vg.activate.connect (() => create_storage_group (false));
+            create_vg.activate.connect (() => {
+                backend.ensure_lvm2_available.begin ((object, result) => {
+                    try {
+                        backend.ensure_lvm2_available.end (result);
+                        create_storage_group (false);
+                    } catch (Error error) { show_check_message ("LVM2 unavailable", operation_error (error)); }
+                });
+            });
             create_raid.activate.connect (() => create_storage_group (true));
             create_vg.set_enabled (backend.can_create_storage_group (false));
             create_raid.set_enabled (backend.can_create_storage_group (true));
@@ -1669,6 +1676,8 @@ namespace MajorisDisks {
                 try {
                     select_drive ("session:" + backend.attach_disk_image.end (result));
                     notifications.add_toast (new Adw.Toast ("Disk image attached"));
+                } catch (RawAttachmentError.UNCERTAIN error) {
+                    show_check_message ("Disk image attachment requires attention", error.message);
                 } catch (Error error) {
                     show_check_message (completed == null ? "Could not attach disk image" :
                         completed + ", but attachment failed", error.message);

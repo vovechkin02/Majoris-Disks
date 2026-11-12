@@ -20,6 +20,13 @@ for tool in losetup mkfs.btrfs btrfs findmnt mountpoint udevadm busctl pkexec sh
 done
 client=$(realpath "$1")
 scenario=$2
+if [ "$scenario" = restart ] && [ "$(systemd-detect-virt --vm)" != qemu ]; then
+    echo 'SKIP: UDisks restart requires a dedicated QEMU guest'
+    exit 77
+fi
+. "$(dirname "$0")/btrfs-module-fixture.sh"
+require_btrfs_module_package
+ensure_btrfs_module
 fault_library=${3:-}
 count=2 size=4G source_data=single source_meta=dup payload=128
 data=raid1 metadata=- action=convert
@@ -51,9 +58,31 @@ worker=
 monitor=
 devices=
 rule="/run/udev/rules.d/99-${fixture##*/}.rules"
+verify_member() {
+    member=$1
+    image=$fixture/disk-$2.img
+    test "$(stat -c '%d:%i' "$image")" = "$(cat "$image.identity")" &&
+        test "$(losetup -j "$image" -ln --output NAME)" = "$member" &&
+        test "$(cat "/sys/class/block/${member##*/}/diskseq")" = "$(cat "$image.diskseq")"
+}
 cleanup() {
     rc=$?
     trap - EXIT
+    if [ "$rc" -ne 0 ]; then
+        echo "Btrfs fixture $uuid failed under UDisks $(btrfs_owner)" >&2
+        for device in $devices; do
+            object="/org/freedesktop/UDisks2/block_devices/${device##*/}"
+            echo "Member $device at $object" >&2
+            for property in IdUUID IdType HintSystem ReadOnly CryptoBackingDevice MDRaid MDRaidMember; do
+                printf '%s ' "$property" >&2
+                busctl --system get-property org.freedesktop.UDisks2 "$object" \
+                    org.freedesktop.UDisks2.Block "$property" >&2 || :
+            done
+            busctl --system get-property org.freedesktop.UDisks2 "$object" \
+                org.freedesktop.UDisks2.PhysicalVolume VolumeGroup >&2 || :
+            ls -l "/sys/class/block/${device##*/}/holders" >&2 || :
+        done
+    fi
     if [ -n "$monitor" ]; then
         kill "$monitor" 2>/dev/null || true
         wait "$monitor" 2>/dev/null || true
@@ -71,14 +100,15 @@ cleanup() {
     i=0
     for device in $devices; do
         i=$((i + 1))
-        if ! losetup -j "$fixture/disk-$i.img" | grep -Fq "$device:" || ! losetup -d "$device"; then
+        if ! verify_member "$device" "$i" || ! losetup -d "$device"; then
             echo "Could not safely detach $device. Retaining $fixture." >&2
             exit 1
         fi
     done
     rm -f "$rule"
     udevadm control --reload-rules
-    rm -f "$fixture"/disk-*.img "$fixture/result" "$fixture/diagnostic" "$fixture/monitor"
+    rm -f "$fixture"/disk-*.img "$fixture"/disk-*.img.identity "$fixture"/disk-*.img.diskseq \
+        "$fixture/result" "$fixture/diagnostic" "$fixture/monitor"
     rmdir "$mountpoint" "$fixture"
     exit "$rc"
 }
@@ -92,9 +122,11 @@ while [ "$i" -lt "$count" ]; do
     i=$((i + 1))
     image="$fixture/disk-$i.img"
     truncate -s "$size" "$image"
+    stat -c '%d:%i' "$image" > "$image.identity"
     device=$(losetup --find --show --nooverlap "$image")
     devices="$devices $device"
-    losetup -j "$image" | grep -Fq "$device:"
+    cat "/sys/class/block/${device##*/}/diskseq" > "$image.diskseq"
+    verify_member "$device" "$i"
 done
 set -- $devices
 mkfs.btrfs -f -U "$uuid" -d "$source_data" -m "$source_meta" "$@"
@@ -197,14 +229,32 @@ case "$scenario" in
         done
         ;;
     restart)
+        previous_daemon=$(btrfs_owner)
         if service restart >"$fixture/diagnostic" 2>&1; then
             echo 'A reviewed plan was accepted after a UDisks restart' >&2
             exit 1
         fi
         cat "$fixture/diagnostic"
         grep -Eq 'review expired|UDisks|volume is no longer available|Operation was cancelled' "$fixture/diagnostic"
-        busctl --system call org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager \
-            org.freedesktop.UDisks2.Manager EnableModule sb btrfs true
+        ensure_btrfs_module
+        test "$previous_daemon" != "$btrfs_daemon"
+        member_index=0
+        for device in $devices; do
+            member_index=$((member_index + 1))
+            verify_member "$device" "$member_index"
+            object="/org/freedesktop/UDisks2/block_devices/${device##*/}"
+            filesystem=
+            for discovery_attempt in $(seq 1 50); do
+                filesystem=$(busctl --system --timeout=5s get-property "$btrfs_daemon" "$object" \
+                    org.freedesktop.UDisks2.Filesystem.BTRFS uuid 2>/dev/null) || filesystem=
+                if [ "$filesystem" = "s \"$uuid\"" ]; then break; fi
+                sleep 0.2
+            done
+            test "$filesystem" = "s \"$uuid\""
+            echo "UDisks $btrfs_daemon rediscovered $device in $uuid"
+        done
+        test "$(btrfs_owner)" = "$btrfs_daemon"
+        service review
         verify_profile Data single
         ;;
     missing)

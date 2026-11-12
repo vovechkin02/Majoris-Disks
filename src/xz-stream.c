@@ -8,18 +8,30 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-gboolean
-majoris_image_match_loop (int block, const char *backing, GError **error)
+static gboolean
+match_loop_identity (int block, const struct stat *info, GError **error)
 {
     struct loop_info64 loop;
-    struct stat info;
-    if (ioctl (block, LOOP_GET_STATUS64, &loop) == 0 && lstat (backing, &info) == 0 &&
-        S_ISREG (info.st_mode) && loop.lo_device == (guint64) info.st_dev &&
-        loop.lo_inode == (guint64) info.st_ino)
+    if (info && S_ISREG (info->st_mode) && ioctl (block, LOOP_GET_STATUS64, &loop) == 0 &&
+        loop.lo_device == (guint64) info->st_dev && loop.lo_inode == (guint64) info->st_ino)
         return TRUE;
     g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                          "The kernel loop mapping does not match the backing file identity.");
     return FALSE;
+}
+
+gboolean
+majoris_image_match_loop (int block, const char *backing, GError **error)
+{
+    struct stat info;
+    return match_loop_identity (block, lstat (backing, &info) == 0 ? &info : NULL, error);
+}
+
+gboolean
+majoris_image_match_loop_source (int block, int source, GError **error)
+{
+    struct stat info;
+    return match_loop_identity (block, fstat (source, &info) == 0 ? &info : NULL, error);
 }
 
 static gboolean

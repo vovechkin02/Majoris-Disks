@@ -137,6 +137,13 @@ allocate_device (guint *index, GError **error)
         int fd = claim_device (candidate);
         if (fd < 0)
             continue;
+#ifdef MAJORIS_TEST_NBD_IOCTL
+        guint64 readonly;
+        if (!read_number (candidate, "ro", &readonly) || readonly != 0) {
+            close (fd);
+            continue;
+        }
+#endif
         if (!has_client (candidate) && read_number (candidate, "size", &size) && size == 0) {
             *index = (guint) candidate;
             return fd;
@@ -203,7 +210,11 @@ disconnect_client (guint index, int *block, const char *identity, GError **error
         return FALSE;
     }
     g_autofree char *path = g_strdup_printf ("/dev/nbd%u", index);
-    const char *argv[] = { MAJORIS_NBD_CLIENT, "-d", path, NULL };
+    const char *argv[] = { MAJORIS_NBD_CLIENT,
+#ifdef MAJORIS_TEST_NBD_IOCTL
+        "-nonetlink",
+#endif
+        "-d", path, NULL };
     GPid pid __attribute__((cleanup(reap_client))) = 0;
     g_autoptr(GError) client_error = NULL;
     run_client (argv, -1, &pid, &client_error);
@@ -343,7 +354,11 @@ connect_client (char **argv)
         !await_launch (4))
         return 1;
     g_autofree char *path = g_strdup_printf ("/dev/nbd%u", (guint) index);
-    const char *client[] = { MAJORIS_NBD_CLIENT, "-unix", "/proc/self/fd/3", path, "-name", argv[3],
+    const char *client[] = { MAJORIS_NBD_CLIENT,
+#ifdef MAJORIS_TEST_NBD_IOCTL
+        "-nonetlink",
+#endif
+        "-unix", "/proc/self/fd/3", path, "-name", argv[3],
         "-nofork", "-timeout", "30", g_str_equal (argv[4], "1") ? "-readonly" : NULL, NULL };
     execv (MAJORIS_NBD_CLIENT, (char *const *) client);
     return 1;
@@ -443,16 +458,46 @@ attach_device (guint uid, const char *token, guint64 capacity, gboolean read_onl
         }
     }
 
-    guint64 sectors, readonly;
     gboolean recorded = write_record (*index, uid, token, identity, "connected-unverified", *client, error);
-    // Debian's netlink client returns after configuring the kernel. Check the actual block path as well.
-    block = claim_device (*index);
-    g_autofree char *claimed_identity = block >= 0 ? majoris_nbd_identity (*index, NULL) : NULL;
-    char sector[512];
-    gboolean valid = readiness_error == NULL && recorded && g_strcmp0 (claimed_identity, identity) == 0 &&
-                     read_number (*index, "size", &sectors) && sectors == capacity / 512 &&
-                     read_number (*index, "ro", &readonly) && readonly == (guint64) read_only &&
-                     pread (block, sector, sizeof sector, 0) == sizeof sector;
+    gboolean valid = FALSE;
+    guint64 sectors = 0, readonly = G_MAXUINT64;
+    ssize_t received = -1;
+    int read_error = 0;
+    // Observe the single accepted connection until its block properties are
+    // published. A netlink reply alone does not establish block readiness.
+    gint64 deadline = g_get_monotonic_time () + 2 * G_TIME_SPAN_SECOND;
+    do {
+        g_autofree char *current = majoris_nbd_identity (*index, NULL);
+        if (g_strcmp0 (current, identity) != 0)
+            break;
+        if (block < 0)
+            block = claim_device (*index);
+        g_autofree char *claimed = block >= 0 ? majoris_nbd_identity (*index, NULL) : NULL;
+        if (block >= 0 && g_strcmp0 (claimed, identity) != 0) {
+            close_fd (&block);
+            block = -1;
+            break;
+        }
+        if (readiness_error == NULL && recorded && block >= 0 &&
+            read_number (*index, "size", &sectors) && sectors == capacity / 512 &&
+            read_number (*index, "ro", &readonly) && readonly == (guint64) read_only) {
+            char sector[512];
+            do {
+                received = pread (block, sector, sizeof sector, 0);
+            } while (received < 0 && errno == EINTR);
+            read_error = received < 0 ? errno : 0;
+            g_autofree char *after = majoris_nbd_identity (*index, NULL);
+            if (g_strcmp0 (after, identity) != 0)
+                break;
+            if (received == sizeof sector) {
+                valid = TRUE;
+                break;
+            }
+        }
+        if (readiness_error != NULL || !recorded)
+            break;
+        g_usleep (20000);
+    } while (g_get_monotonic_time () < deadline);
     if (valid && write_record (*index, uid, token, identity, "attached-verified", *client, error))
         return TRUE;
 
@@ -465,7 +510,10 @@ attach_device (guint uid, const char *token, guint64 capacity, gboolean read_onl
     }
     g_unlink (journal);
     if (error != NULL && *error == NULL)
-        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "The attached NBD capacity, access mode, or sector read could not be verified.");
+        g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+            "The attached NBD mapping could not be verified (sectors %" G_GUINT64_FORMAT
+            "/%" G_GUINT64_FORMAT ", read-only %" G_GUINT64_FORMAT "/%d, read %zd, errno %d).",
+            sectors, capacity / 512, readonly, read_only, received, read_error);
     return FALSE;
 }
 

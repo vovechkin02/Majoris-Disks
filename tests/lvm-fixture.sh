@@ -2,21 +2,72 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Sourced only by the disposable integration tests.
 set -eu
+export LC_ALL=C
 
 skip() { echo "SKIP: $*"; exit 77; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+lvm_owner() {
+    busctl --system call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus GetNameOwner s org.freedesktop.UDisks2 |
+        sed -n 's/^s "\(:[^"]*\)"$/\1/p'
+}
+
+lvm_module_active() {
+    busctl --system --timeout=5s introspect "$lvm_daemon" /org/freedesktop/UDisks2/Manager \
+        org.freedesktop.UDisks2.Manager.LVM2 2>/dev/null |
+        awk '$1 == ".VolumeGroupCreate" && $2 == "method" { found = 1 } END { exit !found }'
+}
+
+ensure_lvm_module() {
+    lvm_daemon=$(lvm_owner) && [ -n "$lvm_daemon" ] || fail 'UDisks daemon unavailable'
+    manager_path=/org/freedesktop/UDisks2/Manager
+    if lvm_module_active; then
+        echo "UDisks $lvm_daemon: LVM2 already active"
+        return
+    fi
+    echo "UDisks $lvm_daemon: activating installed LVM2 module"
+    busctl --system --timeout=30s call "$lvm_daemon" "$manager_path" \
+        org.freedesktop.UDisks2.Manager EnableModule sb lvm2 true ||
+        fail "LVM2 module activation failed on $lvm_daemon"
+    for attempt in $(seq 1 40); do
+        [ "$(lvm_owner)" = "$lvm_daemon" ] || fail 'UDisks owner changed during LVM2 activation'
+        if lvm_module_active; then
+            echo "UDisks $lvm_daemon: Manager.LVM2 published"
+            return
+        fi
+        sleep 0.25
+    done
+    fail "LVM2 activation returned but Manager.LVM2 was not published by $lvm_daemon"
+}
+
+restart_lvm_fixture_daemon() {
+    previous_daemon=$(lvm_owner)
+    [ -n "$previous_daemon" ] || fail 'UDisks daemon unavailable before restart'
+    systemctl restart udisks2
+    for attempt in $(seq 1 40); do
+        restarted_daemon=$(lvm_owner 2>/dev/null)
+        if [ -n "$restarted_daemon" ] && [ "$restarted_daemon" != "$previous_daemon" ]; then
+            echo "UDisks owner changed from $previous_daemon to $restarted_daemon"
+            return
+        fi
+        sleep 0.25
+    done
+    fail 'UDisks did not publish a new owner after restart'
+}
+
 require_lvm_tools() {
-    for tool in losetup lvm pvcreate pvscan pvs vgcreate vgs vgchange vgremove \
-        lvcreate lvchange lvs lvremove udevadm busctl dmsetup cmp dd truncate mktemp stat sha256sum
+    for tool in losetup lvm pvcreate pvremove pvscan pvs vgcreate vgs vgchange vgremove \
+        lvcreate lvchange lvs lvremove udevadm busctl dmsetup python3 cmp dd truncate mktemp stat sha256sum
     do
         command -v "$tool" >/dev/null 2>&1 || skip "$tool is unavailable"
     done
-    busctl --system introspect org.freedesktop.UDisks2 \
-        /org/freedesktop/UDisks2/Manager org.freedesktop.UDisks2.Manager.LVM2 \
-        >/dev/null 2>&1 || skip 'The UDisks LVM2 module is unavailable'
     dmsetup version >/dev/null 2>&1 || skip 'Device mapper is unavailable'
     losetup --find >/dev/null 2>&1 || skip 'No loop devices are available'
+    [ -n "$(lvm_owner)" ] || skip 'UDisks daemon is unavailable'
+    [ "$(dpkg-query -W -f='${db:Status-Status}' udisks2-lvm2 2>/dev/null)" = installed ] ||
+        skip 'The Debian udisks2-lvm2 package is missing'
+    ensure_lvm_module
 }
 
 start_lvm_fixture() {
@@ -26,6 +77,7 @@ start_lvm_fixture() {
     [ -r /etc/os-release ] || skip 'Debian 13 is required'
     . /etc/os-release
     [ "${ID:-}" = debian ] && [ "${VERSION_ID:-}" = 13 ] || skip 'Debian 13 is required'
+    [ "$(systemd-detect-virt --vm)" = qemu ] || skip 'A dedicated QEMU guest is required'
     require_lvm_tools
     test -x "${1:-}" || fail "Fixture driver is unavailable: ${1:-missing argument}"
 }
@@ -93,6 +145,11 @@ cleanup_lvm_fixture() {
     set +e
     if [ "$status" -ne 0 ]; then
         echo "FAIL: ${scenario:-fixture setup} (status $status)" >&2
+        echo 'UDisks state at fixture exit:'
+        lvm_owner
+        busctl --system --timeout=5s introspect org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager || :
+        busctl --system --timeout=5s tree org.freedesktop.UDisks2 || :
+        dmsetup ls --tree || :
         report_lvm_fixture
         [ "$status" != 77 ] || status=1
     fi
@@ -162,8 +219,15 @@ clean_lvm_fixture() {
             test -z "$(printf '%s' "$owner" | tr -d '[:space:]')" || return 1
             if [ -f "$fixture/pv-$index.uuid" ]; then
                 check_fixture_pv "$index" "$device" || return 1
+                # Clear the verified fixture's PV label before releasing the loop
+                # number. UDisks can otherwise retain the previous PV interface
+                # when the same block path is immediately reused by another test.
+                pvremove --yes "$device" || return 1
+                udevadm trigger --action=change --settle "$device" || return 1
             fi
             losetup -d "$device" || return 1
+            udevadm settle || return 1
+            retire_stale_lvm_loop "$device" || return 1
         fi
         attached=$(loop_for_image "$index") || return 1
         test -z "$attached" || return 1
@@ -173,6 +237,41 @@ clean_lvm_fixture() {
     done
     rm -f -- "$fixture/expected" "$fixture/readback"
     rmdir -- "$fixture"
+}
+
+retire_stale_lvm_loop() {
+    loop_name=${1##*/}
+    case "$loop_name" in loop[0-9]*) ;; *) return 1 ;; esac
+    object=/org/freedesktop/UDisks2/block_devices/$loop_name
+    daemon=$(lvm_owner) || return 1
+    test -n "$daemon" || return 1
+    group=$(busctl --system --timeout=5s get-property "$daemon" "$object" \
+        org.freedesktop.UDisks2.PhysicalVolume VolumeGroup 2>/dev/null) || return 0
+    case "$group" in
+        'o "/"') return 0 ;;
+        "o \"/org/freedesktop/UDisks2/lvm/$vg\""|"o \"/org/freedesktop/UDisks2/lvm/${vg}_renamed\"") ;;
+        *) echo "Unexpected PV association on $loop_name: $group" >&2; return 1 ;;
+    esac
+    echo "Retiring unbound fixture $loop_name with stale UDisks PV association $group"
+    # LOOP_CTL_REMOVE refuses a bound or open device. This removes the stale
+    # UDisks object for this fixture index before another suite reuses it.
+    python3 - "$loop_name" <<'PY' || return 1
+import fcntl
+import pathlib
+import re
+import sys
+
+name = sys.argv[1]
+if not re.fullmatch(r"loop[0-9]+", name):
+    raise SystemExit("Invalid fixture loop name")
+device = pathlib.Path("/sys/class/block") / name
+if (device / "size").read_text().strip() != "0" or (device / "loop").exists() or any((device / "holders").iterdir()):
+    raise SystemExit("Fixture loop is still bound or held")
+with open("/dev/loop-control", "rb+", buffering=0) as control:
+    fcntl.ioctl(control, 0x4C81, int(name[4:]))  # LOOP_CTL_REMOVE
+PY
+    udevadm settle || return 1
+    test ! -e "/sys/class/block/$loop_name"
 }
 make_fixture() {
     set --
@@ -211,26 +310,68 @@ wait_lvm_activation() {
     expected_active=$1
     shift
     udevadm settle
+    ensure_lvm_module
     group_path=/org/freedesktop/UDisks2/lvm/${current_vg:-$vg}
     for volume in "$@"; do
+        lv_device=/dev/${current_vg:-$vg}/$volume
+        lv_uuid=$(lvs --noheadings -o lv_uuid "${current_vg:-$vg}/$volume" | tr -d '[:space:]')
+        [ -n "$lv_uuid" ] || fail "LVM metadata has no logical volume $volume"
         ready=0
         for attempt in $(seq 1 40); do
-            busctl --system call org.freedesktop.UDisks2 "$group_path" \
+            [ "$(lvm_owner)" = "$lvm_daemon" ] || fail 'UDisks owner changed during LV discovery'
+            busctl --system --timeout=5s call "$lvm_daemon" "$group_path" \
                 org.freedesktop.UDisks2.VolumeGroup Poll >/dev/null 2>&1 || :
-            active=$(busctl --system get-property org.freedesktop.UDisks2 "$group_path/$volume" \
+            group_id=$(busctl --system get-property "$lvm_daemon" "$group_path" \
+                org.freedesktop.UDisks2.VolumeGroup UUID 2>/dev/null) || group_id=
+            volume_id=$(busctl --system get-property "$lvm_daemon" "$group_path/$volume" \
+                org.freedesktop.UDisks2.LogicalVolume UUID 2>/dev/null) || volume_id=
+            [ -z "$group_id" ] || [ "$group_id" = "s \"$uuid\"" ] || fail "Fixture VG identity changed: $group_id"
+            [ -z "$volume_id" ] || [ "$volume_id" = "s \"$lv_uuid\"" ] || fail "Fixture LV identity changed: $volume_id"
+            if [ -z "$group_id" ] || [ -z "$volume_id" ]; then sleep 0.5; continue; fi
+            active=$(busctl --system get-property "$lvm_daemon" "$group_path/$volume" \
                 org.freedesktop.UDisks2.LogicalVolume Active 2>/dev/null) || active=
-            mapping=$(busctl --system get-property org.freedesktop.UDisks2 "$group_path/$volume" \
+            mapping=$(busctl --system get-property "$lvm_daemon" "$group_path/$volume" \
                 org.freedesktop.UDisks2.LogicalVolume BlockDevice 2>/dev/null) || mapping=
             if { [ "$expected_active" = false ] && [ "$mapping" = 'o "/"' ]; } ||
                 { [ "$expected_active" = true ] && [ -n "$mapping" ] && [ "$mapping" != 'o "/"' ]; }; then
                 if [ "$active" != "b $expected_active" ]; then sleep 0.5; continue; fi
+                if [ "$expected_active" = true ]; then
+                    block_path=$(printf '%s\n' "$mapping" | sed -n 's/^o "\(\/org\/freedesktop\/UDisks2\/block_devices\/dm_2d[0-9]*\)"$/\1/p')
+                    [ -n "$block_path" ] || fail "Unexpected device-mapper object: $mapping"
+                    number=$(busctl --system get-property "$lvm_daemon" "$block_path" \
+                        org.freedesktop.UDisks2.Block DeviceNumber 2>/dev/null) || number=
+                    backlink=$(busctl --system get-property "$lvm_daemon" "$block_path" \
+                        org.freedesktop.UDisks2.Block.LVM2 LogicalVolume 2>/dev/null) || backlink=
+                    expected_number=$(stat -Lc '%r' "$lv_device" 2>/dev/null) || expected_number=
+                    if [ -z "$expected_number" ] || [ "$number" != "t $expected_number" ] ||
+                        [ "$backlink" != "o \"$group_path/$volume\"" ]; then sleep 0.5; continue; fi
+                fi
+                [ "$(lvm_owner)" = "$lvm_daemon" ] || fail 'UDisks owner changed after LV discovery'
                 ready=1
                 break
             fi
             sleep 0.5
         done
-        test "$ready" = 1 || fail "UDisks did not confirm $volume Active=$expected_active ($active, $mapping)"
+        test "$ready" = 1 || fail "UDisks $lvm_daemon discovery incomplete for $volume ($lv_uuid), expected Active=$expected_active"
+        echo "UDisks $lvm_daemon: $group_path/$volume $lv_uuid $active $mapping"
     done
+}
+
+wait_lvm_absent() {
+    absent_path="/org/freedesktop/UDisks2/lvm/${current_vg:-$vg}/$1"
+    udevadm settle
+    for attempt in $(seq 1 40); do
+        [ "$(lvm_owner)" = "$lvm_daemon" ] || fail 'UDisks owner changed while observing LV removal'
+        busctl --system --timeout=5s call "$lvm_daemon" "${absent_path%/*}" \
+            org.freedesktop.UDisks2.VolumeGroup Poll >/dev/null 2>&1 || :
+        if ! busctl --system --timeout=5s get-property "$lvm_daemon" "$absent_path" \
+            org.freedesktop.UDisks2.LogicalVolume UUID >/dev/null 2>&1; then
+            [ "$(lvm_owner)" = "$lvm_daemon" ] || fail 'UDisks owner changed while observing LV removal'
+            return
+        fi
+        sleep 0.25
+    done
+    fail "The removed LV remains visible at $absent_path"
 }
 
 disconnect_fixture_pv() {

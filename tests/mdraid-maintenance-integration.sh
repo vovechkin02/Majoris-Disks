@@ -23,7 +23,7 @@ mdadm --assemble --run "/dev/md/$name" "$left" "$right"
 md=$(readlink -f "/dev/md/$name")
 kernel="/sys/class/block/${md##*/}/md"
 [ "$(mdraid_uuid "$md")" = "$array_uuid" ]
-mdadm --readwrite "$md"
+mdraid_require_writable
 printf '1024\n' > "$kernel/sync_speed_min"
 printf '8192\n' > "$kernel/sync_speed_max"
 mdraid_call check - 0

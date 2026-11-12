@@ -24,6 +24,22 @@ private bool has_unresolved_segment (Variant value) {
 }
 
 private async void run_lvm_fixture (string[] args) throws Error {
+    if (args.length == 2 && args[1] == "--disabled-module") {
+        if (Environment.get_variable ("MAJORIS_DISKS_RUN_UDISKS_RESTART_TESTS") != "1" || Posix.getuid () != 0)
+            throw new IOError.PERMISSION_DENIED ("The disabled module probe requires the isolated restart fixture.");
+        var backend = new UDisksService ();
+        yield backend.refresh ();
+        try {
+            yield backend.ensure_lvm2_available ();
+        } catch (IOError.FAILED error) {
+            if (!error.message.contains ("optional UDisks lvm2 module could not be activated") ||
+                !backend.available () || backend.snapshot.blocks.size () == 0)
+                throw error;
+            stdout.printf ("LVM2 capability unavailable, core storage available: %s\n", error.message);
+            return;
+        }
+        throw new IOError.FAILED ("The deliberately disabled LVM2 module was reported as available.");
+    }
     if (args.length < 5 || Environment.get_variable ("MAJORIS_DISKS_RUN_LVM_TESTS") != "1" ||
         Posix.getuid () != 0 || !Path.is_absolute (args[1]) || !args[2].has_prefix ("majoris_lvm_") ||
         args[3] == "")
@@ -34,6 +50,10 @@ private async void run_lvm_fixture (string[] args) throws Error {
         throw new IOError.PERMISSION_DENIED ("The disposable fixture directory must be private and owned by root.");
     var service = new UDisksService ();
     yield service.refresh ();
+    if (args[4] == "enable-module") {
+        yield service.ensure_lvm2_available ();
+        return;
+    }
     StorageVolumeGroup? group = null;
     for (int i = 0; i < 100 && group == null; i++) {
         foreach (var item in service.snapshot.advanced.get_values ()) {
@@ -93,6 +113,51 @@ private async void exercise_lvm_fixture (string[] args, UDisksService service, S
     try {
         if (action == "rename" && args.length == 6 && args[5].has_prefix ("majoris_lvm_")) {
             yield service.rename_volume_group (anchor, identity, group.uuid, args[5]);
+        } else if (action == "observe-restart" && args.length == 7) {
+            if (Environment.get_variable ("MAJORIS_DISKS_RUN_UDISKS_RESTART_TESTS") != "1")
+                throw new IOError.PERMISSION_DENIED ("The restart observer requires explicit opt-in.");
+            var guest = new Subprocess.newv ({ "systemd-detect-virt", "--vm" }, SubprocessFlags.STDOUT_PIPE);
+            string virtualization;
+            yield guest.communicate_utf8_async (null, null, out virtualization, null);
+            if (!guest.get_successful () || virtualization.strip () != "qemu")
+                throw new IOError.PERMISSION_DENIED ("The restart observer requires a disposable QEMU guest.");
+            var original = volumes.lookup (args[5]);
+            if (original == null || original.uuid != args[6] || !original.active)
+                throw new IOError.NOT_FOUND ("The reviewed fixture LV was not active.");
+            string reviewed_identity = service.modification_identity (anchor);
+            var restart = new Subprocess.newv ({ "systemctl", "restart", "udisks2" }, SubprocessFlags.NONE);
+            yield restart.wait_check_async ();
+            bool ready = false;
+            for (int attempt = 0; attempt < 100; attempt++) {
+                yield service.refresh ();
+                var current = service.snapshot.advanced.lookup (original.path) as StorageLogicalVolume;
+                if (current != null && current != original && current.uuid == original.uuid && current.active &&
+                    (service.snapshot.advanced.lookup (current.group_path) as StorageVolumeGroup)?.uuid == group.uuid) {
+                    ready = true;
+                    break;
+                }
+                Timeout.add (200, exercise_lvm_fixture.callback);
+                yield;
+            }
+            if (!ready) throw new IOError.TIMED_OUT ("The new daemon did not rediscover the reviewed LV UUID.");
+            try {
+                yield service.change_logical_volume_state (anchor, original.path, original.uuid, reviewed_identity, "Deactivate");
+            } catch (IOError.NOT_FOUND error) {
+                if (DBusError.get_remote_error (error) != null) throw error;
+                stdout.printf ("PASS: same LV UUID rediscovered and pre-restart review rejected\n");
+                return;
+            }
+            throw new IOError.FAILED ("A pre-restart LVM review was accepted.");
+        } else if (action == "stale-lv" && args.length == 6) {
+            try {
+                yield service.change_logical_volume_state (anchor, group.path + "/substitute", args[5],
+                    service.modification_identity (anchor), "Activate");
+            } catch (IOError.NOT_FOUND error) {
+                if (DBusError.get_remote_error (error) != null) throw error;
+                stdout.printf ("PASS: stale LV UUID %s was rejected before dispatch\n", args[5]);
+                return;
+            }
+            throw new IOError.FAILED ("A stale logical-volume review was accepted.");
         } else if (action == "layout" && args.length >= 9) {
             uint64 bytes;
             if (!uint64.try_parse (args[7], out bytes)) throw new IOError.INVALID_ARGUMENT ("Invalid fixture size.");

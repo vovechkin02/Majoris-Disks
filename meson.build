@@ -182,6 +182,14 @@ foreach scenario : ['recovery', 'cache', 'layout']
     args: [meson.current_source_dir() / ('tests/lvm-' + scenario + '-integration.sh'), lvm_device_test],
     timeout: 1200, is_parallel: false)
 endforeach
+foreach stage : ['before-vg', 'after-vg', 'after-lv', 'before-review']
+  test('lvm-recovery-restart-' + stage, sh,
+    args: [meson.current_source_dir() / 'tests/lvm-recovery-integration.sh', lvm_device_test, stage],
+    timeout: 360, is_parallel: false)
+endforeach
+test('lvm-disabled-module', sh,
+  args: [meson.current_source_dir() / 'tests/lvm-disabled-module.sh', lvm_device_test],
+  timeout: 90, is_parallel: false)
 test('filesystem-capacity-integration', sh,
   args: [meson.current_source_dir() / 'tests/filesystem-capacity-integration.sh', layout_test])
 test('filesystem-capacity-udisks', sh,
@@ -200,6 +208,13 @@ endif
 imaging_test = executable('image-device-test', 'tests/image-device-test.vala', storage_model_sources,
   'src/udisks-service.vala', include_directories: xz_include,
   dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+loop_dbus_faults = shared_module('loop-dbus-faults', 'tests/loop-dbus-faults.c',
+  dependencies: [dependency('gio-unix-2.0'), meson.get_compiler('c').find_library('dl')])
+foreach fault : ['setup', 'delete', 'restart', 'reuse', 'substitute']
+  test('disposable-loop-' + fault + '-reconciliation', sh,
+    args: [meson.current_source_dir() / 'tests/loop-fault-integration.sh', imaging_test, loop_dbus_faults, fault],
+    timeout: 180, is_parallel: false)
+endforeach
 test('disposable-imaging-integration', imaging_test, timeout: 180)
 test('disposable-xz-integration', imaging_test, args: ['--xz'], timeout: 180)
 test('image-publication-directory-sync', imaging_test, args: ['--publication'])
@@ -219,8 +234,17 @@ test('disposable-partition-image-integration', imaging_test, args: ['--partition
 test('disposable-partition-xz-integration', imaging_test, args: ['--partition', '--xz'], timeout: 180)
 test('disposable-mbr-image-restore', imaging_test, args: ['--partition', '--mbr'], timeout: 180)
 test('disposable-nbd-integration', imaging_test, args: ['--nbd'], timeout: 300)
+test('disposable-nbd-udisks-restart', imaging_test, args: ['--nbd', '--restart-udisks'],
+  timeout: 300, is_parallel: false)
+test('disposable-nbd-device-reuse', imaging_test, args: ['--nbd', '--reuse-device'],
+  timeout: 300, is_parallel: false)
 test('disposable-nbd-exporter-termination', imaging_test, args: ['--nbd', '--kill-exporter'], timeout: 180)
 test('disposable-nbd-client-termination', imaging_test, args: ['--nbd', '--kill-client'], timeout: 180)
+nbd_ioctl_helper = executable('nbd-ioctl-test-helper', ['src/nbd-helper.c', 'src/nbd-identity.c'],
+  c_args: ['-DMAJORIS_TEST_NBD_IOCTL'], dependencies: dependency('gio-2.0'))
+test('disposable-nbd-ioctl-client-termination', sh,
+  args: [meson.current_source_dir() / 'tests/nbd-ioctl-integration.sh', nbd_ioctl_helper, imaging_test],
+  timeout: 240, is_parallel: false)
 test('disposable-nbd-restore-target-loss', imaging_test, args: ['--nbd', '--lose-target'], timeout: 180)
 test('virtual-image-growth', imaging_test, args: ['--grow'], timeout: 120)
 test('virtual-image-conversion', imaging_test, args: ['--convert'], timeout: 180)

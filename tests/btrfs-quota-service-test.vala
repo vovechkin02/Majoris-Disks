@@ -43,7 +43,7 @@ private async void exercise (string[] args) throws Error {
                 if (status.inconsistent) throw new IOError.FAILED ("Rescan ended with inconsistent accounting.");
                 return;
             }
-            Timeout.add (100, exercise.callback);
+            Timeout.add (25, exercise.callback);
             yield;
             status = yield backend.query_btrfs_quota (block, identity);
         }
@@ -88,7 +88,9 @@ private async void exercise (string[] args) throws Error {
     foreach (var subvolume in list.entries)
         if (subvolume.id == snapshot_id && subvolume.snapshot) snapshot = subvolume;
     assert (snapshot != null && UDisksService.btrfs_subvolume_access (block, snapshot) == "Read-only subvolume");
-    assert (list.default_known && list.default_id == 5);
+    if (!list.default_known)
+        throw new IOError.FAILED ("The default Btrfs subvolume could not be read: " + list.default_unavailable);
+    assert (list.default_id == 5);
     yield backend.set_btrfs_default (block, (uint) id, 5, identity);
     yield backend.set_btrfs_default (block, 5, (uint) id, identity);
     yield backend.change_btrfs_subvolume (block, snapshot.path, identity, snapshot, false, true);

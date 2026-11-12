@@ -17,7 +17,7 @@ if [ "${3:-}" = readd ]; then
     kernel="/sys/class/block/${md##*/}/md"
     [ "$(mdraid_uuid "$md")" = "$array_uuid" ]
     # Switch this explicitly owned fixture out of mdadm's auto-read-only state.
-    mdadm --readwrite "$md"
+    mdraid_require_writable
     for delay in 1 2 3 4 5; do
         [ "$(cat "$kernel/array_state")" = clean ] && break
         sleep 1

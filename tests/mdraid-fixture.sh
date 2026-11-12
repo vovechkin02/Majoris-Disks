@@ -19,6 +19,22 @@ mdraid_uuid() {
     mdadm --detail --export "$1" | sed -n 's/^MD_UUID=//p'
 }
 
+mdraid_require_writable() {
+    [ "$(mdraid_uuid "$md")" = "$array_uuid" ]
+    udevadm settle
+    state=$(cat "$kernel/array_state")
+    printf 'Fixture array %s state before writes: %s\n' "$md" "$state"
+    case "$state" in
+        readonly|read-auto) mdadm --readwrite "$md" ;;
+    esac
+    [ "$(mdraid_uuid "$md")" = "$array_uuid" ]
+    [ "$(cat "/sys/class/block/${md##*/}/ro")" = 0 ]
+    case "$(cat "$kernel/array_state")" in
+        active|active-idle|clean|write-pending) ;;
+        *) echo 'The fixture array did not become writable' >&2; return 1 ;;
+    esac
+}
+
 mdraid_owned_loop() {
     [ "$(losetup -n -O BACK-FILE "$1")" = "$2" ] || return 1
     [ -f "$2" ] && [ ! -L "$2" ] && [ "$(realpath "$2")" = "$2" ] || return 1

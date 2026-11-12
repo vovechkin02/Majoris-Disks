@@ -525,3 +525,75 @@ sudo env MAJORIS_DISKS_RUN_BTRFS_PROFILE_TESTS=1 \
   inode, UDisks owner and object paths, attachment token, mount state,
   outcome and readback before releasing owned resources. Keep resources
   and evidence when their ownership or terminal state is uncertain.
+
+## UDisks restart and attachment acceptance
+
+Use a fresh disposable Debian 13 QEMU snapshot with kernel 6.12, UDisks
+2.10.x, `udisks2-lvm2`, `udisks2-btrfs`, `libbtrfsutil1t64` for the Btrfs
+default-subvolume fallback, the storage command-line tools,
+and installed Majoris D-Bus and Polkit helpers. Confirm the guest hostname,
+SSH user and `systemd-detect-virt --vm` before using sudo. Use the guest's
+usual build user for compilation and the default test suite.
+Use the hostname `majoris-mdraid-test` for the full matrix because the
+existing mdraid fixtures check that guest identity before touching storage.
+The unprivileged authorization probes need permission to traverse the
+guest build directory and execute the fixture binaries.
+
+```sh
+meson setup build --prefix=/usr
+meson compile -C build
+meson test -C build --print-errorlogs --num-processes 1
+sudo meson install -C build --no-rebuild
+sudo systemctl reload dbus
+```
+
+Prepare loop, device mapper, Btrfs and a partition-capable NBD module in
+the clean guest. The root-run NBD fixtures require the root user's private
+runtime directory at `/run/user/0`. Run the acceptance script from the
+source root in the guest. It logs each serial group under
+`build/meson-logs/` and returns nonzero if a group fails.
+
+```sh
+sudo env XDG_RUNTIME_DIR=/run/user/0 MAJORIS_DISKS_RUN_UDISKS_RESTART_TESTS=1 \
+  sh tests/run-stability-regression.sh build
+```
+
+The LVM restart targets bracket VG creation, LV creation and review.
+Verify the distinct D-Bus owners, module activation and the keeper VG and
+LV UUIDs. For an active LV, compare the UDisks block device number and
+backlink to the kernel mapper and verify the recorded payload checksum.
+The disabled-module test temporarily starts the guest daemon with
+`--disable-modules` and restores its original service definition.
+The stale LV case tries activation with the old UUID when the object is
+missing and after a same-name replacement appears.
+
+The loop tests count actual `LoopSetup` and `Loop.Delete` dispatches and
+record the genuine accepted replies before changing what the caller
+sees. Compare the original image device and inode, checksum, loop
+disk sequence and accepted object path. Reuse tests check the stale
+request against a replacement at the same kernel device number.
+A separate setup fixture replaces the source pathname after UDisks
+accepts it and verifies the kernel still holds only the original inode.
+The lost setup fixture starts a fresh client to verify both the current
+mapping and the retained uncertain-operation journal.
+A different NBD index is recorded as a skipped same-number scenario.
+The NBD restart test checks the same token, index, sequence and exporter
+at the boundary between helper acceptance and UDisks discovery, then
+reads the ext4 fixture and payload. Run the ioctl fixture before
+activating the regular NBD helper. Its uninstalled helper uses the
+installed client's `-nonetlink` mode and the existing ownership journal,
+and the test checks the client start identity after opening a PID descriptor.
+
+The optional power-loss fixture is phased and runs on a separate
+disposable QEMU overlay. Set `MAJORIS_DISKS_RUN_POWER_LOSS_TESTS=1` only
+in that guest. Run `sh tests/publication-power-loss.sh prepare
+build/image-device-test CHECKPOINT` as root for each of
+`before-rename`, `before-directory-sync`, `after-directory-sync` and
+`incomplete-output`.
+Capture the fixture path and `POWER-LOSS READY` line outside the guest.
+Cut power from the QEMU host by terminating the verified QEMU process
+for that overlay, then boot the same overlay. Run the script's
+`verify FIXTURE` phase and then `cleanup FIXTURE` in the guest. Verification
+requires a changed boot ID and validates the original inode, size,
+SHA-256, RAW format, protected neighboring image and recovery record.
+Use the abrupt QEMU power cut for acceptance.

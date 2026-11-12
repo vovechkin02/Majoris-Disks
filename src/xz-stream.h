@@ -13,3 +13,4 @@ gboolean majoris_xz_encode (GInputStream *input, GOutputStream *output, guint64 
 char *majoris_image_identity (int fd);
 gboolean majoris_image_require_raw (int fd, guint64 size, GError **error);
 gboolean majoris_image_match_loop (int block, const char *backing, GError **error);
+gboolean majoris_image_match_loop_source (int block, int source, GError **error);
