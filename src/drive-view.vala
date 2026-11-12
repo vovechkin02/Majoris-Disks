@@ -27,6 +27,7 @@ namespace MajorisDisks {
         [GtkChild] private unowned Gtk.Button check_filesystem;
         [GtkChild] private unowned Gtk.Button repair_filesystem;
         [GtkChild] private unowned Gtk.Button initialize_disk;
+        [GtkChild] private unowned Gtk.Button erase_drive;
         [GtkChild] private unowned Gtk.Button delete_partition;
         [GtkChild] private unowned Gtk.Button format_volume;
         [GtkChild] private unowned Gtk.Button edit_label;
@@ -87,6 +88,7 @@ namespace MajorisDisks {
         internal signal void luks_header_requested (StorageBlock block, bool restore, bool advanced);
         public signal void format_requested (StorageBlock block);
         public signal void partitioning_requested (StorageBlock block, bool deleting);
+        public signal void erase_requested (StorageBlock block);
         public signal void create_requested (StorageBlock disk, StorageFreeSpace gap);
         public signal void resize_requested (StorageBlock block);
         private StorageBlock? selected_block;
@@ -168,6 +170,10 @@ namespace MajorisDisks {
             initialize_disk.clicked.connect (() => {
                 var disk = current?.medium;
                 if (disk != null) partitioning_requested (disk, false);
+            });
+            erase_drive.clicked.connect (() => {
+                var disk = current?.medium;
+                if (disk != null) erase_requested (disk);
             });
             edit_partition.clicked.connect (() => {
                 if (selected_block != null) metadata_requested (selected_block);
@@ -292,6 +298,7 @@ namespace MajorisDisks {
             current = drive;
             var disk = drive.medium;
             initialize_disk.visible = disk != null && disk.available && !disk.read_only && !disk.system_hint;
+            erase_drive.visible = disk != null && disk.available;
             summary.title = drive.name;
             benchmark_button.visible = drive.medium != null && drive.medium.size >= 1024 * 1024;
             health.visible = drive.smart || drive.nvme_state != "";

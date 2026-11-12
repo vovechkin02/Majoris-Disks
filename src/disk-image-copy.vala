@@ -90,8 +90,9 @@ namespace MajorisDisks {
 
     internal class ImageOperationJournal : Object {
         private string path;
-        private static string directory () {
-            return Path.build_filename (Environment.get_user_state_dir (), "majoris-disks", "imaging");
+        private static string directory (bool overwrite) {
+            return Path.build_filename (Environment.get_user_state_dir (), "majoris-disks",
+                overwrite ? "sanitization" : "imaging");
         }
 
         private static bool private_directory (string directory) {
@@ -111,10 +112,10 @@ namespace MajorisDisks {
             } catch (FileError error) { return ""; }
         }
 
-        internal ImageOperationJournal (string operation, string target, string evidence) throws Error {
-            string root = directory ();
+        internal ImageOperationJournal (string operation, string target, string evidence, bool overwrite = false) throws Error {
+            string root = directory (overwrite);
             if (DirUtils.create_with_parents (root, 0700) != 0 || !private_directory (root))
-                throw new IOError.PERMISSION_DENIED ("Could not create a private imaging recovery directory.");
+                throw new IOError.PERMISSION_DENIED ("Could not create a private storage recovery directory.");
             uint pid = (uint) Posix.getpid ();
             var record = new KeyFile ();
             record.set_uint64 ("operation", "pid", pid);
@@ -122,14 +123,18 @@ namespace MajorisDisks {
             record.set_string ("operation", "name", operation);
             record.set_string ("operation", "target", target);
             record.set_string ("operation", "evidence", evidence);
+            record.set_int64 ("operation", "created", get_real_time ());
             path = Path.build_filename (root, Uuid.string_random () + ".ini");
-            FileUtils.set_contents_full (path, record.to_data (), -1,
+            string data = record.to_data ();
+            if (overwrite && data.length > 65536)
+                throw new IOError.NO_SPACE ("The reviewed storage scope exceeds the recovery record limit.");
+            FileUtils.set_contents_full (path, data, -1,
                 FileSetContentsFlags.CONSISTENT | FileSetContentsFlags.DURABLE, 0600);
         }
 
         internal void remove () {
             if (FileUtils.unlink (path) != 0)
-                warning ("Could not remove imaging operation record %s", path);
+                warning ("Could not remove storage operation record %s", path);
         }
 
         internal void retain_publication (Error error) {
@@ -144,8 +149,8 @@ namespace MajorisDisks {
             }
         }
 
-        internal static void recover (StorageJobManager jobs) {
-            string root = directory ();
+        internal static void recover (StorageJobManager jobs, bool overwrite = false) {
+            string root = directory (overwrite);
             if (!private_directory (root)) return;
             try {
                 var files = Dir.open (root);
@@ -168,16 +173,17 @@ namespace MajorisDisks {
                         var job = jobs.begin_named (record.get_string ("operation", "name"),
                             record.get_string ("operation", "target"), {});
                         var outcome = new StorageOperationResult ();
-                        outcome.fail ("Interrupted imaging operation requires review");
+                        outcome.fail (overwrite ? "Interrupted logical overwrite requires review" :
+                            "Interrupted imaging operation requires review");
                         outcome.status = StorageOperationStatus.NEEDS_ATTENTION;
                         outcome.actual_state = record.get_string ("operation", "evidence");
                         outcome.technical_error = "Recovery record " + path;
                         jobs.finish (job, outcome);
                     } catch (Error error) {
-                        warning ("Could not read imaging recovery record %s: %s", path, error.message);
+                        warning ("Could not read storage recovery record %s: %s", path, error.message);
                     }
                 }
-            } catch (FileError error) { warning ("Could not read imaging recovery records: %s", error.message); }
+            } catch (FileError error) { warning ("Could not read storage recovery records: %s", error.message); }
         }
     }
 

@@ -30,6 +30,13 @@ test('lvm-fixture', sh, args: [meson.current_source_dir() / 'tests/lvm-fixture-t
 native_xz_test = executable('native-xz-test', 'tests/xz-stream-test.c', 'src/xz-stream.c',
   include_directories: xz_include, dependencies: [dependency('gio-2.0'), xz_dep])
 test('native-xz', native_xz_test)
+sanitization_test = executable('sanitization-model-test', 'tests/sanitization-model-test.vala',
+  storage_model_sources, 'src/udisks-service.vala', include_directories: xz_include,
+  dependencies: [dependency('gio-2.0'), dependency('gio-unix-2.0'), dependency('json-glib-1.0'), blkid_c, xz_dep])
+test('sanitization-model', sanitization_test)
+test('sanitization-overwrite-integration', sh,
+  args: [meson.current_source_dir() / 'tests/sanitization-overwrite-integration.sh', sanitization_test],
+  timeout: 120)
 nbd_helper_test = executable('nbd-helper-test', 'tests/nbd-helper-test.c', 'src/nbd-identity.c',
   include_directories: xz_include, dependencies: dependency('gio-2.0'))
 test('nbd-helper', nbd_helper_test)

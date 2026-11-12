@@ -440,6 +440,7 @@ namespace MajorisDisks {
         public bool ejectable;
         public bool can_power_off;
         public bool ata_power_management;
+        public StorageSanitizationCapability[] ata_erase_capabilities = {};
         public bool ata_apm_supported;
         public bool ata_aam_supported;
         public bool ata_write_cache_supported;
@@ -449,6 +450,8 @@ namespace MajorisDisks {
         public bool optical;
         public string media = "";
         public string nvme_state = "";
+        public string nvme_sanitize_status = "";
+        public int nvme_sanitize_percent_remaining = -1;
         public bool smart_enabled;
         public uint64 smart_updated;
         public bool smart_failing;

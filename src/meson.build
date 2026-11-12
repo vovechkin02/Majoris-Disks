@@ -4,6 +4,7 @@ resources = gnome.compile_resources('majoris-disks-resources',
 storage_model_sources = files('device.vala', 'layout.vala', 'hierarchy.vala', 'safety.vala', 'lvm-structure.vala',
   'storage-operation.vala', 'health-monitor.vala', 'disk-benchmark.vala', 'disk-image-copy.vala', 'xz-stream.c', 'nbd-identity.c', 'btrfs-inspect.c', 'virtual-disk.vala', 'virtual-disk-attachment.vala', 'blkid.vapi', 'filesystem-resize.vala', 'kernel-storage-safety.vala', 'mount-restoration.vala', 'restoration-credential.vala')
 storage_model_sources += files('btrfs-quota.vala', 'btrfs-scrub.vala', 'mdraid.vala', 'mdraid-superblock.c')
+storage_model_sources += files('storage-sanitization.vala', 'storage-sanitization.c')
 luks_ui_sources = files('luks-credential-dialog.vala')
 mdraid_ui_sources = files('mdraid-management-view.vala')
 sources = storage_model_sources + luks_ui_sources + mdraid_ui_sources + files('main.vala', 'health-preferences.vala', 'benchmark-dialog.vala', 'udisks-service.vala', 'window.vala',

@@ -199,6 +199,15 @@ namespace MajorisDisks {
             drive.ejectable = property (object_proxy, "Drive", "Ejectable")?.get_boolean () ?? false;
             drive.can_power_off = property (object_proxy, "Drive", "CanPowerOff")?.get_boolean () ?? false;
             drive.ata_power_management = property (object_proxy, "Drive.Ata", "PmSupported")?.get_boolean () ?? false;
+            if (has (object_proxy, "Drive.Ata")) {
+                var frozen = property (object_proxy, "Drive.Ata", "SecurityFrozen");
+                drive.ata_erase_capabilities = {
+                    StorageSanitizationCapability.ata (StorageSanitizationMethod.ATA_SECURITY_ERASE,
+                        property (object_proxy, "Drive.Ata", "SecurityEraseUnitMinutes"), frozen, drive.bus == "ata"),
+                    StorageSanitizationCapability.ata (StorageSanitizationMethod.ATA_ENHANCED_SECURITY_ERASE,
+                        property (object_proxy, "Drive.Ata", "SecurityEnhancedEraseUnitMinutes"), frozen, drive.bus == "ata")
+                };
+            } else drive.ata_erase_capabilities = {};
             drive.ata_apm_supported = property (object_proxy, "Drive.Ata", "ApmSupported")?.get_boolean () ?? false;
             drive.ata_aam_supported = property (object_proxy, "Drive.Ata", "AamSupported")?.get_boolean () ?? false;
             drive.ata_write_cache_supported = property (object_proxy, "Drive.Ata", "WriteCacheSupported")?.get_boolean () ?? false;
@@ -230,6 +239,9 @@ namespace MajorisDisks {
             drive.optical = optical;
             drive.media = property (object_proxy, "Drive", "Media")?.get_string () ?? "";
             drive.nvme_state = property (object_proxy, "NVMe.Controller", "State")?.get_string () ?? "";
+            drive.nvme_sanitize_status = property (object_proxy, "NVMe.Controller", "SanitizeStatus")?.get_string () ?? "";
+            drive.nvme_sanitize_percent_remaining =
+                property (object_proxy, "NVMe.Controller", "SanitizePercentRemaining")?.get_int32 () ?? -1;
             drive.category = optical ? "Optical" : drive.removable || drive.bus == "usb" ? "Removable" : "Internal";
             drive.icon = optical ? "drive-optical-symbolic" :
                 drive.category == "Removable" ? "drive-removable-media-symbolic" : "drive-harddisk-symbolic";
@@ -6269,6 +6281,171 @@ namespace MajorisDisks {
             string type = block.type_id.down ();
             return type != "ntfs" && type != "vfat" && type != "exfat" && type != "udf" && type != "iso9660";
         }
+        internal StorageSanitizationReview review_logical_overwrite (StorageBlock block,
+            StorageSanitizationMethod method) throws Error {
+            int passes = LogicalOverwrite.pass_count (method);
+            var eligibility = StorageSafetyService.assess_operation (StorageOperationKind.LOGICAL_OVERWRITE,
+                block, snapshot.dependencies);
+            if (!eligibility.allowed)
+                throw new IOError.PERMISSION_DENIED (eligibility.reason);
+            bool managed_loop = block.loop?.managed () == true;
+            var drive = block.physical_drive;
+            if (drive?.nvme_sanitize_status == "inprogress")
+                throw new IOError.BUSY ("The controller reports a sanitize operation in progress.");
+            if (block.partition != null || block.virtual_attachment != null ||
+                (!managed_loop && (block.loop != null || drive == null || drive.medium != block || drive.optical)))
+                throw new IOError.NOT_SUPPORTED ("Select a whole disk or a Majoris-managed loop image.");
+            validate_modification (block, false, false, false, false, managed_loop);
+            string backing_identity = "";
+            Posix.Stat source = {};
+            if (managed_loop) {
+                string backing = block.loop.backing_file;
+                if (Posix.lstat (backing, out source) != 0 || !Posix.S_ISREG (source.st_mode))
+                    throw new IOError.NOT_FOUND ("The loop backing file could not be verified.");
+                backing_identity = loop_identity (block.number, block.loop.sequence, source);
+                foreach (var other in snapshot.blocks.get_values ()) {
+                    if (other == block) continue;
+                    string? path = other.loop?.backing_file ?? other.virtual_attachment?.file;
+                    if (path == null || path == "") continue;
+                    Posix.Stat alias = {};
+                    if (path == backing || (Posix.stat (path, out alias) == 0 &&
+                        alias.st_dev == source.st_dev && alias.st_ino == source.st_ino))
+                        throw new IOError.BUSY ("Another attached device shares the loop backing file.");
+                }
+            }
+            string number = KernelStorageSafety.device_number (block.number);
+            var slaves = Dir.open ("/sys/dev/block/" + number + "/slaves");
+            if (slaves.read_name () != null)
+                throw new IOError.NOT_SUPPORTED ("Stacked block devices cannot be overwritten here.");
+            if (passes == 3) {
+                string rotational;
+                FileUtils.get_contents ("/sys/dev/block/" + number + "/queue/rotational", out rotational);
+                if (managed_loop || drive == null || drive.rotation <= 0 || rotational.strip () != "1")
+                    throw new IOError.NOT_SUPPORTED ("Three passes require a drive that reports rotational media.");
+            }
+            var affected = new GenericArray<string> ();
+            var descriptions = new GenericArray<string> ();
+            foreach (var node in snapshot.dependencies.descendants (block)) {
+                var child = node as StorageBlock;
+                if (child == null || child.type_id == "btrfs")
+                    throw new IOError.NOT_SUPPORTED ("Erase requires individually verified storage without Btrfs membership.");
+                affected.add (child.device);
+                descriptions.add (child.type_id == "" ? child.device : child.device + " · " + child.type_id);
+            }
+            foreach (var partition in KernelStorageSafety.partition_numbers (number)) {
+                bool known = false;
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    var child = node as StorageBlock;
+                    if (child != null && KernelStorageSafety.device_number (child.number) == partition) known = true;
+                }
+                if (!known) throw new IOError.NOT_SUPPORTED ("A kernel partition is missing from the reviewed scope.");
+            }
+            uint64 sequence = overwrite_sequence (block);
+            uint64 capacity = KernelStorageSafety.block_capacity (block);
+            if (capacity != block.size || capacity > int64.MAX || block.device == "")
+                throw new IOError.INVALID_DATA ("The kernel and UDisks disagree about the overwrite target.");
+            return new StorageSanitizationReview () {
+                identity = modification_identity (block) + backing_identity, sequence = sequence, capacity = capacity,
+                affected = affected.data, phrase = "ERASE " + block.device, method = method,
+                affected_descriptions = descriptions.data,
+                loop = managed_loop, backing_device = (uint64) source.st_dev, backing_inode = (uint64) source.st_ino
+            };
+        }
+
+        private static uint64 overwrite_sequence (StorageBlock block) throws Error {
+            string value;
+            FileUtils.get_contents ("/sys/dev/block/" + KernelStorageSafety.device_number (block.number) +
+                "/diskseq", out value);
+            uint64 sequence;
+            if (!uint64.try_parse (value.strip (), out sequence) || sequence == 0)
+                throw new IOError.INVALID_DATA ("The kernel disk sequence is unavailable.");
+            return sequence;
+        }
+
+        private void revalidate_logical_overwrite (StorageBlock block, StorageSanitizationReview reviewed) throws Error {
+            var current = review_logical_overwrite (block, reviewed.method);
+            if (current.identity != reviewed.identity || current.capacity != reviewed.capacity ||
+                current.sequence != reviewed.sequence || current.phrase != reviewed.phrase)
+                throw new IOError.NOT_FOUND ("The disk or its affected storage changed after review.");
+        }
+
+        internal async StorageOperationResult overwrite_logical_blocks (StorageBlock block,
+            StorageSanitizationReview reviewed, string confirmation) throws Error {
+            if (confirmation != reviewed.phrase)
+                throw new IOError.PERMISSION_DENIED ("The typed confirmation does not match.");
+            int passes = LogicalOverwrite.pass_count (reviewed.method);
+            revalidate_logical_overwrite (block, reviewed);
+            locks.acquire (block, snapshot.dependencies);
+            var job = jobs.begin ("Overwrite accessible logical blocks", block, snapshot.dependencies);
+            var result = new StorageOperationResult ();
+            var overwrite = new LogicalOverwrite ();
+            ImageOperationJournal? recovery = null;
+            var lifetime = backend_lifetime;
+            ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
+            int fd = -1;
+            try {
+                job.cancelable = true;
+                jobs.phase (job, StorageJobState.PREPARING, "Checking affected storage");
+                foreach (var node in snapshot.dependencies.descendants (block))
+                    yield KernelStorageSafety.require_idle ((StorageBlock) node, job.cancellable);
+                revalidate_logical_overwrite (block, reviewed);
+                jobs.phase (job, StorageJobState.PREPARING, "Waiting for exclusive access and authorization");
+                fd = yield open_block (block, "rw", Posix.O_EXCL | Posix.O_CLOEXEC | Posix.O_SYNC | DIRECT_IO,
+                    job.cancellable);
+                foreach (var node in snapshot.dependencies.descendants (block)) {
+                    if (node is StorageBlock) yield KernelStorageSafety.require_idle ((StorageBlock) node, job.cancellable);
+                }
+                synchronize ();
+                revalidate_logical_overwrite (block, reviewed);
+                uint64 sequence;
+                if (ioctl_capacity (fd, BLOCK_DEVICE_SEQUENCE, out sequence) != 0 || sequence != reviewed.sequence)
+                    throw new IOError.NOT_FOUND ("The opened disk is different from the reviewed disk.");
+                if (reviewed.loop && !overwrite_loop_matches (fd, reviewed.backing_device, reviewed.backing_inode))
+                    throw new IOError.NOT_FOUND ("The opened loop device does not map the reviewed backing file.");
+                recovery = new ImageOperationJournal ("Overwrite accessible logical blocks", block.device,
+                    "The target may contain an interrupted write.\nRequested passes: %d\nAffected devices: %s\nReviewed identity:\n%s"
+                    .printf (passes, string.joinv (", ", reviewed.affected), reviewed.identity), true);
+                yield overwrite.run (fd, reviewed.capacity, passes, jobs, job);
+                result.completed ("%s logical bytes read back as zero".printf (overwrite.verified.to_string ()));
+                int closed = Posix.close (fd);
+                fd = -1;
+                if (closed != 0) throw new IOError.FAILED ("Could not close the overwritten disk.");
+                job.cancelable = false;
+                jobs.phase (job, StorageJobState.FINALIZING, "Refreshing disk metadata");
+                yield new ImageWriteState ().rescan (require_volume (block, "Block"), lifetime);
+                synchronize ();
+                if (overwrite_sequence (block) != reviewed.sequence ||
+                    KernelStorageSafety.block_capacity (block) != reviewed.capacity)
+                    throw new IOError.NOT_FOUND ("The overwritten disk is no longer present with its reviewed identity.");
+                result.successful = true;
+                result.summary = "Logical overwrite verified";
+            } catch (Error error) {
+                result.fail ("Logical overwrite did not complete", error);
+                if (overwrite.write_attempted) {
+                    result.partial = true;
+                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
+                }
+            } finally {
+                if (fd >= 0) Posix.close (fd);
+                var started = new DateTime.from_unix_utc (job.start_time / 1000000);
+                var ended = new DateTime.now_utc ();
+                result.actual_state = "Majoris operation record\nAffected devices: %s\nDisk sequence: %s\n" +
+                    "Started: %s\nEnded: %s\nRequested passes: %d\nFlushed passes: %d\nPass %d bytes written: %s\n" +
+                    "Zero bytes verified by direct readback: %s\nVerification covers accessible logical blocks.";
+                result.actual_state = result.actual_state.printf (string.joinv (", ", reviewed.affected),
+                    reviewed.sequence.to_string (), started.format_iso8601 (), ended.format_iso8601 (), passes,
+                    overwrite.flushed_passes, int.min (overwrite.pass, passes),
+                    overwrite.written.to_string (), overwrite.verified.to_string ());
+                if (result.successful || !overwrite.write_attempted)
+                    recovery?.remove ();
+                synchronize ();
+                lifetime.disconnect (disconnected);
+                locks.release (block);
+                jobs.finish (job, result);
+            }
+            return result;
+        }
+
         public async StorageOperationResult modify_partitioning (StorageBlock block, string command, string confirmed_identity,
             string label = "", bool recursive = false, string encryption_passphrase = "") throws Error {
             bool deleting = command == "delete";

@@ -140,7 +140,8 @@ namespace MajorisDisks {
         EDIT_FILESYSTEM_LABEL, CHECK_FILESYSTEM, REPAIR_FILESYSTEM,
         CREATE_PARTITION, DELETE_PARTITION, RESIZE, FORMAT, CHECK, REPAIR, TAKE_OWNERSHIP,
         ENCRYPT, UNLOCK, LOCK, MOUNT, UNMOUNT, SWAP_START, SWAP_STOP, IMAGE_RESTORE,
-        POWER_OFF, EJECT, BENCHMARK_WRITE, LVM_CHANGE, RAID_CHANGE, BTRFS_CHANGE
+        POWER_OFF, EJECT, BENCHMARK_WRITE, LVM_CHANGE, RAID_CHANGE, BTRFS_CHANGE,
+        SANITIZE_DEVICE, LOGICAL_OVERWRITE
     }
 
     public class StorageOperationEligibility : Object {
@@ -208,12 +209,15 @@ namespace MajorisDisks {
         public static StorageOperationEligibility assess_operation (StorageOperationKind operation,
             StorageDevice device, StorageDependencyService? graph) {
             var eligibility = new StorageOperationEligibility ();
-            var assessment = assess (device, graph, operation == StorageOperationKind.IMAGE_RESTORE);
+            bool erasing = operation == StorageOperationKind.SANITIZE_DEVICE ||
+                operation == StorageOperationKind.LOGICAL_OVERWRITE;
+            var assessment = assess (device, graph, operation == StorageOperationKind.IMAGE_RESTORE ||
+                operation == StorageOperationKind.LOGICAL_OVERWRITE);
             StorageDevice[] nodes = graph == null ? new StorageDevice[] { device } : graph.descendants (device);
             string[] affected = {};
             foreach (var node in nodes) affected += node.path;
             eligibility.affected = affected;
-            bool destructive = operation == StorageOperationKind.DELETE_PARTITION ||
+            bool destructive = erasing || operation == StorageOperationKind.DELETE_PARTITION ||
                 operation == StorageOperationKind.CREATE_PARTITION || operation == StorageOperationKind.INITIALIZE_DISK ||
                 operation == StorageOperationKind.RESIZE_PARTITION || operation == StorageOperationKind.RESIZE_FILESYSTEM ||
                 operation == StorageOperationKind.RESIZE || operation == StorageOperationKind.FORMAT || operation == StorageOperationKind.FORMAT_VOLUME ||
@@ -224,7 +228,7 @@ namespace MajorisDisks {
                 operation == StorageOperationKind.INITIALIZE_DISK || operation == StorageOperationKind.DELETE_PARTITION ||
                 operation == StorageOperationKind.RESIZE_PARTITION || operation == StorageOperationKind.RESIZE ||
                 operation == StorageOperationKind.IMAGE_RESTORE;
-            eligibility.overwrites_storage = operation == StorageOperationKind.FORMAT || operation == StorageOperationKind.FORMAT_VOLUME ||
+            eligibility.overwrites_storage = erasing || operation == StorageOperationKind.FORMAT || operation == StorageOperationKind.FORMAT_VOLUME ||
                 operation == StorageOperationKind.ENCRYPT || operation == StorageOperationKind.IMAGE_RESTORE;
             eligibility.modifies_filesystem = operation == StorageOperationKind.RESIZE || operation == StorageOperationKind.RESIZE_FILESYSTEM ||
                 operation == StorageOperationKind.FORMAT || operation == StorageOperationKind.FORMAT_VOLUME ||
@@ -245,6 +249,9 @@ namespace MajorisDisks {
             } else if ((assessment.active_dependents || assessment.mounted) &&
                 (operation == StorageOperationKind.EDIT_PARTITION_TYPE || operation == StorageOperationKind.EDIT_PARTITION_FLAGS)) {
                 eligibility.blocked = true; eligibility.reason = "Partition type and flag changes are blocked while dependent storage is active.";
+            } else if (erasing && (assessment.active_dependents || assessment.mounted)) {
+                eligibility.blocked = true;
+                eligibility.reason = "Deactivate all affected storage before reviewing an erase.";
             } else if (assessment.active_dependents && destructive) {
                 eligibility.requires_preparation = true;
                 eligibility.preparation = { "Deactivate dependent mounts, swap, mappings, RAID, and logical volumes" };

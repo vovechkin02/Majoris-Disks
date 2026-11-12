@@ -215,6 +215,7 @@ namespace MajorisDisks {
                 });
             });
             drive_view.partitioning_requested.connect ((block, deleting) => confirm_partitioning (block, deleting));
+            drive_view.erase_requested.connect ((block) => show_drive_erasure (block));
             drive_view.create_requested.connect (create_partition);
             drive_view.resize_requested.connect (resize_volume);
             drive_view.metadata_requested.connect (edit_partition_metadata);
@@ -258,6 +259,7 @@ namespace MajorisDisks {
                 jobs_button.visible = backend.jobs.jobs.get_n_items () != 0;
             });
             ImageOperationJournal.recover (backend.jobs);
+            ImageOperationJournal.recover (backend.jobs, true);
             backend.select_requested.connect ((path) => drive_view.select_identity (path));
             drive_view.check_requested.connect ((block, repair) => {
                 if (!repair) {
@@ -1371,6 +1373,26 @@ namespace MajorisDisks {
             });
             dialog.present (this);
         }
+        private void show_drive_erasure (StorageBlock block) {
+            var dialog = new DriveErasureDialog (backend, block);
+            dialog.response.connect ((response) => {
+                var review = dialog.review;
+                if (response != "erase" || review == null || pending.contains (block.path)) return;
+                pending.insert (block.path, block);
+                backend.overwrite_logical_blocks.begin (block, review, dialog.typed_confirmation, (object, async_result) => {
+                    pending.remove (block.path);
+                    try {
+                        var result = backend.overwrite_logical_blocks.end (async_result);
+                        drive_view.invalidate_usage (block);
+                        show_check_message (result.summary, operation_result_details (result));
+                    } catch (Error error) {
+                        show_check_message ("Could not start logical overwrite", operation_error (error));
+                    }
+                });
+            });
+            dialog.present (this);
+        }
+
         private void confirm_partitioning (StorageBlock block, bool deleting, bool volume = false) {
             string identity = backend.modification_identity (block);
             string device = block.preferred;
@@ -3928,6 +3950,79 @@ namespace MajorisDisks {
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/delete-confirmation-dialog.ui")]
     public class DeleteConfirmationDialog : Adw.AlertDialog {}
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/drive-erasure-dialog.ui")]
+    internal class DriveErasureDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Adw.ComboRow method;
+        [GtkChild] private unowned Adw.EntryRow confirmation;
+        internal StorageSanitizationReview? review;
+        internal string typed_confirmation { get { return confirmation.text; } }
+
+        internal DriveErasureDialog (UDisksService backend, StorageBlock block) {
+            StorageSanitizationReview? single = null;
+            StorageSanitizationReview? multiple = null;
+            string failure = "";
+            try { single = backend.review_logical_overwrite (block, StorageSanitizationMethod.LOGICAL_ZERO_OVERWRITE); }
+            catch (Error error) { failure = error.message; }
+            if (single != null) {
+                try { multiple = backend.review_logical_overwrite (block, StorageSanitizationMethod.LOGICAL_MULTIPASS_OVERWRITE); }
+                catch (Error error) { method.subtitle = error.message; }
+            }
+            method.model = new Gtk.StringList (multiple == null ? new string[] { "One pass with zeros" } :
+                new string[] { "One pass with zeros", "Three passes with 0x55, 0xAA and zeros" });
+            method.sensitive = multiple != null;
+            confirmation.sensitive = single != null;
+            string target = "%s · %s · %s".printf (block.physical_drive?.name ?? block.name,
+                format_size (block.size), block.device);
+            var capabilities = new StringBuilder ();
+            var drive = block.physical_drive;
+            if (drive != null) {
+                if (drive.serial != "") target += "\nSerial " + drive.serial;
+                if (drive.wwn != "") target += "\nWWN " + drive.wwn;
+                if (drive.bus != "") target += "\nTransport " + drive.bus;
+                foreach (var capability in drive.ata_erase_capabilities) {
+                    string label = capability.method == StorageSanitizationMethod.ATA_SECURITY_ERASE ?
+                        "ATA Security Erase" : "ATA Enhanced Security Erase";
+                    capabilities.append ("\n" + label + " · " + capability.reason);
+                    if (capability.duration_minutes > 0) capabilities.append (" " + capability.duration () + ".");
+                }
+                if (drive.nvme_state != "") {
+                    capabilities.append ("\n\nNVMe erasure is unavailable until the full hardware scope can be verified.");
+                    switch (drive.nvme_sanitize_status) {
+                        case "inprogress":
+                            capabilities.append ("\nThe controller reports a sanitize operation in progress.");
+                            int remaining = drive.nvme_sanitize_percent_remaining;
+                            if (remaining >= 0 && remaining <= 100)
+                                capabilities.append (" %d%% remaining.".printf (remaining));
+                            break;
+                        case "success":
+                            capabilities.append ("\nThe controller reports success for its most recent sanitize operation.");
+                            break;
+                        case "failure":
+                            capabilities.append ("\nThe controller reports failure for its most recent sanitize operation.");
+                            break;
+                        default:
+                            capabilities.append ("\nThe controller reports no known sanitize result.");
+                            break;
+                    }
+                }
+            }
+            void update () {
+                review = method.selected == 1 ? multiple : single;
+                confirmation.text = "";
+                set_response_enabled ("erase", false);
+                body = target + (review == null ? "\n\n" + failure :
+                    "\n\nAll data on these devices will be destroyed:\n" + string.joinv ("\n", review.affected_descriptions) +
+                    "\n\nCancellation or power loss can leave the disk partially overwritten." +
+                    "\nRemapped sectors, reserved space and inaccessible flash may retain data.\n\nType " + review.phrase) +
+                    capabilities.str;
+            }
+            method.notify["selected"].connect (() => update ());
+            confirmation.changed.connect (() => set_response_enabled ("erase",
+                review != null && confirmation.text == review.phrase));
+            update ();
+        }
+    }
 
     [GtkTemplate (ui = "/com/majoris/disks/ui/format-disk-dialog.ui")]
     public class FormatDiskDialog : Adw.AlertDialog {

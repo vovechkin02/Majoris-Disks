@@ -13,6 +13,7 @@
 <child type="suffix"><object class="GtkMenuButton" id="drive_actions"><property name="label">Drive Actions</property><property name="valign">center</property><property name="popover"><object class="GtkPopover"><property name="child"><object class="GtkBox"><property name="orientation">vertical</property>
   <child><object class="GtkButton" id="detach_image_button"><property name="label">Detach Disk Image</property></object></child>
   <child><object class="GtkButton" id="backup_drive"><property name="label">Create Disk Image</property></object></child>
+  <child><object class="GtkButton" id="erase_drive"><property name="label">Review Data Erasure</property></object></child>
   <child><object class="GtkButton" id="restore_drive"><property name="label">Restore Disk Image</property></object></child>
   <child><object class="GtkButton" id="eject_drive"><property name="label">Eject</property></object></child>
   <child><object class="GtkButton" id="power_off_drive"><property name="label">Safe Power Off</property></object></child>

@@ -1,0 +1,26 @@
+<interface>
+  <template class="MajorisDisksDriveErasureDialog" parent="AdwAlertDialog">
+    <property name="heading">Erase accessible logical blocks?</property>
+    <property name="body-use-markup">false</property>
+    <property name="extra-child">
+      <object class="AdwPreferencesGroup">
+        <child>
+          <object class="AdwComboRow" id="method">
+            <property name="title">Overwrite passes</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwEntryRow" id="confirmation">
+            <property name="title">Type the confirmation shown above</property>
+          </object>
+        </child>
+      </object>
+    </property>
+    <responses>
+      <response id="cancel">Cancel</response>
+      <response id="erase" appearance="destructive">Overwrite Disk</response>
+    </responses>
+    <property name="default-response">cancel</property>
+    <property name="close-response">cancel</property>
+  </template>
+</interface>
