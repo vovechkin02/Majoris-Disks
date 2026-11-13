@@ -13,6 +13,7 @@ worker=$(realpath "${1:?provide the built Majoris LUKS worker}")
 service=${2:-}
 if [ -n "$service" ]; then
     service=$(realpath "$service")
+    "$service" --check-worker
     for tool in udisksctl udevadm busctl; do
         command -v "$tool" >/dev/null || skip "$tool unavailable"
     done
@@ -35,6 +36,7 @@ verify_loop() (
     [ -b "$1" ] && [ "$(losetup --noheadings --output BACK-FILE -- "$1")" = "$image" ]
 )
 cleanup() {
+    result=$?
     retain=0
     if mountpoint -q "$mountpoint" && ! umount "$mountpoint"; then retain=1; fi
     if [ -n "$fat_mount" ]; then
@@ -68,7 +70,8 @@ cleanup() {
     fi
     if [ "$retain" -ne 0 ]; then
         echo "Could not verify fixture cleanup. Retaining $tmp." >&2
-        return
+        [ "$result" -ne 0 ] && exit "$result"
+        exit 1
     fi
     rm -f -- "$tmp/"*.img "$tmp/"*.header "$tmp/"*.key "$tmp/"*.ticket "$tmp/"*.json
     rmdir "$mountpoint" "$tmp" 2>/dev/null || :
@@ -172,7 +175,7 @@ run_service() {
     verify_loop "$one" "$tmp/one.img" || return 1
     udevadm trigger --action=change --sysname-match="${one##*/}"
     udevadm settle --timeout=10
-    if [ "$1" = restore ]; then
+    if [ "$1" = restore ] || [ "$1" = backup ]; then
         object="/org/freedesktop/UDisks2/block_devices/${one##*/}"
         attempt=0
         while :; do
@@ -182,7 +185,7 @@ run_service() {
             if [ -z "$holders" ] && [ "$cleartext" = 'o "/"' ]; then break; fi
             attempt=$((attempt + 1))
             if [ "$attempt" -ge 50 ]; then
-                printf 'Restore fixture did not become idle. Device=%s holders=%s cleartext=%s\n' \
+                printf 'Header fixture did not become idle. Device=%s holders=%s cleartext=%s\n' \
                     "$one" "$holders" "$cleartext" >&2
                 return 1
             fi

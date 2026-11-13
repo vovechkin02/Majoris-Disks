@@ -238,15 +238,15 @@ The follow-up build on Debian 13.5 passed, as did the staged install. The defaul
 
 | Hardware sanitisation capability | Status | Evidence or remaining work |
 | --- | --- | --- |
-| ATA normal Security Erase | Partially implemented | Duration, frozen state and direct transport inspection. Dispatch is disabled. |
-| ATA enhanced Security Erase | Partially implemented | Separate enhanced-duration evidence and the same transport and frozen-state checks. Dispatch is disabled. |
-| NVMe Sanitize Block Erase | Unsupported | SANICAP and trusted subsystem review are pending. |
-| NVMe Sanitize Crypto Erase | Unsupported | SANICAP and trusted subsystem review are pending. |
-| NVMe Sanitize Overwrite | Unsupported | SANICAP, trusted subsystem review and explicit single-pass dispatch are pending. |
-| NVMe complete-subsystem scope | Unsupported | Complete namespace inventory, attachment and dependency validation are pending. |
-| Hardware restart reconciliation | Unsupported | The existing NVMe status is historical controller information. Per-request persistent evidence and reconciliation are pending. |
-| Hardware execution authorization | Unsupported | A restricted Polkit broker and privileged post-authorization checks are pending. |
-| SCSI SANITIZE and NVMe Format secure erase | Unsupported | Execution remains outside the current scope. |
+| ATA normal Security Erase | Implemented and protocol-simulated | Requires verified direct PCI/libata scope and known capability and frozen state. Physical execution has yet to be tested. |
+| ATA enhanced Security Erase | Implemented and protocol-simulated | Requires separate enhanced-duration evidence and the same transport and frozen-state checks. Physical execution has yet to be tested. |
+| NVMe Sanitize Block Erase | Implemented for restricted topologies and protocol-simulated | Requires SANICAP and verified complete subsystem scope. Physical execution has yet to be tested. |
+| NVMe Sanitize Crypto Erase | Implemented for restricted topologies and protocol-simulated | Requires SANICAP and verified complete subsystem scope. Physical execution has yet to be tested. |
+| NVMe Sanitize Overwrite | Implemented for restricted topologies and protocol-simulated | Requires SANICAP and verified complete subsystem scope. Dispatch specifies a single pass. Physical execution has yet to be tested. |
+| NVMe complete-subsystem scope | Implemented for restricted topologies | Multi-controller, shared, multipath, NVMe-oF and incomplete namespace configurations are refused. |
+| Hardware restart reconciliation | Implemented and protocol-simulated | Persists operation evidence and reserves uncertain scopes. |
+| Hardware execution authorization | Implemented and protocol-simulated | Dedicated administrator Polkit approval and privileged revalidation. Graphical acceptance remains open. |
+| SCSI SANITIZE and NVMe Format SES | Not implemented | Both commands remain outside the implemented method list. |
 
 ### Data erasure method status
 
@@ -256,8 +256,8 @@ The follow-up build on Debian 13.5 passed, as did the staged install. The defaul
 | Format with zero overwrite | Existing disk or volume formatting eligibility | UDisks Block.Format with `erase="zero"` writes accessible blocks before formatting. The format path reports UDisks completion. | Preserved |
 | One-pass logical overwrite | Whole eligible disk or Majoris-managed loop, with a known and idle dependency set | UDisks-authorized exclusive, synchronous, direct-I/O descriptor. Flushes and reads the full logical range. Cancellation can leave partial writes. An interrupted operation record requires review at restart. | Implemented and execution-tested on a QEMU loop fixture |
 | Three-pass logical overwrite | Whole eligible disk with a positive drive rotation rate and a rotational kernel queue | Same exclusive descriptor. Writes `0x55`, `0xAA` and zeros, flushing each pass and reading back the final pass. | Implemented but not execution-tested on rotational block media |
-| ATA normal and enhanced | Requires direct ATA identification, command-specific support and verified whole-drive scope | Displays UDisks duration and frozen-state evidence where available. Privileged revalidation, dispatch and monitoring remain open. | Partially implemented |
-| NVMe Sanitize block, crypto and overwrite | Requires positive action capability and a complete NVM subsystem scope | Displays the current UDisks controller status and reported progress where available. Dispatch and operation-specific reconciliation remain open. | Partially implemented |
+| ATA normal and enhanced | Requires direct ATA identification, command-specific support and verified whole-drive scope | Broker dispatches through UDisks and monitors the backend completion reply. | Implemented and protocol-simulated. Physical execution has yet to be tested. |
+| NVMe Sanitize block, crypto and overwrite | Requires positive action capability and a complete NVM subsystem scope | Broker dispatches through UDisks and correlates progress and completion with controller evidence. | Implemented for restricted topologies and protocol-simulated. Physical execution has yet to be tested. |
 | NVMe Format SES 1 and 2 | Requires verified FNA scope, namespace identity and unchanged LBA, metadata and protection settings | Capability discovery, scope verification and dispatch remain open. | Unsupported |
 | SCSI SANITIZE block, crypto and overwrite | Requires positive service-action support and verified LUN identity and access paths | Capability discovery, dispatch and sense-based reconciliation remain open. | Unsupported |
 
@@ -1065,6 +1065,25 @@ storage, image format and authorization restrictions apply.
 The kernel claim probes are released before UDisks dispatch. The broker pins the UDisks connection owner and checks identity immediately beforehand, but the UDisks method accepts an object path and has no atomic disk-sequence or scope argument. Upstream UDisks 2.10.x also contains a sanitize-job start defect after command submission. The broker observes the controller's read-only sanitize log independently and records ambiguous outcomes. [ATA method](https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Drive.Ata.html) · [NVMe method](https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.NVMe.Controller.html) · [UDisks 2.10.2 sanitize job source](https://github.com/storaged-project/udisks/blob/udisks-2.10.2/src/udiskslinuxnvmecontroller.c#L1183-L1200)
 
 SCSI SANITIZE and NVMe Format SES remain open. Physical execution and read-only physical capability testing require separate acceptance on designated hardware.
+
+### Production hardening follow-up
+
+The read-only `majoris-disks-sanitization-scope-inspect` diagnostic links the same scope implementation as the broker. Fixed ATA disks can carry UDisks `HintSystem`. The native inspector checks the actual kernel and UDisks scope, exclusive claims, partitions, configuration, signatures and holders. It refuses EFI and BIOS boot partition types. ATA WWN matching follows UDisks' preference for the udev WWN with extension. NVMe scope validation also checks the active list ordering and termination and compares Identify namespace size, capacity and active LBA size with UDisks and the live kernel block size. [UDisks drive identity source](https://github.com/storaged-project/udisks/blob/udisks-2.10.2/src/udiskslinuxdrive.c) · [UDisks namespace properties](https://storaged.org/udisks/docs/gdbus-org.freedesktop.UDisks2.NVMe.Namespace.html)
+
+The broker revalidates the full review after the durable possible-dispatch checkpoint and binds the call to the checked UDisks unique owner. The exclusive probes end before the call. Device replacement, external storage tools or topology changes can still occur after the last check. The API provides no atomic kernel identity binding. A failed backend reply, including one with a bus-like error name, leaves the result uncertain. An NVMe terminal result requires a recorded successful acceptance reply and attributable controller evidence.
+
+Root can request an audited historical review with `ReviewHistory`. The journal preserves the original boot, bus and daemon identities. Review records capture observed hardware and job evidence. A confirmed pre-dispatch checkpoint can be closed on restart. Uncertain results continue to reserve the scope, including when the original hardware is temporarily absent.
+
+The LUKS failure was reproduced in the disposable guest. The archived service test executable embeds a WSL build-tree helper path while the original guest staging installed the helper under `/usr/local/libexec`. The worker availability error could therefore precede the stale-identity rejection. The source now validates stale identity first and the fixture checks the compiled helper path before creating storage. The fixture waits for idle UDisks and kernel evidence for both backup and restore and reports cleanup failures.
+
+| Acceptance run | Observed result |
+| --- | --- |
+| Debian 13.5, `meson setup build/codex-sanitize-hardening`, `meson compile -C build/codex-sanitize-hardening`, `meson test -C build/codex-sanitize-hardening --print-errorlogs` | Baseline exited 0 with 19 passes and 124 skips. The follow-up reconfiguration detected libnvme 1.13. The follow-up compile and default suite exited 0 with 20 passes and 124 skips. |
+| Production inspection, Debian 13.7 QEMU, UDisks 2.10.1 | VirtIO and QEMU DVD drive inspections exited 0 and refused all five methods. The libnvme-enabled inspector identified the emulated PCIe controller and its NQN. Independent Identify listed namespaces 1 and 2, each 32 MiB, and SANICAP was zero. The inspector refused both synthetic namespace WWIDs. This exercised a negative production path. |
+| `MAJORIS_DISKS_RUN_SANITIZATION_TESTS=1 sh ./sanitization-overwrite-integration.sh ./sanitization-model-test` in QEMU | Exited 0. Verified 4,194,304 zeroed bytes in the complete run and 2,097,152 zeroed bytes after cancellation. The cancellation run preserved 132,120,576 untouched target bytes and the sibling. |
+| QEMU storage regressions | Partition and loop, filesystem capacity, RAW, XZ, partition restore, QCOW2, VHD, VHDX, LUKS resize, Btrfs discovery, LVM layout and mdraid near3 refusal exited 0. The NBD test exited 77 because the guest lacked the required backend or desktop runtime. |
+| QEMU LUKS header and mapping | `MAJORIS_TEST_LUKS=1 sh ./luks-header-integration.sh ./majoris-disks-luks-header ./luks-header-service-test` exited 0 after staging the build-path worker. LUKS1 and LUKS2 backup, restore, stale confirmation rejection, keyslots, mounted-device refusal and cleanup passed. `MAJORIS_TEST_LUKS_RESTORATION=1 sh ./luks-mapping-restoration-integration.sh ./luks-header-service-test` exited 0 after staging the mount restoration and crypttab helpers. It covered dependent mounts, managed reopening, wrong credentials and cancellation. |
+| Release acceptance still open | Positive physical ATA and NVMe scope inspection, complete negative production topology matrix, GNOME graphical Polkit, reboot with active NVMe sanitisation, and the remainder of the storage matrix. Physical erasure was outside this run. |
 
 ### Execution evidence
 

@@ -8435,11 +8435,11 @@ namespace MajorisDisks {
             bool review_active = false)
             throws Error {
             synchronize ();
-            if (!luks_header_available ())
-                throw new IOError.NOT_SUPPORTED ("Install Majoris Disks with the libcryptsetup header worker.");
             if (!block.available || snapshot.blocks.lookup (block.path) != block ||
                 modification_identity (block) != identity)
                 throw new IOError.NOT_FOUND ("The selected device changed after it was confirmed.");
+            if (!luks_header_available ())
+                throw new IOError.NOT_SUPPORTED ("Install Majoris Disks with the libcryptsetup header worker.");
             if (!(advanced ? is_luks_recovery_candidate (block) : is_luks_header_candidate (block)))
                 throw new IOError.NOT_SUPPORTED ("The selected volume does not support this header operation.");
             if (restore) {

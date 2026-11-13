@@ -262,12 +262,16 @@ private async void exercise_service (string device, string backing, string mode,
         return;
     }
     var file = File.new_for_path (path);
+    if (!UDisksService.luks_header_available ())
+        throw new IOError.NOT_SUPPORTED ("The installed LUKS worker does not match this service test build.");
     string identity = service.modification_identity (target);
     try {
         yield service.review_luks_header (target, "stale confirmation", restore ? file : null, advanced);
-        assert_not_reached ();
+        throw new IOError.FAILED ("The stale LUKS confirmation was accepted.");
     } catch (IOError error) {
-        assert (error is IOError.NOT_FOUND);
+        if (!(error is IOError.NOT_FOUND))
+            throw new IOError.FAILED ("Expected stale LUKS confirmation rejection, got %s (%d): %s".printf (
+                error.domain.to_string (), error.code, error.message));
     }
     var review = yield service.review_luks_header (target, identity, restore ? file : null, advanced);
     assert (review.damaged == advanced);
@@ -281,6 +285,11 @@ private async void exercise_service (string device, string backing, string mode,
 }
 
 private int main (string[] args) {
+    if (args.length == 2 && args[1] == "--check-worker") {
+        if (UDisksService.luks_header_available ()) return 0;
+        stderr.printf ("The LUKS worker is missing at the path compiled into this test. Stage the worker there before running the fixture.\n");
+        return 1;
+    }
     if (args.length != 5 || Environment.get_variable ("MAJORIS_TEST_LUKS") != "1" ||
         !args[1].has_prefix ("/dev/loop") ||
         !(args[2].has_prefix ("/var/tmp/majoris-luks.") ||

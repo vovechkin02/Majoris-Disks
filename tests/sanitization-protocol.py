@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import uuid
 
 import gi
 
@@ -59,6 +60,8 @@ class Hardware:
     auth = "approve"
     mode = "success"
     owner_override = None
+    after_inspection = None
+    on_authorization = None
 
     def __init__(self):
         self.ready = threading.Event()
@@ -85,12 +88,16 @@ class Hardware:
             invocation.return_value(GLib.Variant("(sssssui)", (
                 (self.owner_override or bus.get_unique_name()), self.outcome, self.identity, self.status, "/dev/fixture",
                 self.command, self.remaining)))
+            if self.after_inspection:
+                self.after_inspection()
             return
         if member == "CheckAuthorization":
             subject, action, _, interaction, _ = args.unpack()
             self.subjects.append((subject, action, interaction))
             if self.auth == "change":
                 self.identity += "changed\n"
+            if self.on_authorization:
+                self.on_authorization()
             invocation.return_value(GLib.Variant("((bba{ss}))", ((
                 self.auth in ("approve", "change"), False,
                 {"polkit.dismissed": "true"} if self.auth == "cancel" else {}),)))
@@ -100,6 +107,9 @@ class Hardware:
             self.lost = invocation
         elif self.mode == "error":
             invocation.return_dbus_error("org.freedesktop.UDisks2.Error.Failed", "Fixture command error")
+        elif self.mode == "owner-error":
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.NameHasNoOwner",
+                                         "Backend returned a bus-like error after receiving the call")
         else:
             invocation.return_value(GLib.Variant("()", ()))
 
@@ -204,6 +214,40 @@ def run(fixture):
                 rejected(client, token, "Busy")
             assert not hardware.calls
             hardware.auth = "approve"
+            for field, changed in (
+                ("identity", "diskseq:3,capacity:1024,namespace:1\n"),
+                ("identity", "diskseq:2,capacity:2048,namespace:1\n"),
+                ("identity", "changed ATA serial\n"),
+                ("identity", "changed ATA WWN\n"),
+                ("identity", "changed controller or subsystem NQN\n"),
+                ("identity", "namespace appeared\n"),
+                ("identity", "namespace disappeared\n"),
+                ("identity", "namespace ID reused\n"),
+                ("outcome", "mounted"),
+                ("outcome", "holder appeared"),
+                ("outcome", "root dependency"),
+                ("outcome", "frozen"),
+                ("status", "inprogress"),
+                ("owner_override", other.get_unique_name()),
+                ("outcome", "selected object disappeared"),
+                ("identity", "object path reused\n"),
+            ):
+                token = review(client, "block-erase")
+                original = getattr(hardware, field)
+
+                def change_after_first_validation():
+                    hardware.after_inspection = None
+                    setattr(hardware, field, changed)
+
+                def arm_after_authorization():
+                    hardware.after_inspection = change_after_first_validation
+
+                hardware.on_authorization = arm_after_authorization
+                rejected(client, token, "Rejected")
+                hardware.on_authorization = None
+                setattr(hardware, field, original)
+                assert not hardware.calls
+
             for index, method in enumerate(("ata-normal", "ata-enhanced", "block-erase", "crypto-erase", "overwrite")):
                 op = start(client, review(client, method))
                 verify_call(index, method)
@@ -229,6 +273,10 @@ def run(fixture):
             hardware.lost.return_dbus_error("org.freedesktop.DBus.Error.NoReply", "Lost reply")
             status(client, op, "uncertain")
             review(client, "overwrite", 2)
+            hardware.status, hardware.remaining = "inprogress", 40
+            status(client, op, "running", 60)
+            hardware.status = "success"
+            status(client, op, "uncertain")
             hardware.owner_override = other.get_unique_name()
             hardware.status, hardware.remaining = "inprogress", -1
             status(client, op, "running", -1)
@@ -240,6 +288,37 @@ def run(fixture):
             status(client, op, "uncertain")
             review(client, "overwrite", 2)
             assert len(hardware.calls) == 6
+        finally:
+            process.terminate()
+            process.wait(5)
+    with tempfile.TemporaryDirectory() as directory:
+        process = launch(directory)
+        try:
+            hardware.owner_override = None
+            hardware.mode = "owner-error"
+            op = start(client, review(client, "ata-normal"))
+            verify_call(6, "ata-normal")
+            status(client, op, "uncertain")
+            review(client, "ata-normal", 2)
+            if os.getuid() == 0:
+                audit, = broker_call(client, "ReviewHistory", GLib.Variant("(s)", (op,))).unpack()
+                assert "classification=result-uncertain" in audit
+                records = list(Path(directory).glob(f"{op}.*.review"))
+                assert len(records) == 1 and records[0].stat().st_mode & 0o777 == 0o600
+                review(client, "ata-normal", 2)
+            process.terminate()
+            process.wait(5)
+            before_dispatch = str(uuid.uuid4())
+            contents = (Path(directory) / f"{op}.ini").read_text()
+            checkpoint = Path(directory) / f"{before_dispatch}.ini"
+            checkpoint.touch(mode=0o600)
+            checkpoint.write_text(contents.replace("state=uncertain", "state=dispatch-not-reached")
+                                  .replace("scope-key=fixture-scope", "scope-key=separate-fixture-scope"))
+            process = launch(directory)
+            status(client, before_dispatch, "not-dispatched")
+            status(client, op, "uncertain")
+            review(client, "ata-normal", 2)
+            assert len(hardware.calls) == 7
         finally:
             process.terminate()
             process.wait(5)

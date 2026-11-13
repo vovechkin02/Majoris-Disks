@@ -47,6 +47,17 @@ static gboolean equal(const char *a, const char *b)
     return a && b && g_str_equal(a, b);
 }
 
+static gboolean current_owner(GDBusConnection *bus, const char *expected, GError **error)
+{
+    g_autoptr(GVariant) reply = g_dbus_connection_call_sync(bus, "org.freedesktop.DBus",
+        "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", g_variant_new("(s)", UDISKS),
+        G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, error);
+    if (!reply) return FALSE;
+    const char *owner;
+    g_variant_get(reply, "(&s)", &owner);
+    return equal(owner, expected) || refuse(error, "The UDisks daemon owner changed during inspection.");
+}
+
 static gboolean valid_id(const char *value)
 {
     return value && *value && strlen(value) <= 256 && g_utf8_validate(value, -1, NULL) &&
@@ -136,6 +147,8 @@ static gboolean inspect_block(GVariant *props, const char *sys, gboolean partiti
     if (!equal(dev, expected_dev) || !equal(sys, actual_sys))
         return refuse(error, "The kernel block topology changed.");
 
+    /* Fixed secondary drives may carry HintSystem. Device claims and topology,
+     * configuration, signature and boot-partition checks gate eligibility. */
     /* Whole-disk exclusive opens detect kernel claims, including mounts in other namespaces.
      * UDisks needs to obtain its own claim at dispatch, so these are validation probes. */
     int fd = open(device, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK |
@@ -150,7 +163,7 @@ static gboolean inspect_block(GVariant *props, const char *sys, gboolean partiti
     gboolean safe = !check_use || (ioctl(fd, BLKROGET, &read_only) == 0 && !read_only &&
         configuration && g_variant_n_children(configuration) == 0 && safe_signature(fd) && empty_dir(sys, "holders") &&
         empty_dir(sys, "slaves") && false_property(props, "ReadOnly") &&
-        false_property(props, "HintSystem") && false_property(props, "HintIgnore") &&
+        false_property(props, "HintIgnore") &&
         equal(path_property(props, "CryptoBackingDevice"), "/") &&
         equal(path_property(props, "MDRaid"), "/") && equal(path_property(props, "MDRaidMember"), "/"));
     close(fd);
@@ -217,6 +230,11 @@ static gboolean inspect_disk(GVariant *objects, const char *drive, const char *b
                 !g_variant_lookup(part, "Number", "u", &partition_number) ||
                 partition_number != g_ascii_strtoull(index, NULL, 10))
                 return refuse(error, "UDisks and the kernel disagree about partition ownership.");
+            const char *type = string_property(part, "Type");
+            if (!type || !*type || !g_ascii_strcasecmp(type, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b") ||
+                !g_ascii_strcasecmp(type, "21686148-6449-6e6f-744e-656564454649") ||
+                !g_ascii_strcasecmp(type, "0xef"))
+                return refuse(error, "The scope contains a boot partition or its type is unknown.");
             if (!inspect_block(candidate, child, TRUE, sequence, check_use, &part_sequence,
                                identity, description, error)) return FALSE;
             g_hash_table_add(seen, g_strdup(path));
@@ -246,12 +264,16 @@ static gboolean direct_ata(GVariant *block, const char *sys, const char *serial,
     g_autoptr(Udev) udev = udev_new();
     if (!udev) return FALSE;
     g_autoptr(UdevDevice) disk = udev_device_new_from_devnum(udev, 'b', number);
+    const char *udev_wwn = disk ? udev_device_get_property_value(disk, "ID_WWN_WITH_EXTENSION") : NULL;
+    if (disk && !udev_wwn) udev_wwn = udev_device_get_property_value(disk, "ID_WWN");
     if (!disk || !equal(udev_device_get_syspath(disk), sys) ||
         !equal(udev_device_get_property_value(disk, "ID_BUS"), "ata") ||
         !equal(udev_device_get_property_value(disk, "ID_ATA"), "1") ||
         !equal(udev_device_get_property_value(disk, "ID_SERIAL_SHORT"), serial) ||
-        !equal(udev_device_get_property_value(disk, "ID_WWN"), wwn)) return FALSE;
-    g_autofree char *parent = g_strndup(sys, strstr(sys, "/host") - sys);
+        !equal(udev_wwn, wwn)) return FALSE;
+    const char *host = strstr(sys, "/host");
+    if (!host) return FALSE;
+    g_autofree char *parent = g_strndup(sys, host - sys);
     g_autofree char *name = g_path_get_basename(parent);
     g_autofree char *port = g_build_filename("/sys/class/ata_port", name, NULL);
     g_autofree char *target = realpath(port, NULL);
@@ -336,10 +358,33 @@ static gboolean inspect_nvme(GVariant *objects, GVariant *controller, const char
     gboolean lists_ok = verified && nvme_identify_active_ns_list(fd, 0, &active) == 0 &&
         (!has_management || (nvme_identify_allocated_ns_list(fd, 0, &allocated) == 0 &&
                              memcmp(&active, &allocated, sizeof active) == 0));
+    guint64 sizes[1024] = {}, capacities[1024] = {};
+    guint16 lba_sizes[1024] = {};
+    guint8 euis[1024][8] = {}, nguids[1024][16] = {};
+    guint32 previous_nsid = 0;
     for (guint i = 0; lists_ok && i < 1024 && active.ns[i]; i++) {
         struct nvme_id_ns ns = {};
-        lists_ok = nvme_identify_ns(fd, le32toh(active.ns[i]), &ns) == 0 &&
+        guint32 nsid = le32toh(active.ns[i]);
+        lists_ok = nsid > previous_nsid && nsid != G_MAXUINT32 &&
+            nvme_identify_ns(fd, nsid, &ns) == 0 &&
             !(ns.nmic & NVME_NS_NMIC_SHARED);
+        previous_nsid = nsid;
+        if (!lists_ok) break;
+        /* FLBAS holds bits 3:0 and 5:4 of the index in noncontiguous fields. */
+        guint format = (ns.flbas & 0x0f) | ((ns.flbas & 0x60) >> 1);
+        if (format >= G_N_ELEMENTS(ns.lbaf)) {
+            lists_ok = FALSE;
+            break;
+        }
+        guint shift = ns.lbaf[format].ds;
+        sizes[i] = le64toh(ns.nsze);
+        capacities[i] = le64toh(ns.ncap);
+        memcpy(euis[i], ns.eui64, sizeof euis[i]);
+        memcpy(nguids[i], ns.nguid, sizeof nguids[i]);
+        lists_ok = format <= ns.nlbaf && shift >= 9 && shift < 16 &&
+            sizes[i] && capacities[i] && capacities[i] <= sizes[i] &&
+            sizes[i] <= (G_MAXUINT64 >> shift);
+        if (lists_ok) lba_sizes[i] = 1u << shift;
     }
     close(fd);
     g_autofree char *hardware_serial = identify_text(id.sn, sizeof id.sn);
@@ -353,30 +398,13 @@ static gboolean inspect_nvme(GVariant *objects, GVariant *controller, const char
     guint32 sanicap = le32toh(id.sanicap);
     guint32 required = method == NVME_BLOCK ? NVME_CTRL_SANICAP_BES :
         method == NVME_CRYPTO ? NVME_CTRL_SANICAP_CES : NVME_CTRL_SANICAP_OWS;
-    if (!(sanicap & required)) {
-        s->unsupported = TRUE;
-        return refuse(error, "Identify Controller SANICAP does not support this action.");
-    }
-    if (check_use && (sanicap & NVME_CTRL_SANICAP_NDI))
-        return refuse(error, "This controller cannot accept the no-deallocate option used by UDisks.");
-    if (!log_ok) {
-        s->unknown = TRUE;
-        return refuse(error, "The controller sanitize log is unavailable.");
-    }
-    const char *statuses[] = { "never_sanitized", "success", "inprogress", "failure", "success" };
-    guint state = le16toh(log.sstat) & NVME_SANITIZE_SSTAT_STATUS_MASK;
-    if (state >= G_N_ELEMENTS(statuses)) return refuse(error, "Unknown NVMe sanitize state.");
-    s->status = g_strdup(statuses[state]);
-    s->command = le32toh(log.scdw10);
-    if (state == 2)
-        s->remaining = 100 - ((guint)le16toh(log.sprog) * 100 / 65536);
-    if (check_use && (state == 2 || state == 3))
-        return refuse(error, "The subsystem is sanitising or reports sanitize failure mode.");
     if (!lists_ok || active.ns[1023] != 0)
         return refuse(error, "Allocated and accessible namespace coverage could not be established.");
 
     guint namespace_count = 0;
     while (namespace_count < 1024 && active.ns[namespace_count]) namespace_count++;
+    for (guint i = namespace_count; i < 1024; i++)
+        if (active.ns[i]) return refuse(error, "The namespace list has an invalid terminator.");
     if (!namespace_count || namespace_count != disks->len || namespace_count > le32toh(id.nn))
         return refuse(error, "Identify and UDisks disagree about the complete namespace scope.");
     if (!has_management && namespace_count != le32toh(id.nn))
@@ -384,7 +412,8 @@ static gboolean inspect_nvme(GVariant *objects, GVariant *controller, const char
     s->key = g_strdup_printf("nvme:%s", nqn);
     g_string_append_printf(identity, "%s\t%s\t%s\t%u\t%u\n",
                            s->key, controller_sys, actual_dev, controller_id, sanicap);
-    g_string_append_printf(description, "NVM subsystem %s\nController %s\n", nqn, device);
+    g_string_append_printf(description, "NVM subsystem %s\nController %s (ID %u, SANICAP 0x%08x)\n",
+                           nqn, device, controller_id, sanicap);
     g_autoptr(GHashTable) nsids = g_hash_table_new(g_direct_hash, g_direct_equal);
     g_autoptr(GHashTable) wwids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     for (guint i = 0; i < disks->len; i++) {
@@ -404,11 +433,36 @@ static gboolean inspect_nvme(GVariant *objects, GVariant *controller, const char
             g_hash_table_contains(wwids, wwid))
             return refuse(error, "Namespace identity or exclusive kernel attachment is ambiguous.");
         g_hash_table_add(wwids, g_strdup(wwid));
-        gboolean found = FALSE;
+        guint found = namespace_count;
         for (guint j = 0; j < namespace_count; j++)
-            if (le32toh(active.ns[j]) == nsid) found = TRUE;
-        if (!found) return refuse(error, "A namespace is missing from hardware Identify.");
-        g_string_append_printf(identity, "ns:%u\t%s\n", nsid, wwid);
+            if (le32toh(active.ns[j]) == nsid) found = j;
+        if (found == namespace_count) return refuse(error, "A namespace is missing from hardware Identify.");
+        if (g_str_has_prefix(wwid, "eui.")) {
+            gboolean extended = strlen(wwid + 4) == 32;
+            const guint8 *id_bytes = extended ? nguids[found] : euis[found];
+            gsize id_size = extended ? sizeof nguids[found] : sizeof euis[found];
+            g_autoptr(GString) expected = g_string_new("eui.");
+            gboolean nonzero = FALSE;
+            for (gsize j = 0; j < id_size; j++) {
+                nonzero |= id_bytes[j] != 0;
+                g_string_append_printf(expected, "%02x", id_bytes[j]);
+            }
+            if (!nonzero || !equal(wwid, expected->str))
+                return refuse(error, "The namespace WWID does not match hardware Identify.");
+        }
+        guint64 size, capacity, bytes;
+        guint16 lba_size;
+        g_autoptr(GVariant) format = g_variant_lookup_value(ns, "FormattedLBASize", G_VARIANT_TYPE("(qqy)"));
+        if (!format || !g_variant_lookup(ns, "NamespaceSize", "t", &size) ||
+            !g_variant_lookup(ns, "NamespaceCapacity", "t", &capacity) ||
+            !g_variant_lookup(block, "Size", "t", &bytes) ||
+            size != sizes[found] || capacity != capacities[found])
+            return refuse(error, "UDisks and Identify disagree about namespace capacity.");
+        g_variant_get_child(format, 0, "q", &lba_size);
+        if (lba_size != lba_sizes[found] || bytes != size * lba_size)
+            return refuse(error, "The namespace block size does not match Identify.");
+        g_string_append_printf(identity, "ns:%u\t%s\t%" G_GUINT64_FORMAT "\t%u\n",
+                               nsid, wwid, capacity, lba_size);
         g_string_append_printf(description, "Namespace %u (%s)\n", nsid, wwid);
         if (!inspect_disk(objects, drive, path, sys, check_use, seen, identity, description, error))
             return FALSE;
@@ -423,8 +477,24 @@ static gboolean inspect_nvme(GVariant *objects, GVariant *controller, const char
         g_autofree char *nsid = read_attribute(path, "nsid");
         if (nsid) kernel_namespaces++;
     }
-    return kernel_namespaces == namespace_count ||
-        refuse(error, "The kernel exposes unreviewed namespaces on the controller.");
+    if (kernel_namespaces != namespace_count)
+        return refuse(error, "The kernel exposes unreviewed namespaces on the controller.");
+    if (!(sanicap & required)) {
+        s->unsupported = TRUE;
+        return refuse(error, "Identify Controller SANICAP does not support this action.");
+    }
+    if (check_use && (sanicap & NVME_CTRL_SANICAP_NDI))
+        return refuse(error, "This controller cannot accept the no-deallocate option used by UDisks.");
+    if (!log_ok) return refuse(error, "The controller sanitize log is unavailable.");
+    const char *statuses[] = { "never_sanitized", "success", "inprogress", "failure", "success" };
+    guint state = le16toh(log.sstat) & NVME_SANITIZE_SSTAT_STATUS_MASK;
+    if (state >= G_N_ELEMENTS(statuses)) return refuse(error, "Unknown NVMe sanitize state.");
+    s->status = g_strdup(statuses[state]);
+    s->command = le32toh(log.scdw10);
+    if (state == 2)
+        s->remaining = 100 - ((guint)le16toh(log.sprog) * 100 / 65536);
+    return !check_use || (state != 2 && state != 3) ||
+        refuse(error, "The subsystem is sanitising or reports sanitize failure mode.");
 }
 #endif
 
@@ -493,7 +563,6 @@ gboolean sanitize_inspect(GDBusConnection *bus, const char *drive, SanitizeMetho
             }
         }
     }
-    s->unknown = FALSE;
     if (disks->len == 0 || (ata && disks->len != 1))
         return refuse(error, "The physical block-device scope is missing or ambiguous.");
     g_ptr_array_sort(disks, compare_names);
@@ -537,8 +606,10 @@ gboolean sanitize_inspect(GDBusConnection *bus, const char *drive, SanitizeMetho
     } else {
 #ifdef HAVE_LIBNVME
         if (!inspect_nvme(objects, hardware, drive, serial, sys, method, check_use, disks, seen,
-                          s, identity, description, error))
+                          s, identity, description, error)) {
+            s->description = g_string_free(g_steal_pointer(&description), FALSE);
             return FALSE;
+        }
 #else
         s->unknown = TRUE;
         return refuse(error, "This broker was built without libnvme.");
@@ -546,8 +617,10 @@ gboolean sanitize_inspect(GDBusConnection *bus, const char *drive, SanitizeMetho
     }
     if (check_use && g_hash_table_size(seen) != affected)
         return refuse(error, "UDisks exposes additional storage outside the verified kernel scope.");
+    if (!current_owner(bus, s->owner, error)) return FALSE;
 
     s->identity = g_string_free(g_steal_pointer(&identity), FALSE);
     s->description = g_string_free(g_steal_pointer(&description), FALSE);
+    s->unknown = FALSE;
     return TRUE;
 }

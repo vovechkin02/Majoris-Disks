@@ -93,3 +93,9 @@ endif
 executable('majoris-disks-sanitization-service', ['sanitization-service.c', 'sanitization-scope.c'],
   c_args: sanitization_args, dependencies: sanitization_deps,
   install: true, install_dir: get_option('libexecdir'))
+sanitization_inspect = executable('majoris-disks-sanitization-scope-inspect',
+  ['sanitization-scope-inspect.c', 'sanitization-scope.c'],
+  c_args: sanitization_args, dependencies: sanitization_deps,
+  install: true, install_dir: get_option('libexecdir'))
+test('sanitization-scope-inspect', find_program('sh'),
+  args: [meson.project_source_root() / 'tests/sanitization-scope-inspect.sh', sanitization_inspect])
