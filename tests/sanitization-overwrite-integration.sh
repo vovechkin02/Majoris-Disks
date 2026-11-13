@@ -9,4 +9,5 @@ if [ "$(hostname)" != majoris-mdraid-test ] || [ "$(systemd-detect-virt --vm)" !
     echo "SKIP: requires the disposable Majoris QEMU guest and its root fixture runner"
     exit 77
 fi
-exec "$1" fixture
+"$1" fixture
+exec "$1" fixture-interrupt

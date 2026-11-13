@@ -24,13 +24,13 @@ Run the one-pass acceptance fixture as root inside the dedicated Debian QEMU gue
 MAJORIS_DISKS_RUN_SANITIZATION_TESTS=1 meson test -C build sanitization-overwrite-integration --print-errorlogs
 ```
 
-The fixture attaches its own 4 MiB backing file through Majoris, checks that incorrect confirmation leaves the file intact, then compares every byte of the erased file and an unrelated sibling file. The default suite runs ATA property parsing, dependency refusal, the three-pass worker against a temporary regular file, and cancellation before the first write.
+The first fixture attaches its own 4 MiB backing file through Majoris, checks that incorrect confirmation leaves the file intact, then compares every byte of the erased file and an unrelated sibling file. The second fixture uses a 128 MiB loop image and cancels after observing positive write progress. It compares the zeroed prefix to the reported byte count, checks the remaining target bytes and the sibling, and inspects the retained private recovery record. The default suite runs ATA property and transport checks, dependency refusal, overwrite result classification, the three-pass worker against a temporary regular file, and cancellation before the first write.
 
 - Open **Drive Actions → Review Data Erasure** on a fixture disk. Review the device list, capacity and method. Check that dismissing the dialog and entering an incorrect phrase leave the fixture unchanged.
 - Repeat on an emulated HDD that reports a positive rotation rate. Verify three flushed passes and a complete final readback. Try a nonrotational device and verify the three-pass option is unavailable.
 - Cancel after the first write and verify that the outcome calls for review, reports the extent reached and retains a private recovery record. Restart the application and verify it shows the interrupted operation.
 - Mount a fixture partition or activate fixture swap, LUKS, LVM, mdraid or Btrfs. Verify that review or exclusive open refuses the operation. Substitute a device while authorization is pending and verify the stale review is refused.
-- Hardware acceptance remains open. ATA duration and frozen state and NVMe controller status are currently read-only. The ordinary fixture authorizes only software writes to its own loop backing file.
+- Hardware acceptance remains open. ATA duration, frozen state and direct transport evidence and NVMe controller status are currently read-only. The ordinary fixture authorizes only software writes to its own loop backing file.
 
 ## Linux mdraid recovery and maintenance
 

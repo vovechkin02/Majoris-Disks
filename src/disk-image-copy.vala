@@ -138,14 +138,22 @@ namespace MajorisDisks {
         }
 
         internal void retain_publication (Error error) {
+            retain_evidence (error.message);
+        }
+
+        internal void retain_evidence (string evidence, bool append = false) {
             try {
                 var record = new KeyFile ();
                 record.load_from_file (path, KeyFileFlags.NONE);
-                record.set_string ("operation", "evidence", error.message);
-                FileUtils.set_contents_full (path, record.to_data (), -1,
+                string details = append ? record.get_string ("operation", "evidence") + "\n\n" + evidence : evidence;
+                record.set_string ("operation", "evidence", details);
+                string data = record.to_data ();
+                if (append && data.length > 65536)
+                    throw new IOError.NO_SPACE ("The recovery record exceeds its size limit.");
+                FileUtils.set_contents_full (path, data, -1,
                     FileSetContentsFlags.CONSISTENT | FileSetContentsFlags.DURABLE, 0600);
             } catch (Error journal_error) {
-                warning ("Could not update image publication evidence: %s", journal_error.message);
+                warning ("Could not update storage recovery evidence: %s", journal_error.message);
             }
         }
 

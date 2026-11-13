@@ -29,11 +29,9 @@ namespace MajorisDisks {
             Variant? minutes, Variant? frozen, bool direct_ata) {
             var result = new StorageSanitizationCapability ();
             result.method = method;
+            result.scope = StorageSanitizationScope.PHYSICAL_DRIVE;
             result.backend = "UDisks Drive.Ata";
-            if (!direct_ata) {
-                result.availability = StorageSanitizationAvailability.BLOCKED;
-                result.reason = "Direct ATA transport has not been established.";
-            } else if (minutes == null || !minutes.is_of_type (VariantType.INT32) ||
+            if (minutes == null || !minutes.is_of_type (VariantType.INT32) ||
                 frozen == null || !frozen.is_of_type (VariantType.BOOLEAN) || minutes.get_int32 () < 0) {
                 result.reason = "ATA erase capability or security state is unavailable.";
             } else {
@@ -45,6 +43,7 @@ namespace MajorisDisks {
                 } else {
                     result.availability = StorageSanitizationAvailability.BLOCKED;
                     result.reason = result.frozen == true ? "The drive is security-frozen." :
+                        !direct_ata ? "Direct ATA transport and drive identity have not been established." :
                         "Privileged identity and erase-scope revalidation is unavailable.";
                 }
             }
@@ -54,6 +53,61 @@ namespace MajorisDisks {
         public string duration () {
             if (duration_minutes == 510) return "At least 508 minutes";
             return duration_minutes > 0 ? "%d minutes (device estimate)".printf (duration_minutes) : "Unknown";
+        }
+    }
+
+    internal class AtaSanitizationEvidence : Object {
+        internal static bool matches (StorageDrive drive, HashTable<string, StorageDrive> drives) {
+            var block = drive.medium;
+            if (block == null || !drive.available || drive.optical || drive.bus != "ata" ||
+                block.physical_drive != drive || block.partition != null ||
+                drive.serial.strip () == "" || drive.wwn.strip () == "" || block.number == 0)
+                return false;
+
+            foreach (var other in drives.get_values ()) {
+                if (other != drive && (other.serial == drive.serial || other.wwn == drive.wwn))
+                    return false;
+            }
+            foreach (var candidate in drive.blocks) {
+                if (candidate == block) continue;
+                if (candidate.partition?.table_path != block.path) return false;
+            }
+
+            string number = KernelStorageSafety.device_number (block.number);
+            string sysfs = "/sys/dev/block/" + number;
+            try {
+                Posix.Stat node = {};
+                if (Posix.stat (block.device, out node) != 0 || !Posix.S_ISBLK (node.st_mode) ||
+                    node.st_rdev != block.number || block.size != drive.size ||
+                    KernelStorageSafety.block_capacity (block) != block.size ||
+                    Dir.open (sysfs + "/slaves").read_name () != null ||
+                    MdRaidKernelState.udev_property (block, "ID_ATA") != "1" ||
+                    MdRaidKernelState.udev_property (block, "ID_BUS") != "ata" ||
+                    MdRaidKernelState.udev_property (block, "ID_SERIAL_SHORT") != drive.serial ||
+                    MdRaidKernelState.udev_property (block, "ID_WWN") != drive.wwn)
+                    return false;
+
+                string target = FileUtils.read_link (sysfs);
+                string canonical = File.new_for_path ("/sys/dev/block").resolve_relative_path (target).get_path ();
+                string parent = direct_port_parent (canonical);
+                if (parent == "") return false;
+                string name = Path.get_basename (parent);
+                string port = "/sys/class/ata_port/" + name;
+                string link = FileUtils.read_link (port);
+                string port_path = File.new_for_path (Path.get_dirname (port)).resolve_relative_path (link).get_path ();
+                return port_path == parent + "/ata_port/" + name;
+            } catch (Error error) {
+                return false;
+            }
+        }
+
+        internal static string direct_port_parent (string canonical) {
+            // Restrict this evidence to PCI libata disks exposed directly by the SCSI disk driver.
+            if (!Regex.match_simple ("^/sys/devices/pci[^/]+/(?:[0-9a-f:.]+/)+ata[0-9]+/" +
+                "host[0-9]+/target[0-9:]+/[0-9:]+/block/sd[a-z]+$", canonical))
+                return "";
+            int host = canonical.last_index_of ("/host");
+            return canonical.substring (0, host);
         }
     }
 
@@ -76,6 +130,29 @@ namespace MajorisDisks {
         public uint64 written;
         public uint64 verified;
         public bool write_attempted;
+
+        internal void classify_failure (StorageOperationResult result, Error error, uint64 capacity,
+            int passes, bool descriptor_closed, bool identity_verified) {
+            if (flushed_passes == passes && verified == capacity) {
+                string summary = !identity_verified ?
+                    "Readback completed; final target identity could not be verified" :
+                    !descriptor_closed ? "Readback completed; closing the device reported an error" :
+                    "Logical overwrite verified; storage-model refresh incomplete";
+                result.fail (summary, error);
+                result.partial = false;
+                result.status = StorageOperationStatus.NEEDS_ATTENTION;
+            } else if (write_attempted) {
+                bool writing_complete = flushed_passes == passes || (pass == passes && written == capacity);
+                string summary = flushed_passes == passes ?
+                    "Overwrite written and flushed; readback verification incomplete" :
+                    writing_complete ? "Overwrite written; flush could not be verified" : "Partial overwrite";
+                result.fail (summary, error);
+                result.partial = !writing_complete;
+                result.status = StorageOperationStatus.NEEDS_ATTENTION;
+            } else {
+                result.fail ("Logical overwrite did not complete", error);
+            }
+        }
 
         internal static int pass_count (StorageSanitizationMethod method) throws Error {
             if (method == StorageSanitizationMethod.LOGICAL_ZERO_OVERWRITE) return 1;

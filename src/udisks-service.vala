@@ -199,15 +199,7 @@ namespace MajorisDisks {
             drive.ejectable = property (object_proxy, "Drive", "Ejectable")?.get_boolean () ?? false;
             drive.can_power_off = property (object_proxy, "Drive", "CanPowerOff")?.get_boolean () ?? false;
             drive.ata_power_management = property (object_proxy, "Drive.Ata", "PmSupported")?.get_boolean () ?? false;
-            if (has (object_proxy, "Drive.Ata")) {
-                var frozen = property (object_proxy, "Drive.Ata", "SecurityFrozen");
-                drive.ata_erase_capabilities = {
-                    StorageSanitizationCapability.ata (StorageSanitizationMethod.ATA_SECURITY_ERASE,
-                        property (object_proxy, "Drive.Ata", "SecurityEraseUnitMinutes"), frozen, drive.bus == "ata"),
-                    StorageSanitizationCapability.ata (StorageSanitizationMethod.ATA_ENHANCED_SECURITY_ERASE,
-                        property (object_proxy, "Drive.Ata", "SecurityEnhancedEraseUnitMinutes"), frozen, drive.bus == "ata")
-                };
-            } else drive.ata_erase_capabilities = {};
+            drive.ata_erase_capabilities = {};
             drive.ata_apm_supported = property (object_proxy, "Drive.Ata", "ApmSupported")?.get_boolean () ?? false;
             drive.ata_aam_supported = property (object_proxy, "Drive.Ata", "AamSupported")?.get_boolean () ?? false;
             drive.ata_write_cache_supported = property (object_proxy, "Drive.Ata", "WriteCacheSupported")?.get_boolean () ?? false;
@@ -493,6 +485,18 @@ namespace MajorisDisks {
             foreach (var old in previous_advanced.get_values ())
                 if (snapshot.advanced.lookup (old.path) != old) old.available = false;
             StorageHierarchy.link (snapshot, reuse ? previous_drives : snapshot.drives);
+            foreach (var drive in snapshot.drives.get_values ()) {
+                var proxy = manager?.get_object (drive.path);
+                if (proxy == null || !has (proxy, "Drive.Ata")) continue;
+                bool direct = AtaSanitizationEvidence.matches (drive, snapshot.drives);
+                var frozen = property (proxy, "Drive.Ata", "SecurityFrozen");
+                drive.ata_erase_capabilities = {
+                    StorageSanitizationCapability.ata (StorageSanitizationMethod.ATA_SECURITY_ERASE,
+                        property (proxy, "Drive.Ata", "SecurityEraseUnitMinutes"), frozen, direct),
+                    StorageSanitizationCapability.ata (StorageSanitizationMethod.ATA_ENHANCED_SECURITY_ERASE,
+                        property (proxy, "Drive.Ata", "SecurityEnhancedEraseUnitMinutes"), frozen, direct)
+                };
+            }
             foreach (var block in snapshot.blocks.get_values ()) {
                 if (block.raid != null && block.raid.running) {
                     var kernel = MdRaidKernelState.inspect (block);
@@ -6379,6 +6383,9 @@ namespace MajorisDisks {
             var job = jobs.begin ("Overwrite accessible logical blocks", block, snapshot.dependencies);
             var result = new StorageOperationResult ();
             var overwrite = new LogicalOverwrite ();
+            bool descriptor_closed = false;
+            bool metadata_refreshed = false;
+            bool identity_verified = false;
             ImageOperationJournal? recovery = null;
             var lifetime = backend_lifetime;
             ulong disconnected = lifetime.cancelled.connect (() => job.cancellable.cancel ());
@@ -6409,35 +6416,50 @@ namespace MajorisDisks {
                 result.completed ("%s logical bytes read back as zero".printf (overwrite.verified.to_string ()));
                 int closed = Posix.close (fd);
                 fd = -1;
-                if (closed != 0) throw new IOError.FAILED ("Could not close the overwritten disk.");
+                descriptor_closed = closed == 0;
                 job.cancelable = false;
                 jobs.phase (job, StorageJobState.FINALIZING, "Refreshing disk metadata");
-                yield new ImageWriteState ().rescan (require_volume (block, "Block"), lifetime);
+                Error? refresh_failure = null;
+                try {
+                    if (!descriptor_closed) throw new IOError.FAILED ("Could not close the overwritten disk.");
+                    yield new ImageWriteState ().rescan (require_volume (block, "Block"), lifetime);
+                    metadata_refreshed = true;
+                } catch (Error error) {
+                    refresh_failure = error;
+                }
                 synchronize ();
-                if (overwrite_sequence (block) != reviewed.sequence ||
-                    KernelStorageSafety.block_capacity (block) != reviewed.capacity)
+                Posix.Stat device = {};
+                identity_verified = snapshot.blocks.lookup (block.path) == block && block.available &&
+                    Posix.stat (block.device, out device) == 0 && Posix.S_ISBLK (device.st_mode) &&
+                    device.st_rdev == block.number &&
+                    overwrite_sequence (block) == reviewed.sequence &&
+                    KernelStorageSafety.block_capacity (block) == reviewed.capacity;
+                if (!identity_verified)
                     throw new IOError.NOT_FOUND ("The overwritten disk is no longer present with its reviewed identity.");
+                if (refresh_failure != null) throw refresh_failure;
                 result.successful = true;
                 result.summary = "Logical overwrite verified";
             } catch (Error error) {
-                result.fail ("Logical overwrite did not complete", error);
-                if (overwrite.write_attempted) {
-                    result.partial = true;
-                    result.status = StorageOperationStatus.NEEDS_ATTENTION;
-                }
+                overwrite.classify_failure (result, error, reviewed.capacity, passes,
+                    descriptor_closed, identity_verified);
             } finally {
-                if (fd >= 0) Posix.close (fd);
+                if (fd >= 0) descriptor_closed = Posix.close (fd) == 0;
                 var started = new DateTime.from_unix_utc (job.start_time / 1000000);
                 var ended = new DateTime.now_utc ();
                 result.actual_state = "Majoris operation record\nAffected devices: %s\nDisk sequence: %s\n" +
                     "Started: %s\nEnded: %s\nRequested passes: %d\nFlushed passes: %d\nPass %d bytes written: %s\n" +
-                    "Zero bytes verified by direct readback: %s\nVerification covers accessible logical blocks.";
+                    "Zero bytes verified by direct readback: %s\nDescriptor closed: %s\nMetadata refreshed: %s\n" +
+                    "Final identity verified: %s\nVerification covers accessible logical blocks.";
                 result.actual_state = result.actual_state.printf (string.joinv (", ", reviewed.affected),
                     reviewed.sequence.to_string (), started.format_iso8601 (), ended.format_iso8601 (), passes,
                     overwrite.flushed_passes, int.min (overwrite.pass, passes),
-                    overwrite.written.to_string (), overwrite.verified.to_string ());
+                    overwrite.written.to_string (), overwrite.verified.to_string (), descriptor_closed.to_string (),
+                    metadata_refreshed.to_string (), identity_verified.to_string ());
                 if (result.successful || !overwrite.write_attempted)
                     recovery?.remove ();
+                else
+                    recovery?.retain_evidence (result.summary + "\n" + result.actual_state + "\n" +
+                        result.technical_error, true);
                 synchronize ();
                 lifetime.disconnect (disconnected);
                 locks.release (block);
