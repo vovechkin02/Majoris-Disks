@@ -208,7 +208,7 @@ if xvfb.found()
     storage_model_sources + luks_ui_sources + mdraid_ui_sources + files('src/udisks-service.vala', 'src/window.vala',
       'src/drive-view.vala', 'src/filesystem-usage.vala', 'src/partition-map.vala', 'src/health-preferences.vala',
       'src/benchmark-dialog.vala', 'src/btrfs-device-replace-dialog.vala', 'src/btrfs-profile-conversion-dialog.vala',
-      'src/btrfs-quota-dialog.vala', 'src/btrfs-scrub-dialog.vala'),
+      'src/btrfs-quota-dialog.vala', 'src/btrfs-scrub-dialog.vala', 'src/sanitization-client.vala'),
     resources, include_directories: xz_include, dependencies: deps)
   test('ui-templates', xvfb, args: ['-a', ui_test])
 endif
@@ -315,3 +315,20 @@ configure_file(input: 'data/com.majoris.disks.Nbd.service.in', output: 'com.majo
   configuration: nbd_service, install_dir: get_option('datadir') / 'dbus-1' / 'system-services')
 install_data('data/com.majoris.disks.Nbd.conf', install_dir: get_option('datadir') / 'dbus-1' / 'system.d')
 install_data('data/com.majoris.disks.Nbd.policy', install_dir: get_option('datadir') / 'polkit-1' / 'actions')
+
+configure_file(input: 'data/com.majoris.disks.Sanitization.service.in',
+  output: 'com.majoris.disks.Sanitization.service', configuration: nbd_service,
+  install_dir: get_option('datadir') / 'dbus-1' / 'system-services')
+install_data('data/com.majoris.disks.Sanitization.conf',
+  install_dir: get_option('datadir') / 'dbus-1' / 'system.d')
+install_data('data/com.majoris.disks.Sanitization.policy',
+  install_dir: get_option('datadir') / 'polkit-1' / 'actions')
+
+sanitization_fixture = executable('sanitization-broker-fixture',
+  ['src/sanitization-service.c', 'tests/sanitization-scope-fixture.c'],
+  include_directories: xz_include, dependencies: dependency('gio-2.0'),
+  c_args: ['-DSANITIZATION_TEST'])
+private_bus = find_program('dbus-run-session')
+test('sanitization-hardware-protocol', private_bus,
+  args: ['--', '/usr/bin/python3', meson.current_source_dir() / 'tests/sanitization-protocol.py',
+    sanitization_fixture], timeout: 150)

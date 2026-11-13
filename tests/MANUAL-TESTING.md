@@ -613,3 +613,10 @@ for that overlay, then boot the same overlay. Run the script's
 requires a changed boot ID and validates the original inode, size,
 SHA-256, RAW format, protected neighboring image and recovery record.
 Use the abrupt QEMU power cut for acceptance.
+
+## Hardware sanitisation acceptance
+
+- Run `meson test -C build sanitization-hardware-protocol ui-templates --print-errorlogs`. The hardware test uses a private session bus, a test-only broker and fixture Polkit and UDisks services. It verifies exact D-Bus options, caller binding, authorization outcomes, post-authorization scope changes, locking, progress, final state and historical success after a lost reply. Kernel discovery is substituted by fixtures in this test.
+- For desktop authorization acceptance, use an isolated guest with a graphical Polkit agent and simulated hardware only. Check administrator approval, denial and cancellation. Change the fixture identity while the prompt is open and verify refusal with zero destructive calls. Close and reopen monitoring during an accepted simulated operation.
+- For the disposable QEMU logical-overwrite regression, run the existing `sanitization-overwrite-integration` fixture with `MAJORIS_DISKS_RUN_SANITIZATION_TESTS=1`. The fixture verifies the recovery record, the byte count after cancellation, and the unchanged sibling image.
+- Record physical capability checks and destructive execution separately. Physical execution requires explicit approval and designated sacrificial hardware. Keep the journal and the controller or UDisks evidence with the acceptance result.

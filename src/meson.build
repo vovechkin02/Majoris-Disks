@@ -9,7 +9,7 @@ luks_ui_sources = files('luks-credential-dialog.vala')
 mdraid_ui_sources = files('mdraid-management-view.vala')
 sources = storage_model_sources + luks_ui_sources + mdraid_ui_sources + files('main.vala', 'health-preferences.vala', 'benchmark-dialog.vala', 'udisks-service.vala', 'window.vala',
   'drive-view.vala', 'filesystem-usage.vala', 'partition-map.vala', 'btrfs-device-replace-dialog.vala',
-  'btrfs-profile-conversion-dialog.vala', 'btrfs-quota-dialog.vala', 'btrfs-scrub-dialog.vala')
+  'sanitization-client.vala', 'btrfs-profile-conversion-dialog.vala', 'btrfs-quota-dialog.vala', 'btrfs-scrub-dialog.vala')
 
 executable('majoris-disks', sources, resources,
   include_directories: xz_include, dependencies: deps, install: true)
@@ -82,3 +82,14 @@ if mount_dep.found()
     dependencies: [dependency('glib-2.0'), mount_dep, blkid_c],
     install: true, install_dir: get_option('libexecdir'))
 endif
+
+sanitization_deps = [dependency('gio-2.0'), dependency('libudev'), blkid_c]
+sanitization_nvme = dependency('libnvme', required: false)
+sanitization_args = []
+if sanitization_nvme.found()
+  sanitization_deps += [sanitization_nvme]
+  sanitization_args += ['-DHAVE_LIBNVME']
+endif
+executable('majoris-disks-sanitization-service', ['sanitization-service.c', 'sanitization-scope.c'],
+  c_args: sanitization_args, dependencies: sanitization_deps,
+  install: true, install_dir: get_option('libexecdir'))

@@ -1376,6 +1376,12 @@ namespace MajorisDisks {
         private void show_drive_erasure (StorageBlock block) {
             var dialog = new DriveErasureDialog (backend, block);
             dialog.response.connect ((response) => {
+                if (response == "monitor" || (response == "erase" && dialog.hardware_review != null)) {
+                    var monitor = new HardwareSanitizationDialog (dialog.hardware_client, backend, block);
+                    monitor.present (this);
+                    monitor.watch.begin (response == "erase" ? dialog.hardware_review : null);
+                    return;
+                }
                 var review = dialog.review;
                 if (response != "erase" || review == null || pending.contains (block.path)) return;
                 pending.insert (block.path, block);
@@ -3956,11 +3962,13 @@ namespace MajorisDisks {
         [GtkChild] private unowned Adw.ComboRow method;
         [GtkChild] private unowned Adw.EntryRow confirmation;
         internal StorageSanitizationReview? review;
+        internal HardwareSanitizationReview? hardware_review;
+        internal SanitizationClient hardware_client = new SanitizationClient ();
         internal string typed_confirmation { get { return confirmation.text; } }
+        private Cancellable token = new Cancellable ();
 
         internal DriveErasureDialog (UDisksService backend, StorageBlock block) {
-            StorageSanitizationReview? single = null;
-            StorageSanitizationReview? multiple = null;
+            StorageSanitizationReview? single = null, multiple = null;
             string failure = "";
             try { single = backend.review_logical_overwrite (block, StorageSanitizationMethod.LOGICAL_ZERO_OVERWRITE); }
             catch (Error error) { failure = error.message; }
@@ -3968,59 +3976,128 @@ namespace MajorisDisks {
                 try { multiple = backend.review_logical_overwrite (block, StorageSanitizationMethod.LOGICAL_MULTIPASS_OVERWRITE); }
                 catch (Error error) { method.subtitle = error.message; }
             }
-            method.model = new Gtk.StringList (multiple == null ? new string[] { "One pass with zeros" } :
-                new string[] { "One pass with zeros", "Three passes with 0x55, 0xAA and zeros" });
-            method.sensitive = multiple != null;
-            confirmation.sensitive = single != null;
-            string target = "%s · %s · %s".printf (block.physical_drive?.name ?? block.name,
-                format_size (block.size), block.device);
-            var capabilities = new StringBuilder ();
+            string[] labels = { "One pass with zeros", "Three passes with 0x55, 0xAA and zeros",
+                "ATA Secure Erase", "ATA Enhanced Secure Erase", "NVMe Sanitize Block Erase",
+                "NVMe Sanitize Cryptographic Erase", "NVMe Sanitize Overwrite" };
+            string[] commands = { "ata-normal", "ata-enhanced", "block-erase", "crypto-erase", "overwrite" };
             var drive = block.physical_drive;
-            if (drive != null) {
-                if (drive.serial != "") target += "\nSerial " + drive.serial;
-                if (drive.wwn != "") target += "\nWWN " + drive.wwn;
-                if (drive.bus != "") target += "\nTransport " + drive.bus;
-                foreach (var capability in drive.ata_erase_capabilities) {
-                    string label = capability.method == StorageSanitizationMethod.ATA_SECURITY_ERASE ?
-                        "ATA Security Erase" : "ATA Enhanced Security Erase";
-                    capabilities.append ("\n" + label + " · " + capability.reason);
-                    if (capability.duration_minutes > 0) capabilities.append (" " + capability.duration () + ".");
-                }
-                if (drive.nvme_state != "") {
-                    capabilities.append ("\n\nNVMe erasure is unavailable until the full hardware scope can be verified.");
-                    switch (drive.nvme_sanitize_status) {
-                        case "inprogress":
-                            capabilities.append ("\nThe controller reports a sanitize operation in progress.");
-                            int remaining = drive.nvme_sanitize_percent_remaining;
-                            if (remaining >= 0 && remaining <= 100)
-                                capabilities.append (" %d%% remaining.".printf (remaining));
-                            break;
-                        case "success":
-                            capabilities.append ("\nThe controller reports success for its most recent sanitize operation.");
-                            break;
-                        case "failure":
-                            capabilities.append ("\nThe controller reports failure for its most recent sanitize operation.");
-                            break;
-                        default:
-                            capabilities.append ("\nThe controller reports no known sanitize result.");
-                            break;
-                    }
-                }
-            }
-            void update () {
-                review = method.selected == 1 ? multiple : single;
+            bool ata = block.partition == null && drive != null && drive.ata_erase_capabilities.length > 0;
+            bool nvme = block.partition == null && drive != null && drive.nvme_state != "";
+            int[] choices = { 0 };
+            if (multiple != null) choices += 1;
+            if (ata) { choices += 2; choices += 3; }
+            if (nvme) { choices += 4; choices += 5; choices += 6; }
+            string[] names = {};
+            foreach (int index in choices) names += labels[index];
+            method.model = new Gtk.StringList (names);
+            method.sensitive = choices.length > 1;
+            set_response_enabled ("monitor", ata || nvme);
+            string target = "%s · %s · %s".printf (drive?.name ?? block.name,
+                format_size (block.size), block.device);
+            method.notify["selected"].connect (() => {
+                if (method.selected >= choices.length) return;
+                int index = choices[method.selected];
+                token.cancel ();
+                token = new Cancellable ();
+                hardware_review = null;
+                review = index == 1 ? multiple : index == 0 ? single : null;
                 confirmation.text = "";
+                confirmation.sensitive = review != null;
                 set_response_enabled ("erase", false);
-                body = target + (review == null ? "\n\n" + failure :
-                    "\n\nAll data on these devices will be destroyed:\n" + string.joinv ("\n", review.affected_descriptions) +
-                    "\n\nCancellation or power loss can leave the disk partially overwritten." +
-                    "\nRemapped sectors, reserved space and inaccessible flash may retain data.\n\nType " + review.phrase) +
-                    capabilities.str;
+                if (index < 2) {
+                    body = target + (review == null ? "\n\n" + failure :
+                        "\n\nAll data on these devices will be destroyed:\n" +
+                        string.joinv ("\n", review.affected_descriptions) +
+                        "\n\nCancellation or power loss can leave the disk partially overwritten." +
+                        "\nRemapped sectors, reserved space and inaccessible flash may retain data.\n\nType " + review.phrase);
+                    return;
+                }
+                body = target + "\n\nChecking the complete hardware scope…";
+                var request = token;
+                var choice = (StorageSanitizationMethod) (index + 1);
+                hardware_client.review.begin (drive.path, choice, commands[index - 2], request, (obj, result) => {
+                    if (request.is_cancelled ()) return;
+                    try {
+                        var checked = hardware_client.review.end (result);
+                        if (checked.capability.availability != StorageSanitizationAvailability.AVAILABLE) {
+                            body = target + "\n\n" + checked.capability.reason;
+                            return;
+                        }
+                        hardware_review = checked;
+                        confirmation.sensitive = true;
+                        body = labels[index] + "\n\nAll data in the reviewed hardware scope will be destroyed.\n\n" +
+                            checked.scope + "\nAdministrator authentication is required. Once accepted, the operation " +
+                            "can continue after monitoring closes.\n\nType " + checked.phrase;
+                    } catch (Error error) {
+                        body = target + "\n\nHardware review unavailable. " + error.message;
+                    }
+                });
+            });
+            confirmation.changed.connect (() => {
+                string? phrase = hardware_review?.phrase ?? review?.phrase;
+                set_response_enabled ("erase", phrase != null && confirmation.text == phrase);
+            });
+            closed.connect (() => token.cancel ());
+            method.notify_property ("selected");
+        }
+    }
+
+    [GtkTemplate (ui = "/com/majoris/disks/ui/hardware-sanitization-dialog.ui")]
+    internal class HardwareSanitizationDialog : Adw.AlertDialog {
+        [GtkChild] private unowned Gtk.ProgressBar progress;
+        private SanitizationClient client;
+        private UDisksService backend;
+        private string drive;
+        private Cancellable token = new Cancellable ();
+
+        internal HardwareSanitizationDialog (SanitizationClient client, UDisksService backend, StorageBlock block) {
+            this.client = client;
+            this.backend = backend;
+            drive = block.physical_drive?.path ?? "";
+            closed.connect (() => token.cancel ());
+        }
+
+        internal async void watch (HardwareSanitizationReview? review) {
+            string id = "";
+            if (review != null) {
+                body = "Waiting for administrator authorization and final hardware validation…";
+                try { id = yield client.start (review); }
+                catch (Error error) {
+                    string? remote = DBusError.get_remote_error (error);
+                    body = remote != null && remote.has_prefix ("com.majoris.disks.Sanitization.Error.") ?
+                        error.message : "The start reply was interrupted. Check hardware operation records.\n" + error.message;
+                    return;
+                }
             }
-            method.notify["selected"].connect (() => update ());
-            confirmation.changed.connect (() => set_response_enabled ("erase",
-                review != null && confirmation.text == review.phrase));
-            update ();
+            while (!token.is_cancelled ()) {
+                try {
+                    var entries = yield client.list (token);
+                    if (token.is_cancelled ()) return;
+                    var details = new StringBuilder ();
+                    HardwareSanitizationOperation? active = null;
+                    foreach (var entry in entries) {
+                        if (id != "" ? entry.id != id : entry.drive != drive) continue;
+                        details.append_printf ("%s\n%s\n\n", entry.id, entry.detail);
+                        if (active == null && (!entry.terminal () || id != "")) active = entry;
+                    }
+                    body = details.len == 0 ? "No hardware sanitisation records for this drive." : details.str.strip ();
+                    progress.visible = active != null && !active.terminal ();
+                    if (progress.visible) {
+                        progress.show_text = active.progress >= 0;
+                        if (active.progress >= 0) progress.fraction = active.progress / 100.0;
+                        else progress.pulse ();
+                    }
+                    if (id != "" && active != null && active.terminal ()) {
+                        yield backend.refresh ();
+                        return;
+                    }
+                } catch (Error error) {
+                    if (!token.is_cancelled ()) body = "Hardware monitoring interrupted. " + error.message;
+                }
+                if (token.is_cancelled ()) return;
+                Timeout.add_seconds (3, () => { watch.callback (); return Source.REMOVE; });
+                yield;
+            }
         }
     }
 

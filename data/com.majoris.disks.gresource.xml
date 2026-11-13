@@ -13,6 +13,7 @@
     <file>ui/partition-map.ui</file>
     <file>ui/drive-view.ui</file>
     <file>ui/drive-erasure-dialog.ui</file>
+    <file>ui/hardware-sanitization-dialog.ui</file>
     <file>ui/drive-information-dialog.ui</file>
     <file>ui/partition-segment.ui</file>
     <file>ui/sidebar-group-heading.ui</file>

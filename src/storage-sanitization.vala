@@ -44,7 +44,7 @@ namespace MajorisDisks {
                     result.availability = StorageSanitizationAvailability.BLOCKED;
                     result.reason = result.frozen == true ? "The drive is security-frozen." :
                         !direct_ata ? "Direct ATA transport and drive identity have not been established." :
-                        "Privileged identity and erase-scope revalidation is unavailable.";
+                        "A privileged hardware review is required.";
                 }
             }
             return result;
@@ -59,7 +59,7 @@ namespace MajorisDisks {
     internal class AtaSanitizationEvidence : Object {
         internal static bool matches (StorageDrive drive, HashTable<string, StorageDrive> drives) {
             var block = drive.medium;
-            if (block == null || !drive.available || drive.optical || drive.bus != "ata" ||
+            if (block == null || !drive.available || drive.optical || (drive.bus != "ata" && drive.bus != "") ||
                 block.physical_drive != drive || block.partition != null ||
                 drive.serial.strip () == "" || drive.wwn.strip () == "" || block.number == 0)
                 return false;

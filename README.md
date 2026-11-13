@@ -4,7 +4,7 @@ Disks is the native GTK4 and libadwaita storage inspector for Majoris. It uses t
 
 ## Build and test
 
-On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, `libblkid-dev`, `libjson-glib-dev`, `liblzma-dev`, and `udisks2`. The build requires libadwaita 1.5 or later.
+On Debian, install `build-essential`, `meson`, `ninja-build`, `valac`, `libgtk-4-dev`, `libadwaita-1-dev`, `libglib2.0-dev`, `libblkid-dev`, `libjson-glib-dev`, `liblzma-dev`, `libudev-dev`, and `udisks2`. Install `libnvme-dev` to build NVMe Sanitize support. The build requires libadwaita 1.5 or later.
 
 ```sh
 meson setup build --prefix=/usr --sysconfdir=/etc

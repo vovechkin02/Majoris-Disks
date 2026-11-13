@@ -1,0 +1,17 @@
+<interface>
+  <template class="MajorisDisksHardwareSanitizationDialog" parent="AdwAlertDialog">
+    <property name="heading">Hardware sanitisation</property>
+    <property name="body-use-markup">false</property>
+    <property name="extra-child">
+      <object class="GtkProgressBar" id="progress">
+        <property name="visible">false</property>
+        <property name="show-text">true</property>
+      </object>
+    </property>
+    <responses>
+      <response id="close">Close Monitoring</response>
+    </responses>
+    <property name="default-response">close</property>
+    <property name="close-response">close</property>
+  </template>
+</interface>
